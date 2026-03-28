@@ -1,6 +1,7 @@
 """PostgreSQL + pgvector データベース操作。"""
 
 import re
+import sys
 
 import psycopg2
 from pgvector.psycopg2 import register_vector
@@ -10,14 +11,20 @@ from src.config import DB_NAME, DB_USER, DB_HOST, DB_PORT
 
 def connect():
     """PostgreSQL に接続する。"""
-    conn = psycopg2.connect(
-        dbname=DB_NAME,
-        user=DB_USER,
-        host=DB_HOST,
-        port=DB_PORT,
-    )
-    register_vector(conn)
-    return conn
+    try:
+        conn = psycopg2.connect(
+            dbname=DB_NAME,
+            user=DB_USER,
+            host=DB_HOST,
+            port=DB_PORT,
+        )
+        register_vector(conn)
+        return conn
+    except psycopg2.OperationalError as e:
+        print(f"エラー: PostgreSQL に接続できません: {e}")
+        print("PostgreSQL が起動しているか確認してください:")
+        print("  brew services start postgresql@17")
+        sys.exit(1)
 
 
 def insert_chunks(conn, chunks_data):
@@ -150,18 +157,24 @@ def lookup_by_url(conn, url):
 
 def search_similar(conn, embedding, n_results=5, owner=None, since=None):
     """ベクトル類似度検索。オプションでメタデータフィルタ付き。"""
+    import numpy as np
+    if isinstance(embedding, list):
+        embedding = np.array(embedding, dtype=np.float32)
+
     conditions = []
-    params = [embedding]
+    filter_params = []
 
     if owner:
         conditions.append("owner = %s")
-        params.append(owner)
+        filter_params.append(owner)
     if since:
         conditions.append("drive_modified_at > %s")
-        params.append(since)
+        filter_params.append(since)
 
     where = "WHERE " + " AND ".join(conditions) if conditions else ""
-    params.append(n_results)
+
+    # パラメータ順: distance計算用embedding, フィルタ値..., ソート用embedding, LIMIT
+    params = [embedding] + filter_params + [embedding, n_results]
 
     cur = conn.cursor()
     cur.execute(
@@ -173,7 +186,7 @@ def search_similar(conn, embedding, n_results=5, owner=None, since=None):
         ORDER BY embedding <=> %s
         LIMIT %s
         """,
-        (*params[:1], *params),
+        tuple(params),
     )
     results = cur.fetchall()
     cur.close()

@@ -25,6 +25,13 @@ def load_config():
 
 load_config()
 
+# 必須環境変数のバリデーション
+_REQUIRED = ["GOOGLE_EMAIL", "GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET"]
+_missing = [v for v in _REQUIRED if v not in os.environ]
+if _missing:
+    print(f"エラー: config.env に以下の値がありません: {', '.join(_missing)}")
+    sys.exit(1)
+
 # Google OAuth
 GOOGLE_EMAIL = os.environ["GOOGLE_EMAIL"]
 GOOGLE_CLIENT_ID = os.environ["GOOGLE_OAUTH_CLIENT_ID"]
@@ -32,7 +39,7 @@ GOOGLE_CLIENT_SECRET = os.environ["GOOGLE_OAUTH_CLIENT_SECRET"]
 
 # PostgreSQL
 DB_NAME = os.environ.get("PGDATABASE", "gridworldrag")
-DB_USER = os.environ.get("PGUSER", os.getenv("USER", "tobisako"))
+DB_USER = os.environ.get("PGUSER", os.getenv("USER", ""))
 DB_HOST = os.environ.get("PGHOST", "localhost")
 DB_PORT = os.environ.get("PGPORT", "5432")
 

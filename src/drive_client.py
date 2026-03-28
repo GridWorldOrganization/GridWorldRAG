@@ -13,7 +13,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
 from src.config import (
-    GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, TOKEN_PATH,
+    GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_EMAIL, TOKEN_PATH,
     INDEX_MY_DRIVE, INDEX_SHARED_DRIVES, load_shared_drives_whitelist,
 )
 
@@ -125,13 +125,17 @@ def list_all_files(service):
     """
     all_files = []
 
-    # マイドライブ
+    # マイドライブ（自分が所有するファイルのみ、共有アイテムは除外）
     if INDEX_MY_DRIVE:
         print("  [マイドライブ] 取得中...")
-        # corpora="user" + 'me' in owners でマイドライブ所有ファイルのみ
         my_files = _list_files_in_drive(service, corpora="user")
-        # 「共有アイテム」を除外: owners に自分が含まれるもののみ
-        my_files = [f for f in my_files if not f.get("driveId")]
+        # 共有アイテム除外: 自分がオーナーかつ共有ドライブ外のファイルのみ
+        my_files = [
+            f for f in my_files
+            if not f.get("driveId")
+            and f.get("owners")
+            and any(o.get("emailAddress") == GOOGLE_EMAIL for o in f["owners"])
+        ]
         print(f"  [マイドライブ] {len(my_files)} ファイル")
         all_files.extend(my_files)
 
