@@ -1,5 +1,7 @@
 """PostgreSQL + pgvector データベース操作。"""
 
+import re
+
 import psycopg2
 from pgvector.psycopg2 import register_vector
 
@@ -65,6 +67,85 @@ def delete_by_file_id(conn, drive_file_id_prefix):
     conn.commit()
     cur.close()
     return deleted
+
+
+def extract_file_id_from_url(url):
+    """Google Workspace の URL から FILE_ID を抽出する。
+
+    対応 URL:
+      - https://docs.google.com/spreadsheets/d/{ID}/edit...
+      - https://docs.google.com/document/d/{ID}/edit...
+      - https://docs.google.com/presentation/d/{ID}/edit...
+      - https://drive.google.com/file/d/{ID}/view...
+      - https://drive.google.com/open?id={ID}
+      - https://drive.google.com/drive/folders/{ID}
+    """
+    patterns = [
+        r"/d/([a-zA-Z0-9_-]+)",         # /d/{ID} パターン
+        r"/folders/([a-zA-Z0-9_-]+)",    # /folders/{ID}
+        r"[?&]id=([a-zA-Z0-9_-]+)",     # ?id={ID}
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+
+def lookup_by_url(conn, url):
+    """Google Workspace の URL から DB 内の全チャンクを取得する。
+
+    URL から FILE_ID を抽出し、drive_file_id が "{FILE_ID}_chunk_%" に一致する
+    全チャンクをチャンク順に返す。
+
+    Returns:
+        dict: {
+            "file_id": str,
+            "title": str,
+            "owner": str,
+            "source_url": str,
+            "file_type": str,
+            "modified_at": str,
+            "chunks": [{"index": int, "content": str}, ...],
+            "full_text": str,  # 全チャンクを結合したテキスト
+        }
+        見つからない場合は None。
+    """
+    file_id = extract_file_id_from_url(url)
+    if not file_id:
+        return None
+
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT title, content, chunk_index, owner, source_url,
+               file_type, drive_modified_at
+        FROM documents
+        WHERE drive_file_id LIKE %s
+        ORDER BY chunk_index
+        """,
+        (f"{file_id}_chunk_%",),
+    )
+    rows = cur.fetchall()
+    cur.close()
+
+    if not rows:
+        return None
+
+    first = rows[0]
+    chunks = [{"index": r[2], "content": r[1]} for r in rows]
+    full_text = "\n".join(r[1] for r in rows)
+
+    return {
+        "file_id": file_id,
+        "title": first[0],
+        "owner": first[3],
+        "source_url": first[4],
+        "file_type": first[5],
+        "modified_at": str(first[6]) if first[6] else None,
+        "chunks": chunks,
+        "full_text": full_text,
+    }
 
 
 def search_similar(conn, embedding, n_results=5, owner=None, since=None):
