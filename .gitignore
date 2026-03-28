@@ -5,4 +5,5 @@ token.pickle
 credentials.json
 .env
 config.env
+shared_drives_whitelist.txt
 .DS_Store

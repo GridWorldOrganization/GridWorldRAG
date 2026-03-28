@@ -1,0 +1,15 @@
+# 共有ドライブ ホワイトリスト
+# INDEX_SHARED_DRIVES=1 の場合、ここに列挙した共有ドライブのみをインデックス対象にする
+# このファイルを shared_drives_whitelist.txt にコピーして編集してください
+# cp shared_drives_whitelist.txt.example shared_drives_whitelist.txt
+#
+# 書式: 1行につき1件、ドライブID と ドライブ名をタブ区切り
+# ドライブ名はコメント扱い（ID のみ使用）
+# 空行と # で始まる行は無視される
+#
+# ドライブ ID の確認方法:
+#   python -c "from src.drive_client import authenticate; s=authenticate(); [print(d['id'], d['name']) for d in s.drives().list(pageSize=100).execute().get('drives',[])]"
+#
+# 例:
+# 0AFY0skZNHFskUk9PVA	サンプル共有ドライブ1
+# 0AKX9RkcqkJa_Uk9PVA	サンプル共有ドライブ2

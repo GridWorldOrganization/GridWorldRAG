@@ -36,6 +36,10 @@ DB_USER = os.environ.get("PGUSER", os.getenv("USER", "tobisako"))
 DB_HOST = os.environ.get("PGHOST", "localhost")
 DB_PORT = os.environ.get("PGPORT", "5432")
 
+# インデックス対象スコープ
+INDEX_MY_DRIVE = os.environ.get("INDEX_MY_DRIVE", "0") == "1"
+INDEX_SHARED_DRIVES = os.environ.get("INDEX_SHARED_DRIVES", "1") == "1"
+
 # 埋め込み
 EMBEDDING_MODEL = "multi-qa-mpnet-base-dot-v1"
 CHUNK_SIZE = 600
@@ -44,3 +48,23 @@ BATCH_SIZE = 100
 
 # パス
 TOKEN_PATH = PROJECT_ROOT / os.environ.get("GOOGLE_TOKEN_PATH", "token.pickle")
+SHARED_DRIVES_WHITELIST_PATH = PROJECT_ROOT / "shared_drives_whitelist.txt"
+
+
+def load_shared_drives_whitelist():
+    """shared_drives_whitelist.txt からドライブ ID のセットを返す。
+
+    ファイルが存在しない場合は空セット（全共有ドライブ対象外）。
+    """
+    if not SHARED_DRIVES_WHITELIST_PATH.exists():
+        return set()
+    ids = set()
+    with open(SHARED_DRIVES_WHITELIST_PATH) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            drive_id = line.split("\t")[0].split(" ")[0].strip()
+            if drive_id:
+                ids.add(drive_id)
+    return ids

@@ -12,7 +12,10 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
-from src.config import GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, TOKEN_PATH
+from src.config import (
+    GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, TOKEN_PATH,
+    INDEX_MY_DRIVE, INDEX_SHARED_DRIVES, load_shared_drives_whitelist,
+)
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
@@ -77,33 +80,83 @@ def authenticate():
     return build("drive", "v3", credentials=creds)
 
 
-def list_all_files(service):
-    """Google Drive の全ファイルを取得する。"""
+def _list_files_in_drive(service, drive_id=None, corpora="user"):
+    """指定スコープのファイルを全件取得する内部関数。"""
     files = []
     page_token = None
     query = "trashed = false"
 
+    kwargs = {
+        "q": query,
+        "spaces": "drive",
+        "fields": "nextPageToken, files(id, name, mimeType, modifiedTime, owners, webViewLink, driveId)",
+        "pageSize": 1000,
+        "supportsAllDrives": True,
+        "includeItemsFromAllDrives": True,
+    }
+
+    if drive_id:
+        kwargs["driveId"] = drive_id
+        kwargs["corpora"] = "drive"
+    else:
+        kwargs["corpora"] = corpora
+
     while True:
-        response = service.files().list(
-            q=query,
-            spaces="drive",
-            fields="nextPageToken, files(id, name, mimeType, modifiedTime, owners, webViewLink)",
-            pageSize=1000,
-            pageToken=page_token,
-            includeItemsFromAllDrives=True,
-            supportsAllDrives=True,
-        ).execute()
+        if page_token:
+            kwargs["pageToken"] = page_token
+        response = service.files().list(**kwargs).execute()
 
         batch = response.get("files", [])
         files.extend(batch)
-        print(f"  取得済み: {len(files)} ファイル", end="\r")
 
         page_token = response.get("nextPageToken")
         if not page_token:
             break
 
-    print(f"  合計: {len(files)} ファイル")
     return files
+
+
+def list_all_files(service):
+    """設定に基づいて対象ファイルを取得する。
+
+    config.env の INDEX_MY_DRIVE / INDEX_SHARED_DRIVES と
+    shared_drives_whitelist.txt に基づきスコープを制御する。
+    「共有アイテム」（他人から共有されたファイル）は常に対象外。
+    """
+    all_files = []
+
+    # マイドライブ
+    if INDEX_MY_DRIVE:
+        print("  [マイドライブ] 取得中...")
+        # corpora="user" + 'me' in owners でマイドライブ所有ファイルのみ
+        my_files = _list_files_in_drive(service, corpora="user")
+        # 「共有アイテム」を除外: owners に自分が含まれるもののみ
+        my_files = [f for f in my_files if not f.get("driveId")]
+        print(f"  [マイドライブ] {len(my_files)} ファイル")
+        all_files.extend(my_files)
+
+    # 共有ドライブ
+    if INDEX_SHARED_DRIVES:
+        whitelist = load_shared_drives_whitelist()
+        if not whitelist:
+            print("  [共有ドライブ] ホワイトリストが空のためスキップ")
+        else:
+            # 共有ドライブの名前を取得
+            drives_response = service.drives().list(pageSize=100).execute()
+            drive_names = {d["id"]: d["name"] for d in drives_response.get("drives", [])}
+
+            for drive_id in whitelist:
+                drive_name = drive_names.get(drive_id, drive_id)
+                print(f"  [共有ドライブ] {drive_name} 取得中...", end="")
+                try:
+                    drive_files = _list_files_in_drive(service, drive_id=drive_id)
+                    print(f" {len(drive_files)} ファイル")
+                    all_files.extend(drive_files)
+                except Exception as e:
+                    print(f" エラー: {e}")
+
+    print(f"  合計: {len(all_files)} ファイル")
+    return all_files
 
 
 def _download_content(service, file_id):
