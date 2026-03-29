@@ -131,6 +131,133 @@ def lookup(url: str) -> str:
 
 
 @mcp.tool()
+def folder_tree(drive_filter: str = None) -> str:
+    """インデックスDBからフォルダ構成ツリーを表示する。
+
+    DB に保存された folder_path カラムを集計して再構築する。
+    次回ビルド（build_parallel.py）以降のデータから有効。
+
+    Args:
+        drive_filter: ドライブ名でフィルタ（例: "GW_LIB"）。省略時は全ドライブ表示。
+    """
+    conn = _get_conn()
+    cur = conn.cursor()
+
+    if drive_filter:
+        cur.execute(
+            """
+            SELECT folder_path, file_type, COUNT(DISTINCT title) AS cnt
+            FROM documents
+            WHERE folder_path IS NOT NULL AND folder_path != ''
+              AND folder_path LIKE %s
+            GROUP BY folder_path, file_type
+            ORDER BY folder_path, file_type
+            """,
+            (f"{drive_filter}%",),
+        )
+    else:
+        cur.execute(
+            """
+            SELECT folder_path, file_type, COUNT(DISTINCT title) AS cnt
+            FROM documents
+            WHERE folder_path IS NOT NULL AND folder_path != ''
+            GROUP BY folder_path, file_type
+            ORDER BY folder_path, file_type
+            """
+        )
+    rows = cur.fetchall()
+    cur.close()
+
+    if not rows:
+        return "folder_path データがありません。次回ビルド後に有効になります。"
+
+    # folder_path → {file_type: count} の集計
+    from collections import defaultdict
+    folder_info = defaultdict(lambda: defaultdict(int))
+    for path, ftype, cnt in rows:
+        short_type = ftype.split(".")[-1] if ftype else "other"
+        folder_info[path][short_type] += cnt
+
+    # ツリー表示
+    lines = ["## フォルダ構成"]
+    prev_parts = []
+    for path, type_counts in sorted(folder_info.items()):
+        parts = [p.strip() for p in path.split(" / ")]
+        depth = len(parts) - 1
+
+        # 変わった深さから表示
+        indent = "  " * depth
+        folder_name = parts[-1]
+        total = sum(type_counts.values())
+        type_summary = ", ".join(f"{k}:{v}" for k, v in sorted(type_counts.items()))
+        lines.append(f"{indent}📁 {folder_name}  ({total}件: {type_summary})")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def recent_changes() -> str:
+    """直近の差分同期（sync.py）で追加・更新・削除されたファイル一覧を返す。
+
+    sync.py を実行するたびに結果が上書き保存される。
+    差分同期を一度も実行していない場合は未実行と表示する。
+    """
+    import json
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT value, updated_at FROM sync_state WHERE key = 'last_sync_result'"
+    )
+    row = cur.fetchone()
+    cur.close()
+
+    if not row:
+        return "差分同期はまだ実行されていません。`./run_sync.sh` を実行してください。"
+
+    try:
+        data = json.loads(row[0])
+    except Exception:
+        return "同期結果の読み込みに失敗しました。"
+
+    synced_at = data.get("synced_at", "不明")
+    added = data.get("added", [])
+    updated = data.get("updated", [])
+    deleted = data.get("deleted", [])
+    skipped = data.get("skipped", 0)
+    errors = data.get("errors", 0)
+
+    lines = [f"## 直近の差分同期結果（{synced_at}）"]
+    lines.append(f"追加:{len(added)} 更新:{len(updated)} 削除:{len(deleted)} スキップ:{skipped} エラー:{errors}")
+
+    def _fmt_files(files):
+        result = []
+        for f in files:
+            name = f.get("name", "?")
+            url = f.get("url", "")
+            result.append(f"- {name}" + (f"  \n  {url}" if url else ""))
+        return result
+
+    if added:
+        lines.append("")
+        lines.append("### 追加されたファイル")
+        lines.extend(_fmt_files(added))
+    if updated:
+        lines.append("")
+        lines.append("### 更新されたファイル")
+        lines.extend(_fmt_files(updated))
+    if deleted:
+        lines.append("")
+        lines.append("### 削除されたファイル")
+        lines.extend(_fmt_files(deleted))
+
+    if not added and not updated and not deleted:
+        lines.append("")
+        lines.append("変更はありませんでした。")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
 def stats() -> str:
     """インデックスDBの統計情報を返す。
 

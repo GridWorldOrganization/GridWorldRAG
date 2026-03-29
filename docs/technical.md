@@ -419,6 +419,20 @@ Sheets API は `ReadRequestsPerMinutePerUser: 60` の制限がある。8ワー�
 | 通常ファイル | `{drive_file_id}_chunk_{chunk_index}` |
 | スプレッドシート | `{drive_file_id}_sheet_{sheet_gid}_chunk_{chunk_index}` |
 
+### ワーカーステータス一覧
+
+モニター（`monitor.sh`）および進捗 JSON (`/tmp/gridworldrag_progress/worker_N.json`) の `status` 値。
+
+| status 値 | モニター表示 | 説明 |
+|---|---|---|
+| `running` | `XX% ドライブ名` | 通常稼働中 |
+| `loading` | `起動中` | モデル・認証の初期化中 |
+| `ready` | `待機中` | タスク待ち（次タスクの開始前） |
+| `done` | `完了` | 全担当タスク完了 |
+| `rate_limited` | `レート制限待ち` | API レート制限で一時停止 |
+| `rate_limited_running` | `XX%(レート制限待ち)` | 処理継続しつつレート制限待ち |
+| （JSON なし） | `停止中` | ワーカープロセス未起動 |
+
 ### content のプレフィックス
 
 | プレフィックス | 説明 |

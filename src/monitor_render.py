@@ -9,6 +9,8 @@ import os
 import re
 import sys
 
+from src.config import WorkerStatus
+
 
 def render(worker_count, progress_dir, elapsed):
     """全ワーカーの進捗を読み取り、表示行のリストを返す。"""
@@ -44,13 +46,13 @@ def render(worker_count, progress_dir, elapsed):
         total_chunks += chunks
         total_errors += errs
 
-        if status == "done":
-            lines.append(f"W{wid}[####################] done {proc} tasks")
-        elif status == "loading":
+        if status == WorkerStatus.DONE:
+            lines.append(f"W{wid}[####################] 完了")
+        elif status == WorkerStatus.LOADING:
             lines.append(f"W{wid}[....................] 起動中")
-        elif status == "rate_limited":
+        elif status == WorkerStatus.RATE_LIMITED:
             lines.append(f"W{wid}[....................] レート制限待ち")
-        elif status == "rate_limited_running":
+        elif status == WorkerStatus.RATE_LIMITED_RUNNING:
             cur = d.get("current", 0)
             task_size = d.get("total", 1)
             pct = cur * 100 // task_size if task_size > 0 else 0
@@ -61,7 +63,7 @@ def render(worker_count, progress_dir, elapsed):
             filled = pct // 5
             bar = "#" * filled + "." * (20 - filled)
             lines.append(f"W{wid}[{bar}]{pct:3d}%(レート制限待ち) {label}")
-        elif status == "ready":
+        elif status == WorkerStatus.READY:
             lines.append(f"W{wid}[....................] 待機中")
         else:
             tp = d.get("drive_type", "共有")

@@ -49,4 +49,5 @@ def make_chunk_entry(file_info, chunk_text, embedding, chunk_index,
         "sheet_name": sheet_name,
         "permissions": extract_permissions(file_info),
         "partial_content": partial_content,
+        "folder_path": file_info.get("folder_path", ""),
     }

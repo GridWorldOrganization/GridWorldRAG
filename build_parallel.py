@@ -29,12 +29,14 @@ from src.config import (
     EMBEDDING_MODEL, CHUNK_SIZE, CHUNK_OVERLAP, BATCH_SIZE,
     GOOGLE_EMAIL, INDEX_MY_DRIVE, INDEX_SHARED_DRIVES, INDEX_IMAGE_OCR,
     PARALLEL_WORKERS, TASK_SPLIT_THRESHOLD, MONITOR_INTERVAL_MS,
-    WORKER_START_INTERVAL_SEC, load_shared_drives_whitelist,
+    WORKER_START_INTERVAL_SEC, DRIVE_DOWNLOAD_TIMEOUT_SEC,
+    load_shared_drives_whitelist, WorkerStatus,
 )
 from src.drive_client import (
     authenticate, list_files_in_drive, extract_text,
     extract_spreadsheet_sheets, SKIP_MIME_TYPES,
-    set_rate_limit_callback,
+    set_rate_limit_callback, _download_with_sigalrm, _DownloadTimeoutError,
+    attach_folder_paths,
 )
 from src.indexer import make_chunk_entry
 
@@ -50,7 +52,7 @@ FOLDER_MIME = "application/vnd.google-apps.folder"
 
 def _write_progress(worker_id, *, task_label="", task_current=0, task_size=0,
                     processed=0, skipped=0, errors=0, chunks=0,
-                    status="running", drive_type="共有",
+                    status=WorkerStatus.RUNNING, drive_type="共有",
                     tasks_done=0, tasks_total=0, part="", drive_total=0,
                     completed_tasks=None):
     """ワーカーの進捗を JSON ファイルに書き出す（モニター用）。"""
@@ -117,7 +119,13 @@ def _process_file(file_info, model, splitter, service, batch, sheets_semaphore=N
         if sheets_semaphore:
             sheets_semaphore.acquire()
         try:
-            sheets = extract_spreadsheet_sheets(file_info["id"])
+            sheets = _download_with_sigalrm(
+                lambda: extract_spreadsheet_sheets(file_info["id"]),
+                DRIVE_DOWNLOAD_TIMEOUT_SEC,
+            )
+        except _DownloadTimeoutError:
+            print(f"  警告: スプレッドシートタイムアウト [{file_info.get('name', '?')}]", flush=True)
+            sheets = []
         finally:
             if sheets_semaphore:
                 sheets_semaphore.release()
@@ -179,7 +187,7 @@ def _process_file(file_info, model, splitter, service, batch, sheets_semaphore=N
 def _worker(worker_id, task_queue, tasks_total, results_queue, sheets_semaphore):
     """ワーカープロセス: キューからタスクを取得して順次処理する。"""
     # 起動中マーカー（モデルロード前に即座に書き出し）
-    _write_progress(worker_id, status="loading", tasks_total=tasks_total)
+    _write_progress(worker_id, status=WorkerStatus.LOADING, tasks_total=tasks_total)
 
     from langchain_text_splitters import RecursiveCharacterTextSplitter
     from sentence_transformers import SentenceTransformer
@@ -199,7 +207,7 @@ def _worker(worker_id, task_queue, tasks_total, results_queue, sheets_semaphore)
     tasks_done = 0
     completed_tasks = []  # 完了タスクのラベル+パート ["GW_庶務(1/1)", "GW_LIB_EDU(1/5)"]
 
-    def progress(status="running", **kwargs):
+    def progress(status=WorkerStatus.RUNNING, **kwargs):
         """進捗書き出しのショートカット。"""
         _write_progress(
             worker_id, status=status,
@@ -221,7 +229,7 @@ def _worker(worker_id, task_queue, tasks_total, results_queue, sheets_semaphore)
     def _on_rate_limit(waiting):
         if waiting:
             # タスク処理中なら rate_limited_running、待機中なら rate_limited
-            status = "rate_limited_running" if _current_task_kwargs else "rate_limited"
+            status = WorkerStatus.RATE_LIMITED_RUNNING if _current_task_kwargs else WorkerStatus.RATE_LIMITED
             _write_progress(worker_id, status=status,
                             processed=total_processed, skipped=total_skipped,
                             errors=total_errors, chunks=total_chunks,
@@ -231,7 +239,7 @@ def _worker(worker_id, task_queue, tasks_total, results_queue, sheets_semaphore)
 
     set_rate_limit_callback(_on_rate_limit)
 
-    progress(status="ready")
+    progress(status=WorkerStatus.READY)
 
     while True:
         task = task_queue.get()  # ブロッキング取得（センチネル None で終了）
@@ -258,7 +266,34 @@ def _worker(worker_id, task_queue, tasks_total, results_queue, sheets_semaphore)
 
         batch = []
         for fi, file_info in enumerate(files):
-            p, s, e, c = _process_file(file_info, model, splitter, service, batch, sheets_semaphore)
+            _fname = file_info.get("name", "?")
+            _folder = file_info.get("parents_path", file_info.get("drive_name", task_label))
+            _mime = file_info.get("mimeType", "?").split(".")[-1]
+            _ts_start = time.strftime("%H:%M:%S")
+            print(f"[{_ts_start}] W{worker_id} {fi+1}/{task_size} 開始  [{_folder}] {_fname} ({_mime})", flush=True)
+
+            _file_start = time.time()
+            _presult = [None]; _perror = [None]
+            def _run_process():
+                try:
+                    _presult[0] = _process_file(file_info, model, splitter, service, batch, sheets_semaphore)
+                except Exception as _ex:
+                    _perror[0] = _ex
+            _pt = threading.Thread(target=_run_process, daemon=True)
+            _pt.start()
+            _pt.join(timeout=DRIVE_DOWNLOAD_TIMEOUT_SEC)
+            _file_elapsed = time.time() - _file_start
+            _ts = time.strftime("%H:%M:%S")
+            if _pt.is_alive():
+                print(f"[{_ts}] W{worker_id} {fi+1}/{task_size} timeout {_file_elapsed:.1f}s  [{_folder}] {_fname}", flush=True)
+                p, s, e, c = 0, 0, 1, 0
+            elif _perror[0] is not None:
+                print(f"[{_ts}] W{worker_id} {fi+1}/{task_size} err   {_file_elapsed:.1f}s  [{_folder}] {_fname}  ({_perror[0]})", flush=True)
+                p, s, e, c = 0, 0, 1, 0
+            else:
+                p, s, e, c = _presult[0]
+                _result = "skip" if s else ("err" if e else "ok")
+                print(f"[{_ts}] W{worker_id} {fi+1}/{task_size} {_result}   {_file_elapsed:.1f}s  [{_folder}] {_fname}", flush=True)
             total_processed += p
             total_skipped += s
             total_errors += e
@@ -296,11 +331,11 @@ def _worker(worker_id, task_queue, tasks_total, results_queue, sheets_semaphore)
             drive_type=drive_type, part=task_part, drive_total=task_drive_total,
         )
         time.sleep(MONITOR_INTERVAL_MS / 1000)
-        progress(status="ready")
+        progress(status=WorkerStatus.READY)
         time.sleep(MONITOR_INTERVAL_MS / 1000)
 
     conn.close()
-    progress(status="done")
+    progress(status=WorkerStatus.DONE)
 
     results_queue.put({
         "worker_id": worker_id,
@@ -431,6 +466,7 @@ def collect_file_lists(service):
             and any(o.get("emailAddress") == GOOGLE_EMAIL for o in f["owners"])
         ]
         if my_files:
+            attach_folder_paths(my_files, "マイドライブ")
             drive_file_lists.append(("マイドライブ", "マイ", my_files))
 
     if INDEX_SHARED_DRIVES and whitelist:
@@ -460,6 +496,7 @@ def collect_file_lists(service):
             try:
                 svc = authenticate()
                 files = list_files_in_drive(svc, drive_id=drive_id)
+                attach_folder_paths(files, drive_name)
                 _fetch_complete(idx)
                 return idx, drive_name, files, None
             except Exception as e:
@@ -471,6 +508,7 @@ def collect_file_lists(service):
                     try:
                         svc = authenticate()
                         files = list_files_in_drive(svc, drive_id=drive_id)
+                        attach_folder_paths(files, drive_name)
                         _fetch_complete(idx)
                         return idx, drive_name, files, None
                     except Exception as e2:
@@ -698,7 +736,7 @@ def main():
             total_skipped += w_skip
             total_errors += w_err
             total_chunks += w_chunks
-            mark = "完了" if status == "done" else "中断"
+            mark = "完了" if status == WorkerStatus.DONE else "中断"
             print(f"  W{i}: {mark}  タスク:{w_tasks}"
                   f"  処理:{w_proc} スキップ:{w_skip}"
                   f"  エラー:{w_err} チャンク:{w_chunks}")

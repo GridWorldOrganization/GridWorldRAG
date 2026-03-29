@@ -4,6 +4,28 @@ import os
 import sys
 from pathlib import Path
 
+
+class WorkerStatus:
+    """ワーカーの進捗 JSON に書き込む status 値の定数。
+
+    monitor_render.py と build_parallel.py で共有する。
+    JSON は文字列で保存されるため str サブクラスにしない（定数として参照するだけ）。
+
+    一覧:
+        LOADING            : モデル・認証の初期化中
+        RUNNING            : 通常稼働中（ファイル処理中）
+        READY              : タスク待ち（次タスクの開始前）
+        RATE_LIMITED       : API レート制限で一時停止中
+        RATE_LIMITED_RUNNING: 処理継続しつつレート制限待ち
+        DONE               : 全担当タスク完了
+    """
+    LOADING             = "loading"
+    RUNNING             = "running"
+    READY               = "ready"
+    RATE_LIMITED        = "rate_limited"
+    RATE_LIMITED_RUNNING = "rate_limited_running"
+    DONE                = "done"
+
 PROJECT_ROOT = Path(__file__).parent.parent
 
 
@@ -55,6 +77,7 @@ PARALLEL_WORKERS = int(os.environ.get("PARALLEL_WORKERS", "8"))
 TASK_SPLIT_THRESHOLD = int(os.environ.get("TASK_SPLIT_THRESHOLD", "5000"))
 MONITOR_INTERVAL_MS = int(os.environ.get("MONITOR_INTERVAL_MS", "800"))
 WORKER_START_INTERVAL_SEC = float(os.environ.get("WORKER_START_INTERVAL_SEC", "5"))
+DRIVE_DOWNLOAD_TIMEOUT_SEC = int(os.environ.get("DRIVE_DOWNLOAD_TIMEOUT_SEC", "30"))
 
 # 埋め込み
 EMBEDDING_MODEL = "multi-qa-mpnet-base-dot-v1"

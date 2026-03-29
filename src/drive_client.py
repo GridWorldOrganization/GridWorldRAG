@@ -7,6 +7,7 @@ build_index.py, watcher.py など複数スクリプトから利用される。
 import io
 import pickle
 import signal
+import socket
 
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -16,6 +17,7 @@ from googleapiclient.http import MediaIoBaseDownload
 from src.config import (
     GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_EMAIL, TOKEN_PATH,
     INDEX_MY_DRIVE, INDEX_SHARED_DRIVES, load_shared_drives_whitelist,
+    DRIVE_DOWNLOAD_TIMEOUT_SEC,
 )
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
@@ -82,36 +84,66 @@ class _PDFTimeoutError(Exception):
     pass
 
 
+class _DownloadTimeoutError(Exception):
+    pass
+
+
+def _download_with_sigalrm(func, timeout_sec):
+    """func() をスレッドタイムアウト付きで実行する。
+
+    daemon スレッドで func() を走らせ、timeout_sec 秒以内に完了しない場合は
+    _DownloadTimeoutError を投げる。スレッドは放棄（socket が最終的に閉じる）。
+    SIGALRM は httplib2 内部の except Exception に飲まれるため使わない。
+    """
+    import threading
+    result = [None]
+    error = [None]
+
+    def _run():
+        try:
+            result[0] = func()
+        except Exception as e:
+            error[0] = e
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout=timeout_sec)
+    if t.is_alive():
+        raise _DownloadTimeoutError()
+    if error[0] is not None:
+        raise error[0]
+    return result[0]
+
+
 def _extract_pdf_with_timeout(content, timeout_sec=60):
     """PDFテキストをタイムアウト付きで1ページずつ抽出する。
+
+    threading ベース（SIGALRM は非メインスレッドで使えないため）。
 
     Returns:
         (text, is_partial): text は抽出テキスト（Noneの場合は抽出不可）、
                             is_partial は途中でタイムアウトした場合 True。
     """
-    import pypdf
+    import pypdf, threading
     collected = []
-    is_partial = False
+    error = [None]
 
-    def _handler(signum, frame):
-        raise _PDFTimeoutError()
+    def _run():
+        try:
+            reader = pypdf.PdfReader(content)
+            for page in reader.pages:
+                collected.append(page.extract_text() or "")
+        except Exception as e:
+            error[0] = e
 
-    old_handler = signal.signal(signal.SIGALRM, _handler)
-    signal.alarm(timeout_sec)
-    try:
-        reader = pypdf.PdfReader(content)
-        for page in reader.pages:
-            collected.append(page.extract_text() or "")
-        signal.alarm(0)
-    except _PDFTimeoutError:
-        is_partial = True
-    finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, old_handler)
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout=timeout_sec)
+    is_partial = t.is_alive()  # まだ動いている = タイムアウト
 
     text = "\n".join(collected)
     if not text.strip():
-        return None, False  # タイムアウト前に1ページも取れなかった場合も同様
+        return None, False
     return text, is_partial
 
 
@@ -225,7 +257,7 @@ def list_files_in_drive(service, drive_id=None, corpora="user"):
     kwargs = {
         "q": query,
         "spaces": "drive",
-        "fields": "nextPageToken, files(id, name, mimeType, modifiedTime, owners, webViewLink, driveId, permissions(emailAddress, role, type, displayName))",
+        "fields": "nextPageToken, files(id, name, mimeType, modifiedTime, owners, webViewLink, driveId, parents, permissions(emailAddress, role, type, displayName))",
         "pageSize": 1000,
         "supportsAllDrives": True,
         "includeItemsFromAllDrives": True,
@@ -300,14 +332,16 @@ def list_all_files(service):
 
 
 def _download_content(service, file_id):
-    """ファイルをバイナリでダウンロードする。"""
-    request = _api_call_with_retry(lambda: service.files().get_media(fileId=file_id))
-    content = io.BytesIO()
-    downloader = MediaIoBaseDownload(content, request)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-    return content
+    """ファイルをバイナリでダウンロードする（SIGALRM タイムアウト付き）。"""
+    def _do():
+        request = _api_call_with_retry(lambda: service.files().get_media(fileId=file_id))
+        content = io.BytesIO()
+        downloader = MediaIoBaseDownload(content, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        return content
+    return _download_with_sigalrm(_do, DRIVE_DOWNLOAD_TIMEOUT_SEC)
 
 
 def extract_text(service, file_info):
@@ -340,13 +374,19 @@ def extract_text(service, file_info):
     if mime_type in EXPORT_MIME_MAP:
         export_mime = EXPORT_MIME_MAP[mime_type]
         try:
-            request = _api_call_with_retry(lambda: service.files().export_media(fileId=file_id, mimeType=export_mime))
-            content = io.BytesIO()
-            downloader = MediaIoBaseDownload(content, request)
-            done = False
-            while not done:
-                _, done = downloader.next_chunk()
+            def _do_export():
+                request = _api_call_with_retry(lambda: service.files().export_media(fileId=file_id, mimeType=export_mime))
+                content = io.BytesIO()
+                downloader = MediaIoBaseDownload(content, request)
+                done = False
+                while not done:
+                    _, done = downloader.next_chunk()
+                return content
+            content = _download_with_sigalrm(_do_export, DRIVE_DOWNLOAD_TIMEOUT_SEC)
             return content.getvalue().decode("utf-8", errors="replace"), False
+        except _DownloadTimeoutError:
+            print(f"  警告: エクスポートタイムアウト [{file_info['name']}]", flush=True)
+            return None, False
         except Exception as e:
             print(f"  警告: エクスポート失敗 [{file_info['name']}]: {e}", flush=True)
             return None, False
@@ -356,6 +396,9 @@ def extract_text(service, file_info):
         try:
             content = _download_content(service, file_id)
             return content.getvalue().decode("utf-8", errors="replace"), False
+        except _DownloadTimeoutError:
+            print(f"  警告: ダウンロードタイムアウト [{file_info['name']}]", flush=True)
+            return None, False
         except Exception as e:
             print(f"  警告: ダウンロード失敗 [{file_info['name']}]: {e}", flush=True)
             return None, False
@@ -378,6 +421,9 @@ def extract_text(service, file_info):
                 print("  警告: pypdf がインストールされていません。PDF はスキップします。", flush=True)
                 return f"[PDF] {file_info['name']}", False
             return f"[スキャンPDF] {file_info['name']}", False
+        except _DownloadTimeoutError:
+            print(f"  警告: PDF ダウンロードタイムアウト [{file_info['name']}]", flush=True)
+            return f"[PDF] {file_info['name']}", False
         except Exception as e:
             print(f"  警告: PDF 処理失敗 [{file_info['name']}]: {e}", flush=True)
             return f"[PDF] {file_info['name']}", False
@@ -387,6 +433,9 @@ def extract_text(service, file_info):
         try:
             content = _download_content(service, file_id)
             return _try_ocr_image(content, file_info["name"]), False
+        except _DownloadTimeoutError:
+            print(f"  警告: 画像ダウンロードタイムアウト [{file_info['name']}]", flush=True)
+            return f"[画像] {file_info['name']}", False
         except Exception as e:
             print(f"  警告: 画像処理失敗 [{file_info['name']}]: {e}", flush=True)
             return f"[画像] {file_info['name']}", False
@@ -419,6 +468,104 @@ def _try_ocr_image(content, filename):
     return f"[画像] {filename}"
 
 
+def attach_folder_paths(files, drive_name=""):
+    """ファイルリスト内のフォルダエントリを使ってフォルダパスを解決し、
+    各 file_info に folder_path と drive_name を追加する。
+
+    Drive API の追加コールは行わず、取得済みリストのみで完結する。
+    drive_name を prefix として付ける（例: "GW_LIB / 2024 / 月次"）。
+    """
+    FOLDER_MIME = "application/vnd.google-apps.folder"
+
+    # {folder_id: {"name": str, "parents": [id, ...]}} のマップを構築
+    folder_map = {
+        f["id"]: {"name": f["name"], "parents": f.get("parents", [])}
+        for f in files
+        if f.get("mimeType") == FOLDER_MIME
+    }
+
+    # 解決済みパスのキャッシュ {folder_id: "path string"}
+    path_cache = {}
+
+    def _resolve(folder_id, visited=None):
+        if folder_id in path_cache:
+            return path_cache[folder_id]
+        if visited is None:
+            visited = set()
+        if folder_id in visited:
+            return ""
+        visited.add(folder_id)
+
+        info = folder_map.get(folder_id)
+        if not info:
+            # ドライブルート（フォルダ一覧に含まれないID）
+            result = drive_name
+        else:
+            parents = info.get("parents", [])
+            parent_path = _resolve(parents[0], visited) if parents else drive_name
+            name = info["name"]
+            result = f"{parent_path} / {name}" if parent_path else name
+
+        path_cache[folder_id] = result
+        return result
+
+    for f in files:
+        parents = f.get("parents", [])
+        if parents:
+            f["folder_path"] = _resolve(parents[0])
+        else:
+            f["folder_path"] = drive_name
+        f["drive_name"] = drive_name
+
+    return files
+
+
+def resolve_folder_path_api(service, file_info, cache=None):
+    """Drive API を呼び出してフォルダパスを解決する（sync.py 用）。
+
+    cache: {folder_id: {"name": str, "parents": [...]}} の共有辞書。
+    戻り値: "FolderA / SubFolder" 形式の文字列（ドライブ名は含まない）。
+    """
+    if cache is None:
+        cache = {}
+
+    parents = file_info.get("parents", [])
+    if not parents:
+        return ""
+
+    path_parts = []
+    current_id = parents[0]
+    drive_id = file_info.get("driveId")
+    visited = set()
+
+    while current_id:
+        if current_id in visited or current_id == drive_id:
+            break
+        visited.add(current_id)
+
+        if current_id not in cache:
+            try:
+                result = _api_call_with_retry(lambda fid=current_id: service.files().get(
+                    fileId=fid,
+                    fields="id,name,parents,driveId",
+                    supportsAllDrives=True,
+                ).execute())
+                cache[current_id] = result
+            except Exception:
+                break
+
+        info = cache.get(current_id, {})
+        name = info.get("name", "")
+        if name:
+            path_parts.append(name)
+
+        next_parents = info.get("parents", [])
+        current_id = next_parents[0] if next_parents else None
+
+    path_parts.reverse()
+    return " / ".join(path_parts)
+
+
 def get_changes_start_token(service):
     """Changes API の開始トークンを取得する。"""
     response = service.changes().getStartPageToken().execute()
@@ -434,7 +581,7 @@ def list_changes(service, page_token):
             spaces="drive",
             includeItemsFromAllDrives=True,
             supportsAllDrives=True,
-            fields="nextPageToken, newStartPageToken, changes(fileId, removed, file(id, name, mimeType, modifiedTime, owners, webViewLink))",
+            fields="nextPageToken, newStartPageToken, changes(fileId, removed, file(id, name, mimeType, modifiedTime, owners, webViewLink, driveId, parents))",
         ).execute()
 
         changes.extend(response.get("changes", []))

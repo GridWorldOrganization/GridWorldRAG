@@ -41,8 +41,8 @@ def insert_chunks(conn, chunks_data):
             INSERT INTO documents
                 (drive_file_id, title, content, chunk_index, owner,
                  source_url, file_type, drive_modified_at, embedding,
-                 sheet_gid, sheet_name, permissions, partial_content)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 sheet_gid, sheet_name, permissions, partial_content, folder_path)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (drive_file_id) DO UPDATE SET
                 title = EXCLUDED.title,
                 content = EXCLUDED.content,
@@ -55,7 +55,8 @@ def insert_chunks(conn, chunks_data):
                 sheet_gid = EXCLUDED.sheet_gid,
                 sheet_name = EXCLUDED.sheet_name,
                 permissions = EXCLUDED.permissions,
-                partial_content = EXCLUDED.partial_content
+                partial_content = EXCLUDED.partial_content,
+                folder_path = EXCLUDED.folder_path
             """,
             (
                 chunk["drive_file_id"],
@@ -71,6 +72,7 @@ def insert_chunks(conn, chunks_data):
                 chunk.get("sheet_name"),
                 json.dumps(chunk.get("permissions"), ensure_ascii=False) if chunk.get("permissions") else None,
                 chunk.get("partial_content", False),
+                chunk.get("folder_path", ""),
             ),
         )
     conn.commit()

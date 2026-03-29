@@ -26,6 +26,7 @@ ALTER TABLE documents ADD COLUMN IF NOT EXISTS sheet_gid TEXT;
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS sheet_name TEXT;
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS permissions JSONB;
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS partial_content BOOLEAN DEFAULT FALSE;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS folder_path TEXT DEFAULT '';
 
 -- ベクトル検索用インデックス（IVFFlat）
 CREATE INDEX IF NOT EXISTS idx_documents_embedding
