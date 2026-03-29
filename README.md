@@ -209,6 +209,23 @@ python ocr_scan.py --folder-id 0AFxyz --dry-run
 - 各チャンクにシート名（`[シート: シート名]`）を含むため、シート名でも検索可能
 - URL に `gid=` パラメータがある場合、そのシートのチャンクを優先して返す
 
+## 類似プロジェクトとの比較
+
+Google Drive + pgvector の RAG システムを目指した公開リポジトリは存在するが、このプロジェクトの全要件を満たすものは見当たらない（2026年3月時点）。
+
+| リポジトリ | Stars | 合致する点 | 不足している点 |
+|---|---|---|---|
+| [getomnico/omni](https://github.com/getomnico/omni) | 632 | Drive + pgvector + 権限継承 | Rust 製フルアプリ、Sheets シート別処理なし、MCP 非対応 |
+| [taylorwilsdon/google_workspace_mcp](https://github.com/taylorwilsdon/google_workspace_mcp) | 1,962 | Google Workspace MCP として最完全 | RAG / ベクトル検索なし |
+| [nofilamer/RAG_GDRIVE_PGVector_FASTAPI](https://github.com/nofilamer/RAG_GDRIVE_PGVector_FASTAPI) | 0 | Drive + pgvector の構成が近い | 権限なし、Sheets API 未使用、MCP 非対応 |
+
+このプロジェクト固有の組み合わせ:
+
+- **Sheets API でシート別に全データ取得**（CSV export ではなく全シート対応）
+- **共有ドライブのホワイトリスト制御**（対象ドライブを明示指定）
+- **pgvector + FastMCP の組み合わせ**（Claude Code から直接検索可能）
+- **権限を JSONB で chunk 単位に保持**（ファイル単位ではなく細粒度の権限管理）
+
 ## PostgreSQL データディレクトリの確認
 
 PostgreSQL の実データがどこに保存されているか確認するには:
@@ -219,6 +236,65 @@ psql -d postgres -c "SHOW data_directory;"
 ```
 
 Homebrew (ARM) でインストールした場合、通常は `/opt/homebrew/var/postgresql@17` になる。
+
+## 別マシンへのDB転送
+
+Google Drive へのアクセス権がない環境でも、ビルド済みのDBをエクスポート・インポートすることで利用できる。
+
+### エクスポート（ビルド済みマシン側）
+
+```bash
+# gridworldrag_0 を /tmp にダンプ
+./export_db.sh
+
+# 出力先・DB番号を指定
+./export_db.sh --db 1 --out ~/Desktop
+# → ~/Desktop/gridworldrag_1_20260330_1200.sql.gz
+```
+
+生成された `.sql.gz` ファイルを任意の方法で転送する。
+
+### インポート（受け取りマシン側）
+
+#### 事前準備（初回のみ）
+
+```bash
+# 1. リポジトリをクローン
+git clone https://github.com/GridWorldOrganization/GridWorldRAG.git
+cd GridWorldRAG
+
+# 2. Python 環境構築
+/opt/homebrew/opt/python@3.12/bin/python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+# 3. config.env を作成（Google認証は不要、DB設定のみ）
+cp config.env.example config.env
+# GRIDWORLDRAG_SKIP_CONFIG=1 を設定するか、以下の最小構成で作成:
+echo "GRIDWORLDRAG_SKIP_CONFIG=1" > config.env
+```
+
+#### DBインポート
+
+```bash
+./import_db.sh gridworldrag_0_20260330_1200.sql.gz
+# DB番号を指定する場合
+./import_db.sh gridworldrag_0_20260330_1200.sql.gz --db 0
+```
+
+インポート完了後、MCPサーバーを起動すれば検索が使える。
+
+#### MCPサーバー起動
+
+```bash
+# Claude Code に MCP サーバーを登録（初回のみ）
+claude mcp add gridworld-rag-mcp -- python gridworld-rag-mcp/server.py
+
+# DB番号を指定する場合
+claude mcp add gridworld-rag-mcp -- python gridworld-rag-mcp/server.py --db 0
+```
+
+> **注意**: インポート先では `build_parallel.py` や `sync.py` は不要。MCPサーバーのみ動かせばよい。
 
 ## ライセンス
 
