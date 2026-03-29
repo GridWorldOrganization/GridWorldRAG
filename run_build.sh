@@ -25,7 +25,7 @@ mkdir -p "$PROGRESS_DIR"
 : > "$LOG_FILE"
 
 # venv
-source .venv/bin/activate
+PYTHON="$SCRIPT_DIR/.venv/bin/python"
 
 # 設定読み込み
 WORKER_COUNT=$(grep '^PARALLEL_WORKERS=' config.env 2>/dev/null | cut -d= -f2)
@@ -62,10 +62,10 @@ cleanup() {
 trap cleanup INT TERM
 
 # Phase 1: ファイル一覧取得（stdout は画面に直接表示される）
-python build_parallel.py --fetch-only $DB_OPT 2>>"$LOG_FILE"
+$PYTHON build_parallel.py --fetch-only $DB_OPT 2>>"$LOG_FILE"
 
 # Phase 2: ワーカー処理（バックグラウンド）
-python build_parallel.py --work-only $DB_OPT >> "$LOG_FILE" 2>&1 &
+$PYTHON build_parallel.py --work-only $DB_OPT >> "$LOG_FILE" 2>&1 &
 BUILD_PID=$!
 
 # モニター
