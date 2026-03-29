@@ -203,7 +203,7 @@ def _worker(worker_id, task_queue, tasks_total, results_queue):
         task_processed_before = total_processed
         task_skipped_before = total_skipped
         task_errors_before = total_errors
-        print(f"[{task_start}] W{worker_id + 1} 開始: {task_label}({task_part}) {task_size} ファイル")
+        print(f"[{task_start}] W{worker_id + 1} 開始: {task_label}({task_part}) {task_size} ファイル", flush=True)
 
         batch = []
         for fi, file_info in enumerate(files):
@@ -233,7 +233,7 @@ def _worker(worker_id, task_queue, tasks_total, results_queue):
         task_s = total_skipped - task_skipped_before
         task_e = total_errors - task_errors_before
         print(f"[{task_end}] W{worker_id + 1} 完了: {task_label}({task_part})"
-              f"  処理:{task_p} スキップ:{task_s} エラー:{task_e}")
+              f"  処理:{task_p} スキップ:{task_s} エラー:{task_e}", flush=True)
         completed_tasks.append(f"{task_label}({task_part})")
         tasks_done += 1
 
@@ -248,7 +248,7 @@ def _worker(worker_id, task_queue, tasks_total, results_queue):
         t_ready = time.strftime("%H:%M:%S")
         time.sleep(MONITOR_INTERVAL_MS / 1000)
         t_before_get = time.strftime("%H:%M:%S")
-        print(f"[DEBUG] W{worker_id+1} タスク間: 100%={t_100} ready={t_ready} get前={t_before_get}")
+        print(f"[DEBUG] W{worker_id+1} タスク間: 100%={t_100} ready={t_ready} get前={t_before_get}", flush=True)
 
     conn.close()
     progress(status="done")
