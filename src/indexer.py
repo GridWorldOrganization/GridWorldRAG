@@ -28,7 +28,7 @@ def extract_owner(file_info):
 
 
 def make_chunk_entry(file_info, chunk_text, embedding, chunk_index,
-                     sheet_gid=None, sheet_name=None):
+                     sheet_gid=None, sheet_name=None, partial_content=False):
     """1チャンク分の DB 挿入データを作成する。"""
     if sheet_gid is not None:
         drive_file_id = f"{file_info['id']}_sheet_{sheet_gid}_chunk_{chunk_index}"
@@ -48,4 +48,5 @@ def make_chunk_entry(file_info, chunk_text, embedding, chunk_index,
         "sheet_gid": sheet_gid,
         "sheet_name": sheet_name,
         "permissions": extract_permissions(file_info),
+        "partial_content": partial_content,
     }

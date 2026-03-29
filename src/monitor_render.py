@@ -19,20 +19,20 @@ def render(worker_count, progress_dir, elapsed):
     total_errors = 0
 
     # ヘッダ
-    lines.append(f"GridWorldRAG build index {elapsed}")
+    lines.append(f"GridWorldRAG build index workers:{worker_count} time={elapsed}")
 
     # ワーカー行
-    for idx in range(worker_count):
+    for idx in range(1, worker_count + 1):
         f = os.path.join(progress_dir, f"worker_{idx}.json")
-        wid = idx + 1
         if not os.path.exists(f):
-            lines.append(f"W{wid}[....................] 停止中")
+            lines.append(f"W{idx}[....................] 停止中")
             continue
         try:
             d = json.load(open(f))
         except (json.JSONDecodeError, IOError):
-            lines.append(f"W{wid}[....................] 読込中")
+            lines.append(f"W{idx}[....................] 読込中")
             continue
+        wid = d.get("worker_id", idx)
 
         status = d.get("status", "run")
         proc = d.get("processed", 0)
@@ -48,6 +48,19 @@ def render(worker_count, progress_dir, elapsed):
             lines.append(f"W{wid}[####################] done {proc} tasks")
         elif status == "loading":
             lines.append(f"W{wid}[....................] 起動中")
+        elif status == "rate_limited":
+            lines.append(f"W{wid}[....................] レート制限待ち")
+        elif status == "rate_limited_running":
+            cur = d.get("current", 0)
+            task_size = d.get("total", 1)
+            pct = cur * 100 // task_size if task_size > 0 else 0
+            tp = d.get("drive_type", "共有")
+            nm = d.get("drive", "")
+            pt = d.get("part", "")
+            label = f"{tp} {nm}({pt})" if pt else f"{tp} {nm}"
+            filled = pct // 5
+            bar = "#" * filled + "." * (20 - filled)
+            lines.append(f"W{wid}[{bar}]{pct:3d}%(レート制限待ち) {label}")
         elif status == "ready":
             lines.append(f"W{wid}[....................] 待機中")
         else:
@@ -112,13 +125,35 @@ def render(worker_count, progress_dir, elapsed):
                 pass
     total_drive_count = len(all_drive_names) if all_drive_names else "?"
 
-    # サマリ行
+    # 全アイテム数を pickle から取得
+    total_items = "?"
+    task_data_pkl = "/tmp/gridworldrag_taskdata.pkl"
+    if os.path.exists(task_data_pkl):
+        try:
+            import pickle
+            with open(task_data_pkl, "rb") as pf:
+                bundle = pickle.load(pf)
+            total_items = bundle.get("total_items", "?")
+        except Exception:
+            pass
+
+    # 全体進捗バー（アイテム数ベース）
     total_current = total_proc + total_skip + total_errors
+    if isinstance(total_items, int) and total_items > 0:
+        overall_pct = total_current * 100 // total_items
+        overall_filled = overall_pct * 40 // 100
+        overall_bar = "#" * overall_filled + "." * (40 - overall_filled)
+        lines.append(f"[{overall_bar}]{overall_pct:3d}% {total_current}/{total_items} items")
+    else:
+        lines.append(f"[........................................] ?% {total_current}/? items")
+
+    # サマリ行
     total_detail = total_proc + total_skip
     lines.append(
-        f"workers:{worker_count} drives:{drives_done}/{total_drive_count}"
-        f" tasks:{total_tasks_done}/{total_tasks}"
-        f" scanned:{total_current} detail:{total_proc}/{total_detail}"
+        f"drives:{drives_done}/{total_drive_count}"
+        f"(tasks:{total_tasks_done}/{total_tasks})"
+        f" item-scanned:{total_current}/{total_items}"
+        f" detail:{total_proc}/{total_detail}"
         f" chunks:{total_chunks} errors:{total_errors}"
     )
     lines.append("Ctrl+C to stop | log: tail -f /tmp/gridworldrag_build.log")

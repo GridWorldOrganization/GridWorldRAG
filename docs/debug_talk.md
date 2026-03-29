@@ -176,3 +176,247 @@
 > **claude**: Google Drive の公式ドキュメントでは「アイテム（item）」と呼んでいます。
 >
 > **tobisako**: では 645アイテム (483ファイル 162フォルダ) にして。
+
+---
+
+## 11. レート制限の正体を突き止める
+
+> **tobisako**: W7 が体感20秒超えた。ログチェックして。何秒だったか。そしてなぜこれがおこるのか。
+>
+> **claude**: ログを確認します。
+
+ログを調べたところ、W7 のエントリが出ていない。さらに Sheets API の 429 エラーを発見:
+
+```
+警告: スプレッドシート取得失敗: <HttpError 429 ...
+"Quota exceeded for quota metric 'Read requests' ...
+quota_limit_value: 60, ReadRequestsPerMinutePerUser"
+```
+
+> **claude**: 原因判明。Sheets API のレート制限（60リクエスト/分/ユーザー）です。8ワーカーが同時にスプレッドシートを処理すると1分あたり60リクエストをすぐ超える。`_api_call_with_retry` がリトライしますが、バックオフ待ちで10-20秒かかっていました。
+>
+> **tobisako**: 「レート制限バックオフ待ち中」である事を、「待機中」「起動中」と同じく、ステータス表示してほしい。
+
+`drive_client.py` にコールバック機構を追加。レート制限発生時にワーカーのステータスを `rate_limited` に更新。モニターに「レート制限待ち」を表示:
+
+```
+W7[....................] レート制限待ち
+```
+
+---
+
+## 12. ログが出ない問題
+
+> **tobisako**: ちゃんと100%処理おわった、待機してる、次のタスクがはじまったってのが、.logに記載されるしくみになっているか。
+>
+> **claude**: ログを確認したところ、W7 のエントリが出ていません。`print` のバッファリングで即座にフラッシュされていませんでした。全 `print` に `flush=True` を追加します。
+
+---
+
+## 13. DB にフォルダ名も画像ファイル名も入れたい
+
+> **tobisako**: スキップって、DBには、フォルダ名も、画像ファイル名もはいらないの？？
+>
+> **claude**: その通りです。現状フォルダは `SKIP_MIME_TYPES` でスキップ、画像は `INDEX_IMAGE_OCR=0` でスキップされ、DBに入りません。
+>
+> **tobisako**: すぐに修正して。プロセス止める。
+
+対策:
+- フォルダ: `SKIP_MIME_TYPES` から除外し、`[フォルダ] ファイル名` としてDBに記録
+- 画像（OCR無効時）: `[画像] ファイル名` としてDBに記録
+- これにより「そのファイルがそこに存在している」ことが検索可能に
+
+---
+
+## 14. スプレッドシートの全シート対応
+
+> **tobisako**: スプレッドシートは、スプシ1ファイルにシートが複数あって、それらの情報はすべてDBになるだろうか。
+>
+> **claude**: 現在は Google Drive API の export で CSV 出力していますが、最初のシートしかエクスポートされません。
+>
+> **tobisako**: 全て対応して。また、スプレッドシートは URL でシートを直接指定できるから、そのシートの情報を1番に返す必要がある。
+
+対策:
+- Sheets API (`drive.readonly` スコープで動作) で全シートをシート別に取得
+- 各チャンクに `[シート: シート名]` を含めて検索可能に
+- `lookup_by_url` で URL の `gid=` パラメータを解析し、該当シートのチャンクを優先返却
+- DB に `sheet_gid`, `sheet_name` カラムを追加
+
+---
+
+## 15. 権限情報もDBに入れたい
+
+> **tobisako**: あと、DBに、各ファイル・各フォルダの、共有：アクセス出来るユーザー（その権限）を追加して。
+>
+> **claude**: Drive API の `permissions` フィールドを取得し、JSONB カラムで保存します。何十人でもJSON配列として格納。
+>
+> **tobisako**: 各ファイルごとに、権限：ユーザーは、何十人も設定可能だが、これはどうやってDBに記録してるの？
+
+```json
+[
+  {"email": "user@example.com", "name": "田中", "role": "writer", "type": "user"},
+  {"email": "gridworld.co", "name": "", "role": "reader", "type": "domain"}
+]
+```
+
+PostgreSQL の JSONB なので直接クエリも可能:
+```sql
+SELECT title FROM documents WHERE permissions @> '[{"email": "tanaka@example.com"}]';
+```
+
+---
+
+## 16. パブリック公開準備
+
+> **tobisako**: このリポジトリも、パブリック公開する予定なので、一般的なスターの多いclaude code系リポジトリを参考に、汎用的に構成を再確認・調整して。
+
+調査の結果、以下を追加:
+- `LICENSE` (MIT)
+- `CONTRIBUTING.md`
+- `.gitignore` の拡充（IDE、ビルド成果物等）
+- `VectorDB/` → `docs/` にリネーム
+- `setup.sh` の pip cache ハードコードパス削除
+- `config.py` に `GRIDWORLDRAG_SKIP_CONFIG` ガード追加（CI/テスト対応）
+
+---
+
+## 17. M2 Mac の罠
+
+開発序盤、最大の障害は Python 環境だった。
+
+> **tobisako**: この MAC は M2 MAC だ。
+>
+> **claude**: Intel 版の Homebrew (`/usr/local`) が使われていました。ARM 版 (`/opt/homebrew`) に切り替えます。
+
+- Anaconda (Intel x86_64 版) が `/usr/local` にあり、`python3` が x86_64 の Python 3.8 を指していた
+- Intel 版では PyTorch 2.2.2 が上限（macOS x86_64 の wheel 配布が終了）
+- sentence-transformers 5.x は PyTorch 2.4+ を要求
+- ARM 版 Python に切り替えて PyTorch 2.11.0 がインストール可能に
+
+この知見は `CLAUDE.md` に記録し、二度と踏まないようにした。
+
+---
+
+## 18. Sheets API レート制限で全ワーカーが止まる
+
+> **tobisako**: なんだこれ。
+
+```
+W1[....................] レート制限待ち
+W2[....................] レート制限待ち
+W3[....................] レート制限待ち
+W4[....................] レート制限待ち
+W5[#...................]  6% 共有 GW_LIB_EDU(1/5) 13/200/838
+W6[....................] レート制限待ち
+W7[....................] レート制限待ち
+W8[....................] レート制限待ち
+```
+
+8ワーカー中7つがレート制限待ち。
+
+> **claude**: Sheets API のレート制限（60リクエスト/分/ユーザー）に全ワーカーが同時に引っかかっています。各ワーカーが独立にリトライするので、全員が同時にリトライ → また全員レート制限 → の悪循環です。
+>
+> **tobisako**: セマフォ実装して。
+
+`multiprocessing.Semaphore(2)` でプロセス間セマフォを実装。Sheets API への同時アクセスを最大2ワーカーに制限:
+
+- スプレッドシート処理前に `semaphore.acquire()`
+- 処理完了後に `semaphore.release()`（`try/finally` で確実に解放）
+- 60リクエスト/分 ÷ 2ワーカー = 各30リクエスト/分で余裕を持って動作
+
+---
+
+## 19. ワーカー起動間隔の最適値
+
+> **tobisako**: `WORKER_START_INTERVAL_SEC=10` にした。この値、デフォルトはいくらが適切だとおもう？
+>
+> **claude**: 2秒だと全員同時にSheetsAPIを叩き始める。10秒だと全員起動に70秒かかり遅い。デフォルト5が適切です。API負荷の分散と起動速度のバランスが良い。
+>
+> **tobisako**: OK 5 でいこう。
+
+---
+
+## 20. エラー時にもファイル名をDBに記録する
+
+> **tobisako**: errorsのものは、itemのファイル名はDBにかきこまれるが、detailが書き込めていない状態で記録されるならOK。
+>
+> **claude**: 現在はそうなっていません。errors の場合、ファイル名もDBに入りません。`_process_file` で `except Exception` → 即リターンし、batch に何も追加されません。
+>
+> **tobisako**: 投入して。
+
+`_error_fallback` 関数を追加。エラー発生時にも `[エラー] ファイル名` としてDBに記録する:
+
+```python
+def _error_fallback(file_info, file_name, model, batch):
+    """エラー時にファイル名だけでもDBに記録する。"""
+    text = f"[エラー] {file_name}"
+    emb = model.encode([text])[0]
+    batch.append(make_chunk_entry(file_info, text, emb, 0))
+    return 0, 0, 1, 1  # error=1, chunk=1
+```
+
+これにより、エラーが発生したファイルも「そのファイルが存在し、処理でエラーが出た」ことが検索可能になった。
+
+---
+
+## 21. MCPサーバーのもっさり感を改善
+
+> **tobisako**: vectorDB作ったはいいが、もっさり感は拭えない。どうにかならん？
+
+ボトルネックが2つあった：
+
+1. **毎リクエストDB接続**: `connect()` を毎回呼んでいた → TCP ハンドシェイク + pgvector 登録のオーバーヘッドが毎回発生
+2. **遅延ロード**: 初回リクエストでモデルをロードしていた → 初回だけ数秒かかる
+
+`gridworld-rag-mcp/server.py` を修正：
+- DB接続をモジュールレベルのシングルトンに変更（`_get_conn()` で死活確認しつつ使い回し）
+- `SentenceTransformer` を起動時にプリロード（遅延ロード廃止）
+- `conn.close()` の呼び出しも全て削除
+
+---
+
+## 22. W2停止の誤診とワーカーID命名ズレ
+
+> **tobisako**: W2が41からまったく進まない。
+
+プロセスと JSON を確認。
+
+> **claude**: W1が GW_PJ_Secret を CLOSE_WAIT でハングしています。
+
+**これが誤りだった。** JSONファイルは0始まり（`worker_0.json`〜`worker_6.json`）、モニター/ログは1始まり（W1〜W7）で、`worker_1.json` を「W1」と表示してしまった。実際には `worker_1.json` = モニターの **W2** だった。
+
+> **tobisako**: W1と発言して間違えた（本当はW2だった）のは何が原因？
+
+原因：JSONの `worker_id`（0始まり）をそのまま `W{worker_id}` と出力したため、モニター表示（`idx+1`）とズレが生じた。
+
+**根本原因**：内部IDと表示IDが一致していなかった。
+
+- `build_parallel.py` のプロセス生成: `range(n_workers)` → `range(1, n_workers+1)`
+- ログ出力: `W{worker_id + 1}` → `W{worker_id}`（変換不要）
+- シャットダウンループ: `enumerate(processes)` → `enumerate(processes, 1)`
+- 最終チェックループ: `range(n_workers)` → `range(1, n_workers+1)`
+- `monitor_render.py`: `wid = idx + 1` を廃止し、JSONの `worker_id` を直接使用
+
+**ルール**: `print("W" + str(wid+1))` のような「表示直前に+1」を絶対にしない。内部IDと表示IDを一致させる。
+
+---
+
+## 23. W2ハングの実態（CLOSE_WAIT）
+
+> **tobisako**: W2が41/135でまったく進まない。
+
+プロセス（PID 74440）の `lsof` を確認：
+
+```
+TCP 10.5.0.2:51532->1e100.net:https (CLOSE_WAIT)
+TCP 10.5.0.2:51624->1e100.net:https (CLOSE_WAIT)
+TCP 10.5.0.2:49684->1e100.net:https (CLOSE_WAIT)
+```
+
+**CLOSE_WAIT** = Google が接続を閉じたのにこちらが応答待ちのまま止まっている。
+
+- PDF抽出タイムアウト（SIGALRM 60秒）は実装済み
+- しかし **Google Drive API のダウンロード自体がハングするケース**には効かない
+- `httplib2` / `google-api-python-client` にソケットタイムアウトが未設定のため永遠に待ち続ける
+
+→ 根本対策として API 呼び出しにソケットタイムアウトを設定することが必要（Issue #5 に追記候補）。

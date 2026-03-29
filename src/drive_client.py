@@ -6,6 +6,7 @@ build_index.py, watcher.py など複数スクリプトから利用される。
 
 import io
 import pickle
+import signal
 
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -26,7 +27,14 @@ _credentials = None
 import time as _time
 import random as _random
 
-def _api_call_with_retry(func, max_retries=5):
+_rate_limit_callback = None  # レート制限発生時のコールバック
+
+def set_rate_limit_callback(callback):
+    """レート制限発生時に呼ばれるコールバックを設定する。callback(waiting: bool)"""
+    global _rate_limit_callback
+    _rate_limit_callback = callback
+
+def _api_call_with_retry(func, max_retries=5):  # max_retries=1 で失敗即諦め可
     """Google API 呼び出しをレート制限対応のリトライ付きで実行する。"""
     for attempt in range(max_retries):
         try:
@@ -34,8 +42,12 @@ def _api_call_with_retry(func, max_retries=5):
         except Exception as e:
             error_str = str(e)
             if "rate limit" in error_str.lower() or "429" in error_str or "quota" in error_str.lower():
+                if _rate_limit_callback:
+                    _rate_limit_callback(True)
                 wait = (2 ** attempt) + _random.uniform(0, 1)
                 _time.sleep(wait)
+                if _rate_limit_callback:
+                    _rate_limit_callback(False)
                 continue
             raise
     return func()  # 最後の1回
@@ -64,6 +76,43 @@ SKIP_MIME_TYPES = {
     "application/vnd.google-apps.map",
     "application/vnd.google-apps.site",
 }
+
+
+class _PDFTimeoutError(Exception):
+    pass
+
+
+def _extract_pdf_with_timeout(content, timeout_sec=60):
+    """PDFテキストをタイムアウト付きで1ページずつ抽出する。
+
+    Returns:
+        (text, is_partial): text は抽出テキスト（Noneの場合は抽出不可）、
+                            is_partial は途中でタイムアウトした場合 True。
+    """
+    import pypdf
+    collected = []
+    is_partial = False
+
+    def _handler(signum, frame):
+        raise _PDFTimeoutError()
+
+    old_handler = signal.signal(signal.SIGALRM, _handler)
+    signal.alarm(timeout_sec)
+    try:
+        reader = pypdf.PdfReader(content)
+        for page in reader.pages:
+            collected.append(page.extract_text() or "")
+        signal.alarm(0)
+    except _PDFTimeoutError:
+        is_partial = True
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
+
+    text = "\n".join(collected)
+    if not text.strip():
+        return None, False  # タイムアウト前に1ページも取れなかった場合も同様
+    return text, is_partial
 
 
 def authenticate():
@@ -118,17 +167,20 @@ def get_sheets_service():
 def extract_spreadsheet_sheets(file_id):
     """スプレッドシートの全シートをシート別に取得する。
 
+    シート値の取得に失敗した場合も "failed": True でシート名を返す（partial保存用）。
+
     Returns:
-        list[dict]: [{"gid": str, "name": str, "content": str}, ...]
+        list[dict]: [{"gid": str, "name": str, "content": str|None, "failed": bool}, ...]
     """
     service = get_sheets_service()
+    # メタデータ取得（シート名一覧）はリトライあり
     try:
         spreadsheet = _api_call_with_retry(lambda: service.spreadsheets().get(
             spreadsheetId=file_id,
             includeGridData=False,
         ).execute())
     except Exception as e:
-        print(f"  警告: スプレッドシート取得失敗: {e}")
+        print(f"  警告: スプレッドシート取得失敗: {e}", flush=True)
         return []
 
     sheets = spreadsheet.get("sheets", [])
@@ -140,19 +192,26 @@ def extract_spreadsheet_sheets(file_id):
         name = props["title"]
 
         try:
+            # シート値取得はmax_retries=1（429等で失敗したら即諦めてpartialとして保存）
             sheet_range = f"'{name}'"
-            values_response = _api_call_with_retry(lambda sr=sheet_range: service.spreadsheets().values().get(
-                spreadsheetId=file_id,
-                range=sr,
-            ).execute())
+            values_response = _api_call_with_retry(
+                lambda sr=sheet_range: service.spreadsheets().values().get(
+                    spreadsheetId=file_id,
+                    range=sr,
+                ).execute(),
+                max_retries=1,
+            )
             values = values_response.get("values", [])
             if not values:
+                # 空シート: コンテンツなしだが取得成功（失敗ではない）
+                results.append({"gid": gid, "name": name, "content": None, "failed": False})
                 continue
             text = "\n".join("\t".join(str(cell) for cell in row) for row in values)
-            if text.strip():
-                results.append({"gid": gid, "name": name, "content": text})
+            results.append({"gid": gid, "name": name, "content": text if text.strip() else None, "failed": False})
         except Exception as e:
-            print(f"  警告: シート '{name}' の取得失敗: {e}")
+            print(f"  警告: シート '{name}' の取得失敗: {e}", flush=True)
+            # 取得失敗: シート名だけ記録してpartialフラグ
+            results.append({"gid": gid, "name": name, "content": None, "failed": True})
 
     return results
 
@@ -257,21 +316,25 @@ def extract_text(service, file_info):
     対応形式:
     - Google Docs / Sheets / Slides（エクスポート）
     - テキスト系ファイル（直接ダウンロード）
-    - PDF（pypdf でテキスト抽出）
+    - PDF（pypdf でテキスト抽出、タイムアウト付き）
+
+    Returns:
+        (text, is_partial): text は抽出テキスト（Noneの場合は抽出不可）、
+                            is_partial は PDF が途中でタイムアウトした場合 True。
     """
     mime_type = file_info["mimeType"]
     file_id = file_info["id"]
 
     # フォルダ: フォルダ名をメタデータとして返す
     if mime_type == "application/vnd.google-apps.folder":
-        return f"[フォルダ] {file_info['name']}"
+        return f"[フォルダ] {file_info['name']}", False
 
     if mime_type in SKIP_MIME_TYPES:
-        return None
+        return None, False
 
     # スプレッドシートは extract_spreadsheet_sheets() で処理する
     if mime_type == "application/vnd.google-apps.spreadsheet":
-        return None
+        return None, False
 
     # Google Docs 系: エクスポート
     if mime_type in EXPORT_MIME_MAP:
@@ -283,57 +346,60 @@ def extract_text(service, file_info):
             done = False
             while not done:
                 _, done = downloader.next_chunk()
-            return content.getvalue().decode("utf-8", errors="replace")
+            return content.getvalue().decode("utf-8", errors="replace"), False
         except Exception as e:
-            print(f"  警告: エクスポート失敗 [{file_info['name']}]: {e}")
-            return None
+            print(f"  警告: エクスポート失敗 [{file_info['name']}]: {e}", flush=True)
+            return None, False
 
     # テキスト系ファイル: ダウンロード
     if mime_type in TEXT_MIME_TYPES:
         try:
             content = _download_content(service, file_id)
-            return content.getvalue().decode("utf-8", errors="replace")
+            return content.getvalue().decode("utf-8", errors="replace"), False
         except Exception as e:
-            print(f"  警告: ダウンロード失敗 [{file_info['name']}]: {e}")
-            return None
+            print(f"  警告: ダウンロード失敗 [{file_info['name']}]: {e}", flush=True)
+            return None, False
 
-    # PDF: テキスト抽出（テキストベースPDFのみ、スキャンPDFは対象外）
+    # PDF: タイムアウト付きテキスト抽出
+    #   - さくっと読めた → (text, False)
+    #   - タイムアウト・一部抽出 → (partial_text, True)
+    #   - まったく読めない / タイムアウト前に0ページ → ([PDF] meta, False)
     if mime_type == "application/pdf":
         try:
             content = _download_content(service, file_id)
             content.seek(0)
             try:
-                import pypdf
-                reader = pypdf.PdfReader(content)
-                text = "\n".join(page.extract_text() or "" for page in reader.pages)
-                if text.strip():
-                    return text
+                text, is_partial = _extract_pdf_with_timeout(content, timeout_sec=60)
+                if text:
+                    if is_partial:
+                        print(f"  警告: PDF タイムアウト（部分データ保存）[{file_info['name']}]", flush=True)
+                    return text, is_partial
             except ImportError:
-                print("  警告: pypdf がインストールされていません。PDF はスキップします。")
-                return f"[PDF] {file_info['name']}"
-            return f"[スキャンPDF] {file_info['name']}"
+                print("  警告: pypdf がインストールされていません。PDF はスキップします。", flush=True)
+                return f"[PDF] {file_info['name']}", False
+            return f"[スキャンPDF] {file_info['name']}", False
         except Exception as e:
-            print(f"  警告: PDF 処理失敗 [{file_info['name']}]: {e}")
-            return f"[PDF] {file_info['name']}"
+            print(f"  警告: PDF 処理失敗 [{file_info['name']}]: {e}", flush=True)
+            return f"[PDF] {file_info['name']}", False
 
     # 画像: OCR 試行 → メタデータ
     if mime_type.startswith("image/"):
         try:
             content = _download_content(service, file_id)
-            return _try_ocr_image(content, file_info["name"])
+            return _try_ocr_image(content, file_info["name"]), False
         except Exception as e:
-            print(f"  警告: 画像処理失敗 [{file_info['name']}]: {e}")
-            return f"[画像] {file_info['name']}"
+            print(f"  警告: 画像処理失敗 [{file_info['name']}]: {e}", flush=True)
+            return f"[画像] {file_info['name']}", False
 
     # 動画: メタデータのみ
     if mime_type.startswith("video/"):
-        return f"[動画] {file_info['name']}"
+        return f"[動画] {file_info['name']}", False
 
     # 音声: メタデータのみ
     if mime_type.startswith("audio/"):
-        return f"[音声] {file_info['name']}"
+        return f"[音声] {file_info['name']}", False
 
-    return None
+    return None, False
 
 
 def _try_ocr_image(content, filename):

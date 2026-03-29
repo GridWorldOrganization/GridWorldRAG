@@ -17,8 +17,8 @@ build_parallel.py - タスクキュー方式の並列インデックス構築
 import argparse
 import json
 import multiprocessing
-import pickle
 import os
+import pickle
 import signal
 import sys
 import threading
@@ -34,6 +34,7 @@ from src.config import (
 from src.drive_client import (
     authenticate, list_files_in_drive, extract_text,
     extract_spreadsheet_sheets, SKIP_MIME_TYPES,
+    set_rate_limit_callback,
 )
 from src.indexer import make_chunk_entry
 
@@ -79,8 +80,21 @@ def _write_progress(worker_id, *, task_label="", task_current=0, task_size=0,
 # ワーカー
 # ---------------------------------------------------------------------------
 
-def _process_file(file_info, model, splitter, service, batch):
+def _error_fallback(file_info, file_name, model, batch):
+    """エラー時にファイル名だけでもDBに記録する。"""
+    try:
+        text = f"[エラー] {file_name}"
+        emb = model.encode([text])[0]
+        batch.append(make_chunk_entry(file_info, text, emb, 0))
+        return 0, 0, 1, 1  # error=1, chunk=1（メタデータのみ）
+    except Exception:
+        return 0, 0, 1, 0  # 埋め込み生成も失敗した場合
+
+
+def _process_file(file_info, model, splitter, service, batch, sheets_semaphore=None):
     """1ファイルを処理し、チャンクを batch に追加する。
+
+    sheets_semaphore: Sheets API 同時アクセス制限用のプロセス間セマフォ。
 
     Returns:
         (processed_count, skipped_count, error_count, chunk_count)
@@ -96,21 +110,35 @@ def _process_file(file_info, model, splitter, service, batch):
             batch.append(make_chunk_entry(file_info, text, emb, 0))
             return 1, 0, 0, 1
         except Exception:
-            return 0, 0, 1, 0
+            return _error_fallback(file_info, file_name, model, batch)
 
-    # スプレッドシート: シート別処理
+    # スプレッドシート: シート別処理（セマフォで同時アクセス数を制限）
     if mime_type == "application/vnd.google-apps.spreadsheet":
-        sheets = extract_spreadsheet_sheets(file_info["id"])
+        if sheets_semaphore:
+            sheets_semaphore.acquire()
+        try:
+            sheets = extract_spreadsheet_sheets(file_info["id"])
+        finally:
+            if sheets_semaphore:
+                sheets_semaphore.release()
+
         if not sheets:
             return 0, 1, 0, 0
 
         file_chunks = 0
         file_errors = 0
         for sheet in sheets:
-            sheet_content = f"[シート: {sheet['name']}]\n{sheet['content']}"
-            chunks = splitter.split_text(sheet_content)
+            is_partial = sheet.get("failed", False)
+            content = sheet.get("content")
+            # コンテンツあり: 通常テキスト / なし（失敗 or 空）: シート名のみ
+            if content:
+                sheet_text = f"[シート: {sheet['name']}]\n{content}"
+            else:
+                sheet_text = f"[シート: {sheet['name']}]"
+
+            chunks = splitter.split_text(sheet_text)
             if not chunks:
-                continue
+                chunks = [sheet_text]  # シート名だけでも必ず1件保存
             try:
                 embeddings = model.encode(chunks)
             except Exception:
@@ -120,6 +148,7 @@ def _process_file(file_info, model, splitter, service, batch):
                 batch.append(make_chunk_entry(
                     file_info, chunk_text, emb, ci,
                     sheet_gid=sheet["gid"], sheet_name=sheet["name"],
+                    partial_content=is_partial,
                 ))
             file_chunks += len(chunks)
 
@@ -128,7 +157,7 @@ def _process_file(file_info, model, splitter, service, batch):
         return 0, 1, file_errors, 0
 
     # その他のファイル（Docs, PDF, フォルダ, テキスト, 動画, 音声 等）
-    text = extract_text(service, file_info)
+    text, is_partial = extract_text(service, file_info)
     if not text or not text.strip():
         return 0, 1, 0, 0
 
@@ -139,15 +168,15 @@ def _process_file(file_info, model, splitter, service, batch):
     try:
         embeddings = model.encode(chunks)
     except Exception:
-        return 0, 0, 1, 0
+        return _error_fallback(file_info, file_name, model, batch)
 
     for ci, (chunk_text, emb) in enumerate(zip(chunks, embeddings)):
-        batch.append(make_chunk_entry(file_info, chunk_text, emb, ci))
+        batch.append(make_chunk_entry(file_info, chunk_text, emb, ci, partial_content=is_partial))
 
     return 1, 0, 0, len(chunks)
 
 
-def _worker(worker_id, task_queue, tasks_total, results_queue):
+def _worker(worker_id, task_queue, tasks_total, results_queue, sheets_semaphore):
     """ワーカープロセス: キューからタスクを取得して順次処理する。"""
     # 起動中マーカー（モデルロード前に即座に書き出し）
     _write_progress(worker_id, status="loading", tasks_total=tasks_total)
@@ -183,7 +212,24 @@ def _worker(worker_id, task_queue, tasks_total, results_queue):
 
     # タスクのファイルデータを pickle から読み込み
     with open(TASK_DATA_PKL, "rb") as f:
-        all_task_data = pickle.load(f)
+        task_data_bundle = pickle.load(f)
+    all_task_data = task_data_bundle["files"]
+
+    # レート制限時にステータスを更新するコールバック
+    _current_task_kwargs = {}
+
+    def _on_rate_limit(waiting):
+        if waiting:
+            # タスク処理中なら rate_limited_running、待機中なら rate_limited
+            status = "rate_limited_running" if _current_task_kwargs else "rate_limited"
+            _write_progress(worker_id, status=status,
+                            processed=total_processed, skipped=total_skipped,
+                            errors=total_errors, chunks=total_chunks,
+                            tasks_done=tasks_done, tasks_total=tasks_total,
+                            completed_tasks=completed_tasks,
+                            **_current_task_kwargs)
+
+    set_rate_limit_callback(_on_rate_limit)
 
     progress(status="ready")
 
@@ -203,11 +249,16 @@ def _worker(worker_id, task_queue, tasks_total, results_queue):
         task_processed_before = total_processed
         task_skipped_before = total_skipped
         task_errors_before = total_errors
-        print(f"[{task_start}] W{worker_id + 1} 開始: {task_label}({task_part}) {task_size} ファイル", flush=True)
+        print(f"[{task_start}] W{worker_id} 開始: {task_label}({task_part}) {task_size} ファイル", flush=True)
+
+        _current_task_kwargs = {
+            "task_label": task_label, "task_current": 0, "task_size": task_size,
+            "drive_type": drive_type, "part": task_part, "drive_total": task_drive_total,
+        }
 
         batch = []
         for fi, file_info in enumerate(files):
-            p, s, e, c = _process_file(file_info, model, splitter, service, batch)
+            p, s, e, c = _process_file(file_info, model, splitter, service, batch, sheets_semaphore)
             total_processed += p
             total_skipped += s
             total_errors += e
@@ -218,11 +269,12 @@ def _worker(worker_id, task_queue, tasks_total, results_queue):
                 insert_chunks(conn, batch)
                 batch = []
 
-            # 進捗更新
-            progress(
-                task_label=task_label, task_current=fi + 1, task_size=task_size,
-                drive_type=drive_type, part=task_part, drive_total=task_drive_total,
-            )
+            # 進捗更新（レート制限コールバック用にも反映）
+            _current_task_kwargs = {
+                "task_label": task_label, "task_current": fi + 1, "task_size": task_size,
+                "drive_type": drive_type, "part": task_part, "drive_total": task_drive_total,
+            }
+            progress(**_current_task_kwargs)
 
         # タスク完了: 残りバッチ挿入
         if batch:
@@ -232,23 +284,20 @@ def _worker(worker_id, task_queue, tasks_total, results_queue):
         task_p = total_processed - task_processed_before
         task_s = total_skipped - task_skipped_before
         task_e = total_errors - task_errors_before
-        print(f"[{task_end}] W{worker_id + 1} 完了: {task_label}({task_part})"
+        print(f"[{task_end}] W{worker_id} 完了: {task_label}({task_part})"
               f"  処理:{task_p} スキップ:{task_s} エラー:{task_e}", flush=True)
         completed_tasks.append(f"{task_label}({task_part})")
         tasks_done += 1
 
+        _current_task_kwargs = {}
         # 100%表示を確実に見せてから待機中に遷移
         progress(
             task_label=task_label, task_current=task_size, task_size=task_size,
             drive_type=drive_type, part=task_part, drive_total=task_drive_total,
         )
-        t_100 = time.strftime("%H:%M:%S")
         time.sleep(MONITOR_INTERVAL_MS / 1000)
         progress(status="ready")
-        t_ready = time.strftime("%H:%M:%S")
         time.sleep(MONITOR_INTERVAL_MS / 1000)
-        t_before_get = time.strftime("%H:%M:%S")
-        print(f"[DEBUG] W{worker_id+1} タスク間: 100%={t_100} ready={t_ready} get前={t_before_get}", flush=True)
 
     conn.close()
     progress(status="done")
@@ -400,16 +449,14 @@ def collect_file_lists(service):
             fetch_list.append((done_drives, drive_id, drive_name))
 
         def _fetch_drive(idx, drive_id, drive_name):
-            import time as t
             _fetch_start(idx)
             # レート制限バックオフ中なら待つ
             while True:
                 with rate_lock:
                     wait_until = rate_backoff[0]
-                now = t.time()
-                if now >= wait_until:
+                if time.time() >= wait_until:
                     break
-                t.sleep(wait_until - now)
+                time.sleep(wait_until - time.time())
             try:
                 svc = authenticate()
                 files = list_files_in_drive(svc, drive_id=drive_id)
@@ -419,8 +466,8 @@ def collect_file_lists(service):
                 error_str = str(e)
                 if "rate limit" in error_str.lower() or "429" in error_str:
                     with rate_lock:
-                        rate_backoff[0] = t.time() + 10
-                    t.sleep(10)
+                        rate_backoff[0] = time.time() + 10
+                    time.sleep(10)
                     try:
                         svc = authenticate()
                         files = list_files_in_drive(svc, drive_id=drive_id)
@@ -548,9 +595,10 @@ def main():
             "drive_total": t["drive_total"],
         })
 
-    # ファイルデータを pickle に保存（ワーカーが読み込む）
+    # ファイルデータと全アイテム数を pickle に保存（ワーカー・モニターが読み込む）
+    total_items = sum(len(t["files"]) for t in tasks)
     with open(TASK_DATA_PKL, "wb") as f:
-        pickle.dump(task_file_data, f)
+        pickle.dump({"files": task_file_data, "total_items": total_items}, f)
 
     # 各ドライブの 1/n → 全ドライブの 2/n → ... の順でキューに入れる
     max_parts = max((int(t["part"].split("/")[1]) for t in tasks), default=1)
@@ -566,14 +614,17 @@ def main():
     os.makedirs(PROGRESS_DIR, exist_ok=True)
 
     # 5. ワーカー起動
+    # Sheets API 同時アクセス制限（60リクエスト/分/ユーザーなので同時2まで）
+    sheets_semaphore = multiprocessing.Semaphore(2)
+
     start_time = time.time()
     results_queue = multiprocessing.Queue()
     processes = []
 
-    for i in range(n_workers):
+    for i in range(1, n_workers + 1):
         p = multiprocessing.Process(
             target=_worker,
-            args=(i, task_queue, len(tasks), results_queue),
+            args=(i, task_queue, len(tasks), results_queue, sheets_semaphore),
         )
         p.daemon = True
         p.start()
@@ -592,18 +643,18 @@ def main():
             return
         shutdown_requested = True
         print("\n停止シグナル受信。子ワーカーを終了中...")
-        for i, p in enumerate(processes):
+        for i, p in enumerate(processes, 1):
             if p.is_alive():
                 p.terminate()
-                print(f"  W{i + 1} を停止中...", end="")
-        for i, p in enumerate(processes):
+                print(f"  W{i} を停止中...", end="")
+        for i, p in enumerate(processes, 1):
             p.join(timeout=10)
             if p.is_alive():
                 p.kill()
                 p.join(timeout=3)
-                print(f"  W{i + 1} 強制終了")
+                print(f"  W{i} 強制終了")
             else:
-                print(f"  W{i + 1} 停止完了")
+                print(f"  W{i} 停止完了")
 
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
@@ -620,7 +671,7 @@ def main():
     total_errors = 0
     total_chunks = 0
 
-    for i in range(n_workers):
+    for i in range(1, n_workers + 1):
         progress_file = os.path.join(PROGRESS_DIR, f"worker_{i}.json")
         if os.path.exists(progress_file):
             with open(progress_file) as f:
@@ -636,11 +687,11 @@ def main():
             total_errors += w_err
             total_chunks += w_chunks
             mark = "完了" if status == "done" else "中断"
-            print(f"  W{i + 1}: {mark}  タスク:{w_tasks}"
+            print(f"  W{i}: {mark}  タスク:{w_tasks}"
                   f"  処理:{w_proc} スキップ:{w_skip}"
                   f"  エラー:{w_err} チャンク:{w_chunks}")
         else:
-            print(f"  W{i + 1}: 未起動")
+            print(f"  W{i}: 未起動")
 
     alive = [p for p in processes if p.is_alive()]
     if alive:

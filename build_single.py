@@ -71,10 +71,16 @@ def main():
 
             file_chunks = 0
             for sheet in sheets:
-                sheet_content = f"[シート: {sheet['name']}]\n{sheet['content']}"
-                chunks = splitter.split_text(sheet_content)
+                is_partial = sheet.get("failed", False)
+                content = sheet.get("content")
+                if content:
+                    sheet_text = f"[シート: {sheet['name']}]\n{content}"
+                else:
+                    sheet_text = f"[シート: {sheet['name']}]"
+
+                chunks = splitter.split_text(sheet_text)
                 if not chunks:
-                    continue
+                    chunks = [sheet_text]
                 try:
                     embeddings = model.encode(chunks)
                 except Exception as e:
@@ -86,13 +92,16 @@ def main():
                     batch.append(make_chunk_entry(
                         file_info, chunk_text, emb, ci,
                         sheet_gid=sheet["gid"], sheet_name=sheet["name"],
+                        partial_content=is_partial,
                     ))
                 file_chunks += len(chunks)
 
+            partial_count = sum(1 for s in sheets if s.get("failed"))
             if file_chunks > 0:
                 total_chunks += file_chunks
                 processed += 1
-                print(f" OK ({len(sheets)} シート, {file_chunks} チャンク)")
+                suffix = f" [{partial_count}シート partial]" if partial_count else ""
+                print(f" OK ({len(sheets)} シート, {file_chunks} チャンク){suffix}")
             else:
                 skipped += 1
                 print(" スキップ（空）")
@@ -113,7 +122,7 @@ def main():
                     print(" エラー")
                 continue
 
-            text = extract_text(service, file_info)
+            text, is_partial = extract_text(service, file_info)
             if not text or not text.strip():
                 skipped += 1
                 print(" スキップ")
@@ -133,7 +142,7 @@ def main():
                 continue
 
             for ci, (chunk_text, emb) in enumerate(zip(chunks, embeddings)):
-                batch.append(make_chunk_entry(file_info, chunk_text, emb, ci))
+                batch.append(make_chunk_entry(file_info, chunk_text, emb, ci, partial_content=is_partial))
 
             total_chunks += len(chunks)
             processed += 1

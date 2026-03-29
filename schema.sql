@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS documents (
     sheet_gid         TEXT,
     sheet_name        TEXT,
     permissions       JSONB,
+    partial_content   BOOLEAN DEFAULT FALSE,
     created_at        TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -24,6 +25,7 @@ CREATE TABLE IF NOT EXISTS documents (
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS sheet_gid TEXT;
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS sheet_name TEXT;
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS permissions JSONB;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS partial_content BOOLEAN DEFAULT FALSE;
 
 -- ベクトル検索用インデックス（IVFFlat）
 CREATE INDEX IF NOT EXISTS idx_documents_embedding

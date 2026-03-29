@@ -85,8 +85,9 @@ Claude Code ←→ mcp_server.py ───────────────�
 |-----------|------|
 | 停止中 | プロセス未起動（順次起動の順番待ち） |
 | 起動中 | プロセス起動済み、モデル・DB・認証をロード中 |
-| 待機中 | ロード完了、次のタスク取得前（タスク間に 1.2 秒の待機あり） |
+| 待機中 | ロード完了、次のタスク取得前 |
 | running | タスク処理中 |
+| レート制限待ち | Google API のレート制限（429）に到達、バックオフ中 |
 | done | 全タスク完了 |
 
 ### Phase 5: ワーカー起動（--work-only モード）
@@ -319,7 +320,7 @@ Ctrl+C 時は `KeyboardInterrupt` をキャッチし、`ThreadPoolExecutor` を 
 ### status 遷移
 
 ```
-ready → running → ready → running → ... → done
+ready → running → (rate_limited → running)* → ready → running → ... → done
 ```
 
 ### モニター更新間隔
@@ -372,6 +373,13 @@ Google Drive API / Sheets API の呼び出しには `_api_call_with_retry()` で
 - 対象エラー: `429`, `rate limit`, `quota`
 - リトライ: 最大 5 回
 - 待機時間: `2^attempt + random(0,1)` 秒（エクスポネンシャルバックオフ）
+- レート制限中はワーカーのステータスが `rate_limited`（レート制限待ち）に変わる
+
+### Sheets API セマフォ
+
+Sheets API は `ReadRequestsPerMinutePerUser: 60` の制限がある。8ワーカーが同時にスプレッドシートを処理すると即座に制限に到達する。
+
+`multiprocessing.Semaphore(2)` でプロセス間セマフォを実装し、Sheets API（`extract_spreadsheet_sheets`）への同時アクセスを最大2ワーカーに制限している。
 
 ## DB スキーマ
 
