@@ -29,7 +29,7 @@ from src.config import (
     EMBEDDING_MODEL, CHUNK_SIZE, CHUNK_OVERLAP, BATCH_SIZE,
     GOOGLE_EMAIL, INDEX_MY_DRIVE, INDEX_SHARED_DRIVES, INDEX_IMAGE_OCR,
     PARALLEL_WORKERS, TASK_SPLIT_THRESHOLD, MONITOR_INTERVAL_MS,
-    load_shared_drives_whitelist,
+    WORKER_START_INTERVAL_SEC, load_shared_drives_whitelist,
 )
 from src.drive_client import (
     authenticate, list_files_in_drive, extract_text,
@@ -38,6 +38,8 @@ from src.drive_client import (
 from src.indexer import make_chunk_entry
 
 PROGRESS_DIR = "/tmp/gridworldrag_progress"
+FILELIST_PKL = "/tmp/gridworldrag_filelist.pkl"
+TASK_DATA_PKL = "/tmp/gridworldrag_taskdata.pkl"
 FOLDER_MIME = "application/vnd.google-apps.folder"
 
 
@@ -180,7 +182,6 @@ def _worker(worker_id, task_queue, tasks_total, results_queue):
         )
 
     # タスクのファイルデータを pickle から読み込み
-    TASK_DATA_PKL = "/tmp/gridworldrag_taskdata.pkl"
     with open(TASK_DATA_PKL, "rb") as f:
         all_task_data = pickle.load(f)
 
@@ -236,9 +237,18 @@ def _worker(worker_id, task_queue, tasks_total, results_queue):
         completed_tasks.append(f"{task_label}({task_part})")
         tasks_done += 1
 
-        # タスク間の待機（モニター表示で100%→待機中の遷移が見えるように）
-        progress(status="ready")
+        # 100%表示を確実に見せてから待機中に遷移
+        progress(
+            task_label=task_label, task_current=task_size, task_size=task_size,
+            drive_type=drive_type, part=task_part, drive_total=task_drive_total,
+        )
+        t_100 = time.strftime("%H:%M:%S")
         time.sleep(MONITOR_INTERVAL_MS / 1000)
+        progress(status="ready")
+        t_ready = time.strftime("%H:%M:%S")
+        time.sleep(MONITOR_INTERVAL_MS / 1000)
+        t_before_get = time.strftime("%H:%M:%S")
+        print(f"[DEBUG] W{worker_id+1} タスク間: 100%={t_100} ready={t_ready} get前={t_before_get}")
 
     conn.close()
     progress(status="done")
@@ -484,8 +494,6 @@ def main():
                         help="ワーカー処理のみ（/tmp/gridworldrag_filelist.pkl を読み込み）")
     args = parser.parse_args()
 
-    FILELIST_PKL = "/tmp/gridworldrag_filelist.pkl"
-
     if args.work_only:
         # pickle からファイル一覧を読み込み
         with open(FILELIST_PKL, "rb") as f:
@@ -538,11 +546,9 @@ def main():
             "drive_type": t["drive_type"],
             "part": t["part"],
             "drive_total": t["drive_total"],
-            "file_count": len(t["files"]),
         })
 
     # ファイルデータを pickle に保存（ワーカーが読み込む）
-    TASK_DATA_PKL = "/tmp/gridworldrag_taskdata.pkl"
     with open(TASK_DATA_PKL, "wb") as f:
         pickle.dump(task_file_data, f)
 
@@ -573,19 +579,7 @@ def main():
         p.start()
         processes.append(p)
         if i < n_workers - 1:
-            # ワーカーのモデルロード完了（status=ready）を待ってから次を起動
-            progress_file = os.path.join(PROGRESS_DIR, f"worker_{i}.json")
-            while True:
-                if os.path.exists(progress_file):
-                    with open(progress_file) as pf:
-                        try:
-                            status = json.load(pf).get("status")
-                            if status != "loading":
-                                break
-                        except json.JSONDecodeError:
-                            pass
-                time.sleep(0.5)
-            time.sleep(1)
+            time.sleep(WORKER_START_INTERVAL_SEC)
 
     print(f"\n{n_workers} ワーカー起動、{len(tasks)} タスクを処理中...")
 

@@ -35,19 +35,10 @@ echo "=========================================="
 # 開始時刻
 date +%s > /tmp/gridworldrag_start_time
 
-# Phase 1: ファイル一覧取得（stdout は画面に直接表示される）
-python build_parallel.py --fetch-only 2>>"$LOG_FILE"
-
-echo ""
-
-# Phase 2: ワーカー処理（バックグラウンド）
-python build_parallel.py --work-only >> "$LOG_FILE" 2>&1 &
-BUILD_PID=$!
-
-# Ctrl+C トラップ
+# Ctrl+C トラップ（全フェーズ共通）
+BUILD_PID=""
 cleanup() {
-    # カーソルを表示領域の下に移動
-    printf "\033[${WORKER_COUNT}B\n\n"
+    echo ""
     echo "停止中..."
     if [ -n "$BUILD_PID" ]; then
         kill $BUILD_PID 2>/dev/null
@@ -57,6 +48,13 @@ cleanup() {
     exit 0
 }
 trap cleanup INT TERM
+
+# Phase 1: ファイル一覧取得（stdout は画面に直接表示される）
+python build_parallel.py --fetch-only 2>>"$LOG_FILE"
+
+# Phase 2: ワーカー処理（バックグラウンド）
+python build_parallel.py --work-only >> "$LOG_FILE" 2>&1 &
+BUILD_PID=$!
 
 # モニター
 bash "$SCRIPT_DIR/monitor.sh" "$BUILD_PID" "$WORKER_COUNT" "$MONITOR_INTERVAL_MS"

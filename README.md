@@ -2,16 +2,6 @@
 
 Google Drive のドキュメントを PostgreSQL + pgvector にインデックスし、Claude Code から MCP 経由でセマンティック検索するための RAG システム。
 
-## アーキテクチャ
-
-```
-Google Drive ──→ build_single.py ──→ PostgreSQL + pgvector
-                                          ↑
-                 watcher.py ──────────────┘ (差分更新)
-                                          ↑
-Claude Code ←→ mcp_server.py ────────────┘ (検索)
-```
-
 ## 必要な環境
 
 | コンポーネント | バージョン | インストール |

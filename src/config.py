@@ -50,7 +50,8 @@ INDEX_SHARED_DRIVES = os.environ.get("INDEX_SHARED_DRIVES", "1") == "1"
 INDEX_IMAGE_OCR = os.environ.get("INDEX_IMAGE_OCR", "0") == "1"
 PARALLEL_WORKERS = int(os.environ.get("PARALLEL_WORKERS", "8"))
 TASK_SPLIT_THRESHOLD = int(os.environ.get("TASK_SPLIT_THRESHOLD", "5000"))
-MONITOR_INTERVAL_MS = int(os.environ.get("MONITOR_INTERVAL_MS", "1000"))
+MONITOR_INTERVAL_MS = int(os.environ.get("MONITOR_INTERVAL_MS", "800"))
+WORKER_START_INTERVAL_SEC = float(os.environ.get("WORKER_START_INTERVAL_SEC", "2"))
 
 # 埋め込み
 EMBEDDING_MODEL = "multi-qa-mpnet-base-dot-v1"
