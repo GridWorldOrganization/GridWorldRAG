@@ -54,8 +54,8 @@ if not dbs:
 
 from src.db import connect
 
-print(f"{'DB名':<20} {'名称':<12} {'サイズ':>8}  {'チャンク数':>10}  {'ファイル数':>8}  {'最終インデックス'}")
-print("-" * 85)
+print(f"{'#':>3}  {'DB名':<20} {'名称':<12} {'サイズ':>8}  {'チャンク数':>10}  {'ファイル数':>8}  {'最終インデックス'}")
+print("-" * 90)
 
 for dbname, size in dbs:
     idx = dbname.replace('gridworldrag_', '')
@@ -72,7 +72,7 @@ for dbname, size in dbs:
         last_update = row[0].strftime('%Y-%m-%d %H:%M') if row and row[0] else '-'
         cur2.close()
         conn2.close()
-        print(f"{dbname:<20} {label:<12} {size:>8}  {chunks:>10,}  {files:>8,}  {last_update}")
+        print(f"{idx:>3}  {dbname:<20} {label:<12} {size:>8}  {chunks:>10,}  {files:>8,}  {last_update}")
     except Exception as e:
-        print(f"{dbname:<20} {label:<12} {size:>8}  {'(エラー: ' + str(e)[:30] + ')'}")
+        print(f"{idx:>3}  {dbname:<20} {label:<12} {size:>8}  {'(エラー: ' + str(e)[:30] + ')'}")
 EOF
