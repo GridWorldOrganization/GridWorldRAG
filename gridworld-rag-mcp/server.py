@@ -15,6 +15,15 @@ import os
 # プロジェクトルートを参照できるようにする
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+# --db N オプションで接続先DBを切り替え（起動時のみ有効）
+_db_name = None
+for _i, _arg in enumerate(sys.argv[1:]):
+    if _arg == "--db" and _i + 1 < len(sys.argv) - 1:
+        _db_index = sys.argv[_i + 2]
+        _db_name = f"gridworldrag_{_db_index}"
+        os.environ["GRIDWORLDRAG_DB_INDEX"] = _db_index
+        break
+
 from mcp.server.fastmcp import FastMCP
 
 from src.config import EMBEDDING_MODEL
@@ -29,12 +38,12 @@ _conn = None
 def _get_conn():
     global _conn
     if _conn is None or _conn.closed:
-        _conn = connect()
+        _conn = connect(_db_name)
     else:
         try:
             _conn.cursor().execute("SELECT 1")
         except Exception:
-            _conn = connect()
+            _conn = connect(_db_name)
     return _conn
 
 

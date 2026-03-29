@@ -534,12 +534,24 @@ def main():
     parser = argparse.ArgumentParser(description="タスクキュー方式の並列インデックス構築")
     parser.add_argument("-w", "--workers", type=int, default=PARALLEL_WORKERS,
                         help=f"並列ワーカー数 (デフォルト: {PARALLEL_WORKERS})")
+    parser.add_argument("--db", type=int, default=None, metavar="N",
+                        help="使用するDB番号 (例: --db 1 → gridworldrag_1。未指定は GRIDWORLDRAG_DB_INDEX または 0)")
     parser.add_argument("--dry-run", action="store_true", help="処理対象の確認のみ")
     parser.add_argument("--fetch-only", action="store_true",
                         help="ファイル一覧取得のみ（結果を /tmp/gridworldrag_filelist.pkl に保存）")
     parser.add_argument("--work-only", action="store_true",
                         help="ワーカー処理のみ（/tmp/gridworldrag_filelist.pkl を読み込み）")
     args = parser.parse_args()
+
+    if args.db is not None:
+        import os as _os
+        _os.environ["GRIDWORLDRAG_DB_INDEX"] = str(args.db)
+        # config モジュールの DB_NAME を再設定
+        import src.config as _cfg
+        _cfg.DB_NAME = f"gridworldrag_{args.db}"
+        import src.db as _db
+        _db.DB_NAME = f"gridworldrag_{args.db}"
+        print(f"DB: gridworldrag_{args.db} を使用")
 
     if args.work_only:
         # pickle からファイル一覧を読み込み

@@ -1,9 +1,20 @@
 #!/bin/bash
 # GridWorldRAG - インデックス構築 起動スクリプト
+# 使い方: ./run_build.sh [--db N]   例: ./run_build.sh --db 1 → gridworldrag_1 に構築
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
+
+# --db N オプションを受け取る
+DB_OPT=""
+DB_LABEL="0 (gridworldrag_0)"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --db) DB_OPT="--db $2"; DB_LABEL="$2 (gridworldrag_$2)"; shift 2 ;;
+        *) shift ;;
+    esac
+done
 
 PROGRESS_DIR="/tmp/gridworldrag_progress"
 LOG_FILE="/tmp/gridworldrag_build.log"
@@ -29,6 +40,7 @@ fi
 
 echo "=========================================="
 echo " GridWorldRAG - インデックス構築"
+echo " DB: $DB_LABEL"
 echo " ドライブ数: $TOTAL_DRIVES  ワーカー数: $WORKER_COUNT"
 echo "=========================================="
 
@@ -50,10 +62,10 @@ cleanup() {
 trap cleanup INT TERM
 
 # Phase 1: ファイル一覧取得（stdout は画面に直接表示される）
-python build_parallel.py --fetch-only 2>>"$LOG_FILE"
+python build_parallel.py --fetch-only $DB_OPT 2>>"$LOG_FILE"
 
 # Phase 2: ワーカー処理（バックグラウンド）
-python build_parallel.py --work-only >> "$LOG_FILE" 2>&1 &
+python build_parallel.py --work-only $DB_OPT >> "$LOG_FILE" 2>&1 &
 BUILD_PID=$!
 
 # モニター

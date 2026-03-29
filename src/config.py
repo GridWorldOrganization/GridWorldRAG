@@ -39,7 +39,10 @@ GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET", "")
 
 # PostgreSQL
-DB_NAME = os.environ.get("PGDATABASE", "gridworldrag")
+# DB_INDEX で gridworldrag_0 / gridworldrag_1 ... を切り替える。
+# PGDATABASE を直接指定した場合はそちらが優先される。
+DB_INDEX = int(os.environ.get("GRIDWORLDRAG_DB_INDEX", "0"))
+DB_NAME = os.environ.get("PGDATABASE", f"gridworldrag_{DB_INDEX}")
 DB_USER = os.environ.get("PGUSER", os.getenv("USER", ""))
 DB_HOST = os.environ.get("PGHOST", "localhost")
 DB_PORT = os.environ.get("PGPORT", "5432")
