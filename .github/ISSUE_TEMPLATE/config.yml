@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Discussion / Q&A
+    url: https://github.com/GridWorldOrganization/GridWorldRAG/discussions
+    about: Questions and general discussion

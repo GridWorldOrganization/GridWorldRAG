@@ -105,32 +105,41 @@ PC をフル活用する場合は `./run_calc_workers.sh` で最適値を自動�
 
 ```
 GridWorldRAG/
-├── README.md                 ← このファイル
-├── QUICKSTART.md             ← クイックスタートガイド
-├── LICENSE                   ← MIT License
-├── CONTRIBUTING.md           ← コントリビューションガイド
-├── run_calc_workers.sh        ← 最適並列数の計算 → config.env
-├── run_build.sh               ← 並列ビルド起動 + モニター
-├── run_build_single.sh        ← シングルプロセスビルド
-├── setup.sh                  ← セットアップスクリプト
-├── schema.sql                ← PostgreSQL テーブル定義
-├── config.env.example        ← 設定テンプレート（Git管理）
-├── config.env                ← 実際の設定（Git管理外）
-├── requirements.txt          ← Python 依存パッケージ
-├── build_single.py            ← 全件インデックス構築（シングル）
-├── build_parallel.py         ← 全件インデックス構築（並列）
-├── calc_workers.py           ← 最適並列ワーカー数の算出
-├── ocr_scan.py               ← 画像OCR後追いツール
-├── watcher.py                ← 変更監視デーモン（予定）
-├── mcp_server.py             ← Claude Code 用 MCP サーバー（予定）
+├── README.md                      ← このファイル
+├── QUICKSTART.md                  ← クイックスタートガイド
+├── CHANGELOG.md                   ← 変更履歴
+├── LICENSE                        ← MIT License
+├── CONTRIBUTING.md                ← コントリビューションガイド
+├── schema.sql                     ← PostgreSQL テーブル定義
+├── requirements.txt               ← Python 依存パッケージ
+├── config.env.example             ← 設定テンプレート（Git管理）
+├── shared_drives_whitelist.txt.example
+├── setup.sh                       ← 初回セットアップ
+├── build_parallel.py              ← 全件インデックス構築（並列・推奨）
+├── build_single.py                ← 全件インデックス構築（シングル）
+├── sync.py                        ← 差分同期（Google Drive Changes API）
+├── calc_workers.py                ← 最適並列ワーカー数の算出
+├── ocr_scan.py                    ← 画像OCR後追いツール
+├── export_db.sh                   ← DBダンプ出力
+├── import_db.sh                   ← DBダンプ取り込み
+├── run_build.sh                   ← 並列ビルド起動 + モニター
+├── run_build_single.sh            ← シングルプロセスビルド
+├── run_sync.sh                    ← 差分同期実行
+├── run_calc_workers.sh            ← 最適並列数の計算
+├── monitor.sh                     ← リアルタイムモニター
+├── list_dbs.sh                    ← DB一覧・サイズ表示
 ├── src/
-│   ├── __init__.py
-│   ├── config.py             ← 設定読み込み
-│   ├── drive_client.py       ← Google Drive API クライアント
-│   ├── db.py                 ← PostgreSQL + pgvector 操作
-│   └── indexer.py            ← インデックス構築の共通処理
+│   ├── config.py                  ← 設定読み込み・定数管理
+│   ├── drive_client.py            ← Google Drive API クライアント
+│   ├── db.py                      ← PostgreSQL + pgvector 操作
+│   ├── indexer.py                 ← チャンク生成ヘルパー
+│   └── monitor_render.py          ← モニター表示レンダリング
+├── gridworld-rag-mcp/
+│   ├── server.py                  ← MCP サーバー（search / lookup / stats 等）
+│   └── run_mcp.sh                 ← MCP サーバー起動スクリプト
 └── docs/
-    └── vectordb.md           ← 設計メモ・選定経緯
+    ├── technical.md               ← 技術リファレンス
+    └── vectordb.md                ← ベクトルDB設計メモ
 ```
 
 ## モジュール構成
@@ -153,6 +162,7 @@ text = extract_text(service, files[0])
 |---|---|
 | `authenticate()` | OAuth 認証 → Drive API サービスオブジェクトを返す |
 | `list_all_files(service)` | 全ファイルのメタデータ一覧を取得 |
+| `attach_folder_paths(files, drive_name)` | ファイルリストからフォルダパスを解決（追加 API コールなし） |
 | `extract_text(service, file_info)` | ファイルからテキストを抽出（Docs/PDF/画像OCR 対応） |
 | `extract_spreadsheet_sheets(file_id)` | スプレッドシートの全シートをシート別に取得 |
 | `get_changes_start_token(service)` | Changes API の開始トークンを取得 |
@@ -169,6 +179,26 @@ conn = connect()
 insert_chunks(conn, chunks_data)
 results = search_similar(conn, query_embedding, n_results=5)
 doc = lookup_by_url(conn, "https://docs.google.com/spreadsheets/d/.../edit?gid=123")
+```
+
+### `gridworld-rag-mcp/server.py`
+
+Claude Code 用の MCP サーバー。FastMCP ベースで 5 ツールを提供する。
+
+| ツール | 用途 |
+|---|---|
+| `search` | セマンティック検索（クエリに URL が含まれる場合は `lookup` と併用） |
+| `lookup` | Google Drive/Docs の URL からファイル内容を直接取得 |
+| `stats` | インデックス DB の統計（総件数・ファイルタイプ・オーナー別集計） |
+| `folder_tree` | DB からフォルダ構成ツリーを再構築して表示 |
+| `recent_changes` | 直近の差分同期（`sync.py`）で追加・更新・削除されたファイル一覧 |
+
+```bash
+# Claude Code への登録
+claude mcp add gridworld-rag-mcp -- python gridworld-rag-mcp/server.py
+
+# DB 番号を指定する場合
+claude mcp add gridworld-rag-mcp -- python gridworld-rag-mcp/server.py --db 1
 ```
 
 ### `src/config.py`
