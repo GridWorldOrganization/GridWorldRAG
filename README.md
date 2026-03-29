@@ -2,6 +2,23 @@
 
 Google Drive のドキュメントを PostgreSQL + pgvector にインデックスし、Claude Code から MCP 経由でセマンティック検索するための RAG システム。
 
+## 類似プロジェクトとの比較
+
+Google Drive + pgvector の RAG システムを目指した公開リポジトリは存在するが、このプロジェクトの全要件を満たすものは見当たらない（2026年3月時点）。
+
+| リポジトリ | Stars | 合致する点 | 不足している点 |
+|---|---|---|---|
+| [getomnico/omni](https://github.com/getomnico/omni) | 632 | Drive + pgvector + 権限継承 | Rust 製フルアプリ、Sheets シート別処理なし、MCP 非対応 |
+| [taylorwilsdon/google_workspace_mcp](https://github.com/taylorwilsdon/google_workspace_mcp) | 1,962 | Google Workspace MCP として最完全 | RAG / ベクトル検索なし |
+| [nofilamer/RAG_GDRIVE_PGVector_FASTAPI](https://github.com/nofilamer/RAG_GDRIVE_PGVector_FASTAPI) | 0 | Drive + pgvector の構成が近い | 権限なし、Sheets API 未使用、MCP 非対応 |
+
+このプロジェクト固有の組み合わせ:
+
+- **Sheets API でシート別に全データ取得**（CSV export ではなく全シート対応）
+- **共有ドライブのホワイトリスト制御**（対象ドライブを明示指定）
+- **pgvector + FastMCP の組み合わせ**（Claude Code から直接検索可能）
+- **権限を JSONB で chunk 単位に保持**（ファイル単位ではなく細粒度の権限管理）
+
 ## 必要な環境
 
 | コンポーネント | バージョン | インストール |
@@ -208,23 +225,6 @@ python ocr_scan.py --folder-id 0AFxyz --dry-run
 - 1ファイル内の全シートをシート別にDB格納
 - 各チャンクにシート名（`[シート: シート名]`）を含むため、シート名でも検索可能
 - URL に `gid=` パラメータがある場合、そのシートのチャンクを優先して返す
-
-## 類似プロジェクトとの比較
-
-Google Drive + pgvector の RAG システムを目指した公開リポジトリは存在するが、このプロジェクトの全要件を満たすものは見当たらない（2026年3月時点）。
-
-| リポジトリ | Stars | 合致する点 | 不足している点 |
-|---|---|---|---|
-| [getomnico/omni](https://github.com/getomnico/omni) | 632 | Drive + pgvector + 権限継承 | Rust 製フルアプリ、Sheets シート別処理なし、MCP 非対応 |
-| [taylorwilsdon/google_workspace_mcp](https://github.com/taylorwilsdon/google_workspace_mcp) | 1,962 | Google Workspace MCP として最完全 | RAG / ベクトル検索なし |
-| [nofilamer/RAG_GDRIVE_PGVector_FASTAPI](https://github.com/nofilamer/RAG_GDRIVE_PGVector_FASTAPI) | 0 | Drive + pgvector の構成が近い | 権限なし、Sheets API 未使用、MCP 非対応 |
-
-このプロジェクト固有の組み合わせ:
-
-- **Sheets API でシート別に全データ取得**（CSV export ではなく全シート対応）
-- **共有ドライブのホワイトリスト制御**（対象ドライブを明示指定）
-- **pgvector + FastMCP の組み合わせ**（Claude Code から直接検索可能）
-- **権限を JSONB で chunk 単位に保持**（ファイル単位ではなく細粒度の権限管理）
 
 ## PostgreSQL データディレクトリの確認
 
