@@ -1,9 +1,25 @@
+# Python
 .venv/
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Secrets / local config
 token.pickle
 credentials.json
 .env
 config.env
 shared_drives_whitelist.txt
+
+# OS
 .DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

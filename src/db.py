@@ -1,5 +1,6 @@
 """PostgreSQL + pgvector データベース操作。"""
 
+import json
 import re
 import sys
 
@@ -31,12 +32,17 @@ def insert_chunks(conn, chunks_data):
     """チャンクデータを DB に一括挿入する（UPSERT）。"""
     cur = conn.cursor()
     for chunk in chunks_data:
+        # PostgreSQL は NUL (0x00) を含む文字列を受け付けない
+        title = (chunk["title"] or "").replace("\x00", "")
+        content = (chunk["content"] or "").replace("\x00", "")
+
         cur.execute(
             """
             INSERT INTO documents
                 (drive_file_id, title, content, chunk_index, owner,
-                 source_url, file_type, drive_modified_at, embedding)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 source_url, file_type, drive_modified_at, embedding,
+                 sheet_gid, sheet_name, permissions)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (drive_file_id) DO UPDATE SET
                 title = EXCLUDED.title,
                 content = EXCLUDED.content,
@@ -45,18 +51,24 @@ def insert_chunks(conn, chunks_data):
                 source_url = EXCLUDED.source_url,
                 file_type = EXCLUDED.file_type,
                 drive_modified_at = EXCLUDED.drive_modified_at,
-                embedding = EXCLUDED.embedding
+                embedding = EXCLUDED.embedding,
+                sheet_gid = EXCLUDED.sheet_gid,
+                sheet_name = EXCLUDED.sheet_name,
+                permissions = EXCLUDED.permissions
             """,
             (
                 chunk["drive_file_id"],
-                chunk["title"],
-                chunk["content"],
+                title,
+                content,
                 chunk["chunk_index"],
                 chunk["owner"],
                 chunk["source_url"],
                 chunk["file_type"],
                 chunk["drive_modified_at"],
                 chunk["embedding"],
+                chunk.get("sheet_gid"),
+                chunk.get("sheet_name"),
+                json.dumps(chunk.get("permissions"), ensure_ascii=False) if chunk.get("permissions") else None,
             ),
         )
     conn.commit()
@@ -99,11 +111,23 @@ def extract_file_id_from_url(url):
     return None
 
 
+def extract_gid_from_url(url):
+    """スプレッドシート URL から gid（シートID）を抽出する。
+
+    対応 URL:
+      - ...edit?gid=660932359#gid=660932359
+      - ...edit#gid=660932359
+      - ...edit?gid=0
+    """
+    match = re.search(r'[?&#]gid=(\d+)', url)
+    return match.group(1) if match else None
+
+
 def lookup_by_url(conn, url):
     """Google Workspace の URL から DB 内の全チャンクを取得する。
 
-    URL から FILE_ID を抽出し、drive_file_id が "{FILE_ID}_chunk_%" に一致する
-    全チャンクをチャンク順に返す。
+    URL から FILE_ID を抽出し、該当ファイルの全チャンクを返す。
+    スプレッドシートで gid が指定されている場合、そのシートのチャンクを優先表示する。
 
     Returns:
         dict: {
@@ -113,8 +137,10 @@ def lookup_by_url(conn, url):
             "source_url": str,
             "file_type": str,
             "modified_at": str,
-            "chunks": [{"index": int, "content": str}, ...],
-            "full_text": str,  # 全チャンクを結合したテキスト
+            "target_sheet": {"gid": str, "name": str} or None,
+            "chunks": [{"index": int, "content": str,
+                        "sheet_gid": str|None, "sheet_name": str|None}, ...],
+            "full_text": str,
         }
         見つからない場合は None。
     """
@@ -122,16 +148,22 @@ def lookup_by_url(conn, url):
     if not file_id:
         return None
 
+    target_gid = extract_gid_from_url(url)
+
     cur = conn.cursor()
+    # file_id で始まる全チャンクを取得（_chunk_ と _sheet_ の両方に対応）
     cur.execute(
         """
         SELECT title, content, chunk_index, owner, source_url,
-               file_type, drive_modified_at
+               file_type, drive_modified_at, sheet_gid, sheet_name
         FROM documents
         WHERE drive_file_id LIKE %s
-        ORDER BY chunk_index
+        ORDER BY
+            CASE WHEN %s IS NOT NULL AND sheet_gid = %s THEN 0 ELSE 1 END,
+            sheet_gid NULLS FIRST,
+            chunk_index
         """,
-        (f"{file_id}_chunk_%",),
+        (f"{file_id}_%", target_gid, target_gid),
     )
     rows = cur.fetchall()
     cur.close()
@@ -140,8 +172,24 @@ def lookup_by_url(conn, url):
         return None
 
     first = rows[0]
-    chunks = [{"index": r[2], "content": r[1]} for r in rows]
+    chunks = [
+        {
+            "index": r[2],
+            "content": r[1],
+            "sheet_gid": r[7],
+            "sheet_name": r[8],
+        }
+        for r in rows
+    ]
     full_text = "\n".join(r[1] for r in rows)
+
+    # ターゲットシートの情報
+    target_sheet = None
+    if target_gid:
+        for r in rows:
+            if r[7] == target_gid:
+                target_sheet = {"gid": r[7], "name": r[8]}
+                break
 
     return {
         "file_id": file_id,
@@ -150,6 +198,7 @@ def lookup_by_url(conn, url):
         "source_url": first[4],
         "file_type": first[5],
         "modified_at": str(first[6]) if first[6] else None,
+        "target_sheet": target_sheet,
         "chunks": chunks,
         "full_text": full_text,
     }
@@ -180,7 +229,8 @@ def search_similar(conn, embedding, n_results=5, owner=None, since=None):
     cur.execute(
         f"""
         SELECT id, title, content, owner, source_url, file_type,
-               drive_modified_at, embedding <=> %s AS distance
+               drive_modified_at, embedding <=> %s AS distance,
+               sheet_gid, sheet_name
         FROM documents
         {where}
         ORDER BY embedding <=> %s

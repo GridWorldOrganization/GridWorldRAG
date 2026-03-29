@@ -16,7 +16,7 @@ fi
 # 2. パッケージインストール
 echo "[2/4] パッケージをインストール中..."
 source .venv/bin/activate
-pip install --cache-dir /Users/tobisako/tmp/pip-cache -r requirements.txt -q
+pip install -r requirements.txt -q
 
 # 3. PostgreSQL データベース
 echo "[3/4] PostgreSQL データベースをセットアップ中..."

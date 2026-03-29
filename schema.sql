@@ -14,8 +14,16 @@ CREATE TABLE IF NOT EXISTS documents (
     file_type         TEXT,
     drive_modified_at TIMESTAMPTZ,
     embedding         VECTOR(768),
+    sheet_gid         TEXT,
+    sheet_name        TEXT,
+    permissions       JSONB,
     created_at        TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- 既存 DB マイグレーション用
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS sheet_gid TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS sheet_name TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS permissions JSONB;
 
 -- ベクトル検索用インデックス（IVFFlat）
 CREATE INDEX IF NOT EXISTS idx_documents_embedding
@@ -25,3 +33,4 @@ CREATE INDEX IF NOT EXISTS idx_documents_embedding
 CREATE INDEX IF NOT EXISTS idx_documents_drive_file_id ON documents (drive_file_id);
 CREATE INDEX IF NOT EXISTS idx_documents_owner ON documents (owner);
 CREATE INDEX IF NOT EXISTS idx_documents_modified ON documents (drive_modified_at);
+CREATE INDEX IF NOT EXISTS idx_documents_sheet_gid ON documents (sheet_gid);

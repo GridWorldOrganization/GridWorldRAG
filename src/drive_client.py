@@ -19,10 +19,31 @@ from src.config import (
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
+# authenticate() で保持する認証情報（Sheets API 等で再利用）
+_credentials = None
+
+# Google API レート制限対策: リトライ付き実行
+import time as _time
+import random as _random
+
+def _api_call_with_retry(func, max_retries=5):
+    """Google API 呼び出しをレート制限対応のリトライ付きで実行する。"""
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except Exception as e:
+            error_str = str(e)
+            if "rate limit" in error_str.lower() or "429" in error_str or "quota" in error_str.lower():
+                wait = (2 ** attempt) + _random.uniform(0, 1)
+                _time.sleep(wait)
+                continue
+            raise
+    return func()  # 最後の1回
+
 # Google Docs 系の MIME タイプとエクスポート形式
+# ※ スプレッドシートは Sheets API でシート別取得するため、ここには含めない
 EXPORT_MIME_MAP = {
     "application/vnd.google-apps.document": "text/plain",
-    "application/vnd.google-apps.spreadsheet": "text/csv",
     "application/vnd.google-apps.presentation": "text/plain",
 }
 
@@ -36,9 +57,8 @@ TEXT_MIME_TYPES = {
     "application/xml",
 }
 
-# スキップする MIME タイプ
+# スキップする MIME タイプ（テキスト抽出不可かつメタデータも不要なもの）
 SKIP_MIME_TYPES = {
-    "application/vnd.google-apps.folder",
     "application/vnd.google-apps.shortcut",
     "application/vnd.google-apps.form",
     "application/vnd.google-apps.map",
@@ -53,6 +73,7 @@ def authenticate():
     初回はブラウザが開き、Google アカウントでログインが必要。
     認証後は token.pickle にトークンをキャッシュする。
     """
+    global _credentials
     creds = None
 
     if TOKEN_PATH.exists():
@@ -77,11 +98,67 @@ def authenticate():
         with open(TOKEN_PATH, "wb") as f:
             pickle.dump(creds, f)
 
+    _credentials = creds
     return build("drive", "v3", credentials=creds)
 
 
-def _list_files_in_drive(service, drive_id=None, corpora="user"):
-    """指定スコープのファイルを全件取得する内部関数。"""
+_sheets_service_cache = None
+
+def get_sheets_service():
+    """Sheets API サービスオブジェクトを返す（drive.readonly スコープで動作）。"""
+    global _sheets_service_cache
+    if _sheets_service_cache is not None:
+        return _sheets_service_cache
+    if _credentials is None:
+        raise RuntimeError("authenticate() を先に呼んでください")
+    _sheets_service_cache = build("sheets", "v4", credentials=_credentials)
+    return _sheets_service_cache
+
+
+def extract_spreadsheet_sheets(file_id):
+    """スプレッドシートの全シートをシート別に取得する。
+
+    Returns:
+        list[dict]: [{"gid": str, "name": str, "content": str}, ...]
+    """
+    service = get_sheets_service()
+    try:
+        spreadsheet = _api_call_with_retry(lambda: service.spreadsheets().get(
+            spreadsheetId=file_id,
+            includeGridData=False,
+        ).execute())
+    except Exception as e:
+        print(f"  警告: スプレッドシート取得失敗: {e}")
+        return []
+
+    sheets = spreadsheet.get("sheets", [])
+    results = []
+
+    for sheet in sheets:
+        props = sheet["properties"]
+        gid = str(props["sheetId"])
+        name = props["title"]
+
+        try:
+            sheet_range = f"'{name}'"
+            values_response = _api_call_with_retry(lambda sr=sheet_range: service.spreadsheets().values().get(
+                spreadsheetId=file_id,
+                range=sr,
+            ).execute())
+            values = values_response.get("values", [])
+            if not values:
+                continue
+            text = "\n".join("\t".join(str(cell) for cell in row) for row in values)
+            if text.strip():
+                results.append({"gid": gid, "name": name, "content": text})
+        except Exception as e:
+            print(f"  警告: シート '{name}' の取得失敗: {e}")
+
+    return results
+
+
+def list_files_in_drive(service, drive_id=None, corpora="user"):
+    """指定スコープのファイルを全件取得する。"""
     files = []
     page_token = None
     query = "trashed = false"
@@ -89,7 +166,7 @@ def _list_files_in_drive(service, drive_id=None, corpora="user"):
     kwargs = {
         "q": query,
         "spaces": "drive",
-        "fields": "nextPageToken, files(id, name, mimeType, modifiedTime, owners, webViewLink, driveId)",
+        "fields": "nextPageToken, files(id, name, mimeType, modifiedTime, owners, webViewLink, driveId, permissions(emailAddress, role, type, displayName))",
         "pageSize": 1000,
         "supportsAllDrives": True,
         "includeItemsFromAllDrives": True,
@@ -104,7 +181,7 @@ def _list_files_in_drive(service, drive_id=None, corpora="user"):
     while True:
         if page_token:
             kwargs["pageToken"] = page_token
-        response = service.files().list(**kwargs).execute()
+        response = _api_call_with_retry(lambda: service.files().list(**kwargs).execute())
 
         batch = response.get("files", [])
         files.extend(batch)
@@ -128,7 +205,7 @@ def list_all_files(service):
     # マイドライブ（自分が所有するファイルのみ、共有アイテムは除外）
     if INDEX_MY_DRIVE:
         print("  [マイドライブ] 取得中...")
-        my_files = _list_files_in_drive(service, corpora="user")
+        my_files = list_files_in_drive(service, corpora="user")
         # 共有アイテム除外: 自分がオーナーかつ共有ドライブ外のファイルのみ
         my_files = [
             f for f in my_files
@@ -153,7 +230,7 @@ def list_all_files(service):
                 drive_name = drive_names.get(drive_id, drive_id)
                 print(f"  [共有ドライブ] {drive_name} 取得中...", end="")
                 try:
-                    drive_files = _list_files_in_drive(service, drive_id=drive_id)
+                    drive_files = list_files_in_drive(service, drive_id=drive_id)
                     print(f" {len(drive_files)} ファイル")
                     all_files.extend(drive_files)
                 except Exception as e:
@@ -165,7 +242,7 @@ def list_all_files(service):
 
 def _download_content(service, file_id):
     """ファイルをバイナリでダウンロードする。"""
-    request = service.files().get_media(fileId=file_id)
+    request = _api_call_with_retry(lambda: service.files().get_media(fileId=file_id))
     content = io.BytesIO()
     downloader = MediaIoBaseDownload(content, request)
     done = False
@@ -185,14 +262,22 @@ def extract_text(service, file_info):
     mime_type = file_info["mimeType"]
     file_id = file_info["id"]
 
+    # フォルダ: フォルダ名をメタデータとして返す
+    if mime_type == "application/vnd.google-apps.folder":
+        return f"[フォルダ] {file_info['name']}"
+
     if mime_type in SKIP_MIME_TYPES:
+        return None
+
+    # スプレッドシートは extract_spreadsheet_sheets() で処理する
+    if mime_type == "application/vnd.google-apps.spreadsheet":
         return None
 
     # Google Docs 系: エクスポート
     if mime_type in EXPORT_MIME_MAP:
         export_mime = EXPORT_MIME_MAP[mime_type]
         try:
-            request = service.files().export_media(fileId=file_id, mimeType=export_mime)
+            request = _api_call_with_retry(lambda: service.files().export_media(fileId=file_id, mimeType=export_mime))
             content = io.BytesIO()
             downloader = MediaIoBaseDownload(content, request)
             done = False
@@ -212,7 +297,7 @@ def extract_text(service, file_info):
             print(f"  警告: ダウンロード失敗 [{file_info['name']}]: {e}")
             return None
 
-    # PDF: テキスト抽出
+    # PDF: テキスト抽出（テキストベースPDFのみ、スキャンPDFは対象外）
     if mime_type == "application/pdf":
         try:
             content = _download_content(service, file_id)
@@ -225,12 +310,47 @@ def extract_text(service, file_info):
                     return text
             except ImportError:
                 print("  警告: pypdf がインストールされていません。PDF はスキップします。")
-            return None
+                return f"[PDF] {file_info['name']}"
+            return f"[スキャンPDF] {file_info['name']}"
         except Exception as e:
             print(f"  警告: PDF 処理失敗 [{file_info['name']}]: {e}")
-            return None
+            return f"[PDF] {file_info['name']}"
+
+    # 画像: OCR 試行 → メタデータ
+    if mime_type.startswith("image/"):
+        try:
+            content = _download_content(service, file_id)
+            return _try_ocr_image(content, file_info["name"])
+        except Exception as e:
+            print(f"  警告: 画像処理失敗 [{file_info['name']}]: {e}")
+            return f"[画像] {file_info['name']}"
+
+    # 動画: メタデータのみ
+    if mime_type.startswith("video/"):
+        return f"[動画] {file_info['name']}"
+
+    # 音声: メタデータのみ
+    if mime_type.startswith("audio/"):
+        return f"[音声] {file_info['name']}"
 
     return None
+
+
+def _try_ocr_image(content, filename):
+    """画像から OCR テキスト抽出を試行する。"""
+    try:
+        import pytesseract
+        from PIL import Image
+        content.seek(0)
+        img = Image.open(content)
+        text = pytesseract.image_to_string(img, lang="jpn+eng")
+        if text.strip():
+            return f"[画像] {filename}\n{text}"
+    except ImportError:
+        pass
+    except Exception:
+        pass
+    return f"[画像] {filename}"
 
 
 def get_changes_start_token(service):
