@@ -218,6 +218,8 @@ def _worker(worker_id, task_queue, tasks_total, results_queue, sheets_semaphore)
 def _worker_main(worker_id, task_queue, tasks_total, results_queue, sheets_semaphore,
                   model, splitter, conn):
     """ワーカーのメインループ（conn の try/finally は呼び出し元で保護済み）。"""
+    from src.db import connect, insert_chunks
+
     service = authenticate()
 
     total_processed = 0
