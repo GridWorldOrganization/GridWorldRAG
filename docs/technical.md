@@ -97,11 +97,11 @@ Claude Code ←→ mcp_server.py ───────────────�
 3. `min(PARALLEL_WORKERS, タスク数)` 個のワーカープロセスを生成
 4. 各ワーカーは `daemon=True`（親プロセス終了時に自動停止）
 5. SIGINT / SIGTERM ハンドラを設定（Ctrl+C で全ワーカーを terminate → join）
-6. 各ワーカーの初期化:
+6. 各ワーカーの初期化（`_worker` → `_worker_main`）:
    - `SentenceTransformer(EMBEDDING_MODEL)` をロード（約 420MB / ワーカー）
    - `RecursiveCharacterTextSplitter` を生成
-   - PostgreSQL に接続
-   - Google Drive API に認証
+   - PostgreSQL に接続（`try/finally` で `conn.close()` を保護）
+   - Google Drive API に認証（`httplib2.Http(timeout=N)` でソケットタイムアウト付き）
 
 ### Phase 6: ファイル処理（_worker → _process_file）
 
@@ -111,7 +111,9 @@ Claude Code ←→ mcp_server.py ───────────────�
 
 ```
 while True:
-    task = queue.get_nowait()  # 空なら queue.Empty で break
+    task = task_queue.get()  # ブロッキング取得（センチネル None で終了）
+    if task is None:
+        break
 ```
 
 #### 6-2. ファイルごとの処理（_process_file）
@@ -147,6 +149,8 @@ while True:
 - `BATCH_SIZE=100` ごとに `insert_chunks()` を呼び出し
 - UPSERT（`ON CONFLICT (drive_file_id) DO UPDATE`）で冪等性を確保
 - NUL 文字 (`\x00`) は自動除去
+- `insert_chunks()` 失敗時は `rollback()` → DB接続を再作成して処理継続（バッチロストはログ記録）
+- カーソルは `try/finally` で確実に `close()`
 
 #### 6-6. 進捗更新
 
