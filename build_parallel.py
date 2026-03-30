@@ -137,7 +137,7 @@ def _process_file(file_info, model, splitter, service, batch, sheets_semaphore=N
                 cur.execute("SELECT 1 FROM documents WHERE drive_file_id LIKE %s LIMIT 1",
                             (f"{file_id}_%",))
                 if cur.fetchone():
-                    return 0, 1, 0, 0  # 既にDB投入済み → スキップ
+                    return -1, 1, 0, 0  # -1 = resume スキップ（通常の skip は 0）
             finally:
                 cur.close()
         except Exception:
@@ -348,9 +348,12 @@ def _worker_main(worker_id, task_queue, tasks_total, results_queue, sheets_semap
             _file_start = time.time()
             try:
                 p, s, e, c = _process_file(file_info, model, splitter, service, batch, sheets_semaphore, conn=conn)
+                _is_resume = (p == -1)
+                if _is_resume:
+                    p = 0  # カウント上は通常スキップと同じ
                 _file_elapsed = time.time() - _file_start
                 _ts = time.strftime("%H:%M:%S")
-                _result = "skip" if s else ("err" if e else "ok")
+                _result = "resumeSkip" if _is_resume else ("skip" if s else ("err" if e else "ok"))
                 print(f"[{_ts}] W{worker_id} {fi+1}/{task_size} {_result}   {_file_elapsed:.1f}s  [{_folder}] {_fname}", flush=True)
             except Exception as _ex:
                 _file_elapsed = time.time() - _file_start
