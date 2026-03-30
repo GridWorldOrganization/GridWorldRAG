@@ -29,7 +29,7 @@ from src.config import (
     EMBEDDING_MODEL, CHUNK_SIZE, CHUNK_OVERLAP, BATCH_SIZE,
     GOOGLE_EMAIL, INDEX_MY_DRIVE, INDEX_SHARED_DRIVES, INDEX_IMAGE_OCR,
     PARALLEL_WORKERS, TASK_SPLIT_THRESHOLD, MONITOR_INTERVAL_MS,
-    WORKER_START_INTERVAL_SEC,
+    WORKER_START_INTERVAL_SEC, FETCH_THREADS,
     load_shared_drives_whitelist, WorkerStatus,
 )
 from src.drive_client import (
@@ -527,9 +527,10 @@ def collect_file_lists(service):
 
     done_drives = 0
 
-    # ドットアニメーション + スレッドA/B 表示
+    # ドットアニメーション + スレッド表示
     _fetch_done = [0]
-    _thread_current = {"A": "-", "B": "-"}  # スレッドA/Bが処理中の番号
+    _thread_labels = list("ABCDEFGHIJKLMNOP"[:FETCH_THREADS])
+    _thread_current = {lbl: "-" for lbl in _thread_labels}
     _fetch_lock = threading.Lock()
     _fetch_stop = threading.Event()
 
@@ -540,16 +541,15 @@ def collect_file_lists(service):
             d = "." * dots
             with _fetch_lock:
                 done = _fetch_done[0]
-                a = _thread_current["A"]
-                b = _thread_current["B"]
-            msg = f"2スレッドでファイル一覧を取得中 A:#{a} B:#{b} ({done}/{total_drives}完了)"
+                parts = " ".join(f"{lbl}:#{_thread_current[lbl]}" for lbl in _thread_labels)
+            msg = f"{FETCH_THREADS}スレッドでファイル一覧を取得中 {parts} ({done}/{total_drives}完了)"
             print(f"\r{msg}{d}\033[K", end="", flush=True)
             _fetch_stop.wait(0.5)
 
     _dot_thread = threading.Thread(target=_dot_animator, daemon=True)
     _dot_thread.start()
 
-    # スレッド名→A/Bのマッピング
+    # スレッド名→ラベル（A,B,C,...）のマッピング
     _thread_names = {}
     _thread_name_lock = threading.Lock()
 
@@ -557,7 +557,8 @@ def collect_file_lists(service):
         tid = threading.current_thread().name
         with _thread_name_lock:
             if tid not in _thread_names:
-                _thread_names[tid] = "A" if len(_thread_names) == 0 else "B"
+                idx = len(_thread_names)
+                _thread_names[tid] = _thread_labels[idx] if idx < len(_thread_labels) else chr(65 + idx)
             return _thread_names[tid]
 
     def _fetch_start(idx):
@@ -651,8 +652,8 @@ def collect_file_lists(service):
                 _fetch_complete(idx)
                 return idx, drive_name, None, e
 
-        # 2スレッドで並列取得
-        executor = ThreadPoolExecutor(max_workers=2)
+        # nスレッドで並列取得
+        executor = ThreadPoolExecutor(max_workers=FETCH_THREADS)
         try:
             futures = [
                 executor.submit(_fetch_drive, idx, did, dname)
@@ -742,9 +743,9 @@ def main():
         try:
             drive_file_lists = collect_file_lists(service)
         except KeyboardInterrupt:
-            print("\r2スレッドでファイル一覧を取得中... 中断\033[K")
+            print(f"\r{FETCH_THREADS}スレッドでファイル一覧を取得中... 中断\033[K")
             sys.exit(1)
-        print("\r2スレッドでファイル一覧を取得中... 完了\033[K")
+        print(f"\r{FETCH_THREADS}スレッドでファイル一覧を取得中... 完了\033[K")
         print_file_list_summary(drive_file_lists)
 
         if args.fetch_only:

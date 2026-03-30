@@ -78,6 +78,7 @@ TASK_SPLIT_THRESHOLD = int(os.environ.get("TASK_SPLIT_THRESHOLD", "5000"))
 MONITOR_INTERVAL_MS = int(os.environ.get("MONITOR_INTERVAL_MS", "800"))
 WORKER_START_INTERVAL_SEC = float(os.environ.get("WORKER_START_INTERVAL_SEC", "5"))
 DRIVE_DOWNLOAD_TIMEOUT_SEC = int(os.environ.get("DRIVE_DOWNLOAD_TIMEOUT_SEC", "30"))
+FETCH_THREADS = int(os.environ.get("FETCH_THREADS", "3"))
 
 # 埋め込み
 EMBEDDING_MODEL = "multi-qa-mpnet-base-dot-v1"
