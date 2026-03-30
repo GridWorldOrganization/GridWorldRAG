@@ -646,13 +646,19 @@ def collect_file_lists(service):
                 return drive_id, drive_name, 0
 
         _prelim = []
-        with ThreadPoolExecutor(max_workers=FETCH_THREADS) as _probe_exec:
+        _probe_exec = ThreadPoolExecutor(max_workers=FETCH_THREADS)
+        try:
             _probe_futures = [
                 _probe_exec.submit(_probe_drive, did, dname)
                 for did, dname in _probe_targets
             ]
             for fut in as_completed(_probe_futures):
                 _prelim.append(fut.result())
+        except KeyboardInterrupt:
+            _probe_exec.shutdown(wait=False, cancel_futures=True)
+            raise
+        finally:
+            _probe_exec.shutdown(wait=False)
 
         # 大きい順にソート（大きいドライブを先に開始 → 最後に小さいのが残る）
         _prelim.sort(key=lambda x: -x[2])
