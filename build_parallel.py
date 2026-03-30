@@ -29,7 +29,7 @@ from src.config import (
     EMBEDDING_MODEL, CHUNK_SIZE, CHUNK_OVERLAP, BATCH_SIZE,
     GOOGLE_EMAIL, INDEX_MY_DRIVE, INDEX_SHARED_DRIVES, INDEX_IMAGE_OCR,
     PARALLEL_WORKERS, TASK_SPLIT_THRESHOLD, MONITOR_INTERVAL_MS,
-    WORKER_START_INTERVAL_SEC, DRIVE_DOWNLOAD_TIMEOUT_SEC,
+    WORKER_START_INTERVAL_SEC,
     load_shared_drives_whitelist, WorkerStatus,
 )
 from src.drive_client import (
@@ -188,7 +188,7 @@ def _worker(worker_id, task_queue, tasks_total, results_queue, sheets_semaphore)
 
     from langchain_text_splitters import RecursiveCharacterTextSplitter
     from sentence_transformers import SentenceTransformer
-    from src.db import connect, insert_chunks
+    from src.db import connect
 
     model = SentenceTransformer(EMBEDDING_MODEL)
     # Note: _model_lock は廃止。daemon スレッドによるタイムアウトを廃止し
@@ -639,9 +639,9 @@ def main():
         try:
             drive_file_lists = collect_file_lists(service)
         except KeyboardInterrupt:
-            print(f"\r2スレッドでファイル一覧を取得中... 中断\033[K")
+            print("\r2スレッドでファイル一覧を取得中... 中断\033[K")
             sys.exit(1)
-        print(f"\r2スレッドでファイル一覧を取得中... 完了\033[K")
+        print("\r2スレッドでファイル一覧を取得中... 完了\033[K")
         print_file_list_summary(drive_file_lists)
 
         if args.fetch_only:

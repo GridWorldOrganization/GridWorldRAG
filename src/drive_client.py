@@ -6,7 +6,6 @@ build_index.py, watcher.py など複数スクリプトから利用される。
 
 import io
 import pickle
-import signal
 import socket
 
 from google.auth.transport.requests import Request
