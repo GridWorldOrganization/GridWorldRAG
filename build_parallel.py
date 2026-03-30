@@ -194,6 +194,7 @@ def _worker(worker_id, task_queue, tasks_total, results_queue, sheets_semaphore)
     from src.db import connect, insert_chunks
 
     model = SentenceTransformer(EMBEDDING_MODEL)
+    _model_lock = threading.Lock()  # model.encode() の排他制御（タイムアウト時の競合防止）
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP,
     )
@@ -276,7 +277,8 @@ def _worker(worker_id, task_queue, tasks_total, results_queue, sheets_semaphore)
             _presult = [None]; _perror = [None]
             def _run_process():
                 try:
-                    _presult[0] = _process_file(file_info, model, splitter, service, batch, sheets_semaphore)
+                    with _model_lock:
+                        _presult[0] = _process_file(file_info, model, splitter, service, batch, sheets_semaphore)
                 except Exception as _ex:
                     _perror[0] = _ex
             _pt = threading.Thread(target=_run_process, daemon=True)
