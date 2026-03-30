@@ -626,21 +626,34 @@ def collect_file_lists(service):
 
         # 取得対象リストを作成し、大きいドライブを先に処理する
         # （最後に巨大ドライブが残って1スレッドだけ働く問題を回避）
-        _prelim = []
-        for drive_id in whitelist:
-            drive_name = drive_names.get(drive_id, drive_id)
-            # 1ページだけ取得してサイズを推定（nextPageToken あり = 1000件超）
+        # プローブを並列化（FETCH_THREADS スレッドで同時推定）
+        _probe_targets = [
+            (did, drive_names.get(did, did)) for did in whitelist
+        ]
+
+        def _probe_drive(drive_id, drive_name):
             try:
-                _probe = service.files().list(
+                _svc = authenticate()
+                _probe = _svc.files().list(
                     driveId=drive_id, corpora="drive", q="trashed = false",
                     fields="nextPageToken, files(id)", pageSize=1000,
                     supportsAllDrives=True, includeItemsFromAllDrives=True,
                 ).execute()
                 _est = 10000 if "nextPageToken" in _probe else len(_probe.get("files", []))
+                return drive_id, drive_name, _est
             except Exception as _probe_ex:
                 _log(f"プローブ失敗 {drive_name}: {_probe_ex}")
-                _est = 0
-            _prelim.append((drive_id, drive_name, _est))
+                return drive_id, drive_name, 0
+
+        _prelim = []
+        with ThreadPoolExecutor(max_workers=FETCH_THREADS) as _probe_exec:
+            _probe_futures = [
+                _probe_exec.submit(_probe_drive, did, dname)
+                for did, dname in _probe_targets
+            ]
+            for fut in as_completed(_probe_futures):
+                _prelim.append(fut.result())
+
         # 大きい順にソート（大きいドライブを先に開始 → 最後に小さいのが残る）
         _prelim.sort(key=lambda x: -x[2])
         _log("ドライブサイズ推定（大きい順）:")
