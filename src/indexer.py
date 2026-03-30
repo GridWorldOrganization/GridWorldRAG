@@ -22,8 +22,11 @@ def extract_permissions(file_info):
 
 def extract_owner(file_info):
     """ファイルのオーナーメールアドレスを取得する。"""
-    if file_info.get("owners"):
-        return file_info["owners"][0].get("emailAddress", "")
+    owners = file_info.get("owners")
+    if owners and isinstance(owners, list) and len(owners) > 0:
+        owner = owners[0]
+        if isinstance(owner, dict):
+            return owner.get("emailAddress", "")
     return ""
 
 
@@ -44,7 +47,7 @@ def make_chunk_entry(file_info, chunk_text, embedding, chunk_index,
         "source_url": file_info.get("webViewLink", ""),
         "file_type": file_info["mimeType"],
         "drive_modified_at": file_info.get("modifiedTime"),
-        "embedding": embedding.tolist(),
+        "embedding": embedding.tolist() if hasattr(embedding, "tolist") else list(embedding),
         "sheet_gid": sheet_gid,
         "sheet_name": sheet_name,
         "permissions": extract_permissions(file_info),

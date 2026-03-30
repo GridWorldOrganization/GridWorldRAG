@@ -51,7 +51,7 @@ def _api_call_with_retry(func, max_retries=5):  # max_retries=1 で失敗即諦�
                     _rate_limit_callback(False)
                 continue
             raise
-    return func()  # 最後の1回
+    return func()  # 最後の1回（例外は呼び出し元に伝搬）
 
 # Google Docs 系の MIME タイプとエクスポート形式
 # ※ スプレッドシートは Sheets API でシート別取得するため、ここには含めない
@@ -77,41 +77,6 @@ SKIP_MIME_TYPES = {
     "application/vnd.google-apps.map",
     "application/vnd.google-apps.site",
 }
-
-
-class _PDFTimeoutError(Exception):
-    pass
-
-
-class _DownloadTimeoutError(Exception):
-    pass
-
-
-def _download_with_sigalrm(func, timeout_sec):
-    """func() をスレッドタイムアウト付きで実行する。
-
-    daemon スレッドで func() を走らせ、timeout_sec 秒以内に完了しない場合は
-    _DownloadTimeoutError を投げる。スレッドは放棄（socket が最終的に閉じる）。
-    SIGALRM は httplib2 内部の except Exception に飲まれるため使わない。
-    """
-    import threading
-    result = [None]
-    error = [None]
-
-    def _run():
-        try:
-            result[0] = func()
-        except Exception as e:
-            error[0] = e
-
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    t.join(timeout=timeout_sec)
-    if t.is_alive():
-        raise _DownloadTimeoutError()
-    if error[0] is not None:
-        raise error[0]
-    return result[0]
 
 
 def _extract_pdf_with_timeout(content, timeout_sec=60):
@@ -227,9 +192,13 @@ def extract_spreadsheet_sheets(file_id):
     results = []
 
     for sheet in sheets:
-        props = sheet["properties"]
-        gid = str(props["sheetId"])
-        name = props["title"]
+        try:
+            props = sheet["properties"]
+            gid = str(props["sheetId"])
+            name = props["title"]
+        except (KeyError, TypeError) as e:
+            print(f"  警告: シートメタデータ不正（スキップ）: {e}", flush=True)
+            continue
 
         try:
             # シート値取得はmax_retries=1（429等で失敗したら即諦めてpartialとして保存）

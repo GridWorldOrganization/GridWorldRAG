@@ -27,8 +27,6 @@ from src.drive_client import (
     list_changes,
     extract_text,
     extract_spreadsheet_sheets,
-    _download_with_sigalrm,
-    _DownloadTimeoutError,
     SKIP_MIME_TYPES,
     resolve_folder_path_api,
 )
@@ -145,12 +143,9 @@ def _process_changed_file(file_info, service, model, splitter, whitelist):
     # スプレッドシート
     if mime_type == "application/vnd.google-apps.spreadsheet":
         try:
-            sheets = _download_with_sigalrm(
-                lambda: extract_spreadsheet_sheets(file_id),
-                DRIVE_DOWNLOAD_TIMEOUT_SEC,
-            )
-        except _DownloadTimeoutError:
-            print(f"  警告: スプレッドシートタイムアウト [{file_name}]", flush=True)
+            sheets = extract_spreadsheet_sheets(file_id)
+        except Exception as e:
+            print(f"  警告: スプレッドシート取得失敗 [{file_name}]: {e}", flush=True)
             return [], "error"
 
         if not sheets:
@@ -302,7 +297,6 @@ def _run_sync(service, conn, model, splitter, whitelist):
             added += 1
             added_files.append({"name": fname, "url": furl, "id": file_id})
 
-    import json as _json
     _save_sync_result(conn, {
         "synced_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "added": added_files,

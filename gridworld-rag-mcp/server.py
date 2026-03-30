@@ -27,7 +27,7 @@ for _i, _arg in enumerate(sys.argv[1:]):
 from mcp.server.fastmcp import FastMCP
 
 from src.config import EMBEDDING_MODEL
-from src.db import connect, search_similar, lookup_by_url, extract_file_id_from_url
+from src.db import connect, search_similar, lookup_by_url
 
 mcp = FastMCP("gridworld-rag-mcp")
 
@@ -41,7 +41,11 @@ def _get_conn():
         _conn = connect(_db_name)
     else:
         try:
-            _conn.cursor().execute("SELECT 1")
+            cur = _conn.cursor()
+            try:
+                cur.execute("SELECT 1")
+            finally:
+                cur.close()
         except Exception:
             _conn = connect(_db_name)
     return _conn
@@ -180,7 +184,6 @@ def folder_tree(drive_filter: str = None) -> str:
 
     # ツリー表示
     lines = ["## フォルダ構成"]
-    prev_parts = []
     for path, type_counts in sorted(folder_info.items()):
         parts = [p.strip() for p in path.split(" / ")]
         depth = len(parts) - 1
@@ -294,7 +297,7 @@ def stats() -> str:
     cur.close()
 
     lines = [
-        f"## インデックスDB統計",
+        "## インデックスDB統計",
         f"- 総レコード数: {total_rows}",
         f"- ファイル数: {total_files}",
         "",
