@@ -93,16 +93,32 @@ def _error_fallback(file_info, file_name, model, batch):
         return 0, 0, 1, 0  # 埋め込み生成も失敗した場合
 
 
-def _process_file(file_info, model, splitter, service, batch, sheets_semaphore=None):
+def _process_file(file_info, model, splitter, service, batch, sheets_semaphore=None, conn=None):
     """1ファイルを処理し、チャンクを batch に追加する。
 
     sheets_semaphore: Sheets API 同時アクセス制限用のプロセス間セマフォ。
+    conn: DB接続（resume モード時、既存ファイルのスキップ判定に使用）。
 
     Returns:
         (processed_count, skipped_count, error_count, chunk_count)
     """
     file_name = file_info["name"]
     mime_type = file_info["mimeType"]
+
+    # resume: DB に既に存在するファイルはスキップ（再実行時の高速化）
+    if conn is not None:
+        file_id = file_info["id"]
+        try:
+            cur = conn.cursor()
+            try:
+                cur.execute("SELECT 1 FROM documents WHERE drive_file_id LIKE %s LIMIT 1",
+                            (f"{file_id}_%",))
+                if cur.fetchone():
+                    return 0, 1, 0, 0  # 既にDB投入済み → スキップ
+            finally:
+                cur.close()
+        except Exception:
+            pass  # DB チェック失敗時は通常処理に fallback
 
     # 画像: OCR 無効時はファイル名のみ DB 投入
     if mime_type.startswith("image/") and not INDEX_IMAGE_OCR:
@@ -296,7 +312,7 @@ def _worker_main(worker_id, task_queue, tasks_total, results_queue, sheets_semap
 
             _file_start = time.time()
             try:
-                p, s, e, c = _process_file(file_info, model, splitter, service, batch, sheets_semaphore)
+                p, s, e, c = _process_file(file_info, model, splitter, service, batch, sheets_semaphore, conn=conn)
                 _file_elapsed = time.time() - _file_start
                 _ts = time.strftime("%H:%M:%S")
                 _result = "skip" if s else ("err" if e else "ok")

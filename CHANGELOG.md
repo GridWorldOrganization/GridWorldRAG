@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Worker crash resilience** — `_worker` now wraps `conn.close()` in `try/finally`; `insert_chunks` failures trigger DB reconnect instead of crashing the worker
 - **Spreadsheet exception handling** — broadened catch from `(socket.timeout, OSError)` to `Exception` to cover httplib2-specific errors
 - **Worker fatal error reporting** — separated `_worker` into init + `_worker_main` so fatal errors are logged and `results_queue` always receives a response (prevents parent deadlock)
+- **Resume support** — `_process_file` checks DB for existing data before processing; re-running the build skips already-indexed files instantly and processes only new/unprocessed files
 
 ### Removed
 
