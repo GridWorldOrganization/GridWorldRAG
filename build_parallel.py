@@ -586,6 +586,7 @@ def main():
     if args.db is not None:
         import os as _os
         _os.environ["GRIDWORLDRAG_DB_INDEX"] = str(args.db)
+        _os.environ["PGDATABASE"] = f"gridworldrag_{args.db}"  # ワーカー継承用
         # config モジュールの DB_NAME を再設定
         import src.config as _cfg
         _cfg.DB_NAME = f"gridworldrag_{args.db}"
