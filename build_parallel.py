@@ -594,11 +594,28 @@ def collect_file_lists(service):
         rate_lock = threading.Lock()
         rate_backoff = [0.0]
 
-        # 取得対象リストを番号付きで作成
-        fetch_list = []
+        # 取得対象リストを作成し、大きいドライブを先に処理する
+        # （最後に巨大ドライブが残って1スレッドだけ働く問題を回避）
+        _prelim = []
         for drive_id in whitelist:
-            done_drives += 1
             drive_name = drive_names.get(drive_id, drive_id)
+            # 1ページだけ取得してサイズを推定（nextPageToken あり = 1000件超）
+            try:
+                _probe = service.files().list(
+                    driveId=drive_id, corpora="drive", q="trashed = false",
+                    fields="nextPageToken, files(id)", pageSize=1000,
+                    supportsAllDrives=True, includeItemsFromAllDrives=True,
+                ).execute()
+                _est = 10000 if "nextPageToken" in _probe else len(_probe.get("files", []))
+            except Exception:
+                _est = 0
+            _prelim.append((drive_id, drive_name, _est))
+        # 大きい順にソート（大きいドライブを先に開始 → 最後に小さいのが残る）
+        _prelim.sort(key=lambda x: -x[2])
+
+        fetch_list = []
+        for drive_id, drive_name, _est in _prelim:
+            done_drives += 1
             fetch_list.append((done_drives, drive_id, drive_name))
 
         def _fetch_drive(idx, drive_id, drive_name):
