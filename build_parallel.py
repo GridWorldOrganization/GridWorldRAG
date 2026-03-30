@@ -335,7 +335,9 @@ def _worker_main(worker_id, task_queue, tasks_total, results_queue, sheets_semap
         }
 
         batch = []
-        for fi, file_info in enumerate(files):
+        fi = 0
+        while fi < task_size:
+            file_info = files[fi]
             _fname = file_info.get("name", "?")
             _folder = file_info.get("parents_path", file_info.get("drive_name", task_label))
             _mime = file_info.get("mimeType", "?").split(".")[-1]
@@ -366,7 +368,6 @@ def _worker_main(worker_id, task_queue, tasks_total, results_queue, sheets_semap
                 except Exception as _db_ex:
                     print(f"[{time.strftime('%H:%M:%S')}] W{worker_id} DB挿入エラー（{len(batch)}件ロスト）: {_db_ex}", flush=True)
                     total_errors += 1
-                    # 接続復旧を試みる
                     try:
                         conn.close()
                     except Exception:
@@ -374,21 +375,23 @@ def _worker_main(worker_id, task_queue, tasks_total, results_queue, sheets_semap
                     conn = connect()
                 batch = []
 
+            fi += 1
+
             # 進捗更新（レート制限コールバック用にも反映）
             _current_task_kwargs = {
-                "task_label": task_label, "task_current": fi + 1, "task_size": task_size,
+                "task_label": task_label, "task_current": fi, "task_size": task_size,
                 "drive_type": drive_type, "part": task_part, "drive_total": task_drive_total,
             }
             progress(**_current_task_kwargs)
 
             # --- ワークスティール: 遊んでいるワーカーに残りを再分配 ---
-            remaining_count = task_size - (fi + 1)
-            if remaining_count >= 100 and (fi + 1) % 50 == 0:
+            remaining_count = task_size - fi
+            if remaining_count >= 100 and fi % 50 == 0:
                 idle_count = _count_idle_workers(worker_id)
                 if idle_count >= 2:
                     # 残りの 80% をサブタスクとしてキューに戻す
                     keep_count = max(remaining_count // 5, 50)
-                    redistribute_start = file_start + (fi + 1) + keep_count
+                    redistribute_start = file_start + fi + keep_count
                     redistribute_count = remaining_count - keep_count
                     # サブタスク分割（idle ワーカー数に応じて）
                     n_splits = min(idle_count, 4)
@@ -405,10 +408,9 @@ def _worker_main(worker_id, task_queue, tasks_total, results_queue, sheets_semap
                             "file_start": s_start,
                             "file_end": s_end,
                         })
-                    # このワーカーは keep_count 分だけ処理して終了
-                    new_end = file_start + (fi + 1) + keep_count
-                    files = all_files[file_start:new_end]
-                    task_size = len(files)
+                    # このワーカーは keep_count 分だけ処理して break
+                    task_size = fi + keep_count
+                    files = all_files[file_start:file_start + task_size]
                     print(f"[{time.strftime('%H:%M:%S')}] W{worker_id} 再分配: "
                           f"残り{redistribute_count}件を{n_splits}サブタスクに分割、"
                           f"{keep_count}件を継続", flush=True)
