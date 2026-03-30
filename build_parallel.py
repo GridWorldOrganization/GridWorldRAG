@@ -397,8 +397,7 @@ def _worker_main(worker_id, task_queue, tasks_total, results_queue, sheets_semap
                     # サブタスク分割（idle ワーカー数に応じて）
                     n_splits = min(idle_count, 4, redistribute_count)  # redistribute_count 以下に制限
                     if n_splits == 0:
-                        fi = fi  # 再分配不要、そのまま継続
-                        continue
+                        continue  # 再分配不要、そのまま継続
                     split_size = redistribute_count // n_splits
                     for si in range(n_splits):
                         s_start = redistribute_start + si * split_size
