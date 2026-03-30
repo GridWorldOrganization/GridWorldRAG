@@ -336,6 +336,7 @@ def _worker_main(worker_id, task_queue, tasks_total, results_queue, sheets_semap
 
         batch = []
         fi = 0
+        _redistributed = False  # 1タスクにつき再分配は1回まで
         while fi < task_size:
             file_info = files[fi]
             _fname = file_info.get("name", "?")
@@ -386,7 +387,7 @@ def _worker_main(worker_id, task_queue, tasks_total, results_queue, sheets_semap
 
             # --- ワークスティール: 遊んでいるワーカーに残りを再分配 ---
             remaining_count = task_size - fi
-            if remaining_count >= 100 and fi % 50 == 0:
+            if not _redistributed and remaining_count >= 100 and fi % 50 == 0:
                 idle_count = _count_idle_workers(worker_id)
                 if idle_count >= 2:
                     # 残りの 80% をサブタスクとしてキューに戻す
@@ -394,7 +395,10 @@ def _worker_main(worker_id, task_queue, tasks_total, results_queue, sheets_semap
                     redistribute_start = file_start + fi + keep_count
                     redistribute_count = remaining_count - keep_count
                     # サブタスク分割（idle ワーカー数に応じて）
-                    n_splits = min(idle_count, 4)
+                    n_splits = min(idle_count, 4, redistribute_count)  # redistribute_count 以下に制限
+                    if n_splits == 0:
+                        fi = fi  # 再分配不要、そのまま継続
+                        continue
                     split_size = redistribute_count // n_splits
                     for si in range(n_splits):
                         s_start = redistribute_start + si * split_size
@@ -408,9 +412,10 @@ def _worker_main(worker_id, task_queue, tasks_total, results_queue, sheets_semap
                             "file_start": s_start,
                             "file_end": s_end,
                         })
-                    # このワーカーは keep_count 分だけ処理して break
+                    # このワーカーは keep_count 分だけ処理して終了
                     task_size = fi + keep_count
                     files = all_files[file_start:file_start + task_size]
+                    _redistributed = True
                     print(f"[{time.strftime('%H:%M:%S')}] W{worker_id} 再分配: "
                           f"残り{redistribute_count}件を{n_splits}サブタスクに分割、"
                           f"{keep_count}件を継続", flush=True)
@@ -798,18 +803,20 @@ def main():
 
     print(f"\n{n_workers} ワーカー起動、{len(tasks)} タスクを処理中...")
 
+    # シャットダウン制御（_sentinel_monitor より先に定義する必要がある）
+    shutdown_requested = False
+
     # 全ワーカー idle 検知 → sentinel 投入スレッド
     def _sentinel_monitor():
-        """全ワーカーが idle（ready）かつキューが空になったら sentinel を投入して終了させる。"""
+        """全ワーカーが idle（ready）かつキューが空になったら sentinel を投入して終了させる。
+        レース回避: 2回連続で全員 idle を確認してから終了判定。"""
         import time as _t
         _t.sleep(30)  # 起動直後は全員 ready なので待つ
+        consecutive_idle = 0
         while True:
             _t.sleep(10)
             if shutdown_requested:
                 return
-            # キューが空でなければまだタスクがある
-            if not task_queue.empty():
-                continue
             # 全ワーカーの状態を確認
             all_idle = True
             worker_count = 0
@@ -827,17 +834,18 @@ def main():
                 except Exception:
                     all_idle = False
                     break
-            if all_idle and worker_count >= n_workers:
-                print("\n全ワーカー idle 検知 → 終了シグナル送信", flush=True)
-                for _ in range(n_workers):
-                    task_queue.put(None)
-                return
+            if all_idle and worker_count >= n_workers and task_queue.empty():
+                consecutive_idle += 1
+                if consecutive_idle >= 2:
+                    print("\n全ワーカー idle 検知 → 終了シグナル送信", flush=True)
+                    for _ in range(n_workers):
+                        task_queue.put(None)
+                    return
+            else:
+                consecutive_idle = 0
 
     _sentinel_thread = threading.Thread(target=_sentinel_monitor, daemon=True)
     _sentinel_thread.start()
-
-    # シャットダウン制御
-    shutdown_requested = False
 
     def _shutdown(signum, frame):
         nonlocal shutdown_requested
