@@ -451,7 +451,7 @@ def _worker_main(worker_id, task_queue, tasks_total, results_queue, sheets_semap
         progress(status=WorkerStatus.READY)
         time.sleep(MONITOR_INTERVAL_MS / 1000)
 
-    conn.close()
+    # conn.close() は呼び出し元 _worker の finally で行う
     progress(status=WorkerStatus.DONE)
 
     results_queue.put({
@@ -915,38 +915,41 @@ def main():
         from src.db import connect as db_connect
 
         check_conn = db_connect()
-        check_cur = check_conn.cursor()
+        try:
+            check_cur = check_conn.cursor()
+            try:
+                # DB 内の全ファイルIDを一括取得（drive_file_id の先頭部分）
+                check_cur.execute(
+                    "SELECT DISTINCT split_part(drive_file_id, '_chunk_', 1) FROM documents"
+                    " UNION "
+                    "SELECT DISTINCT split_part(drive_file_id, '_sheet_', 1) FROM documents"
+                )
+                db_file_ids = {row[0] for row in check_cur.fetchall()}
 
-        # DB 内の全ファイルIDを一括取得（drive_file_id の先頭部分）
-        check_cur.execute(
-            "SELECT DISTINCT split_part(drive_file_id, '_chunk_', 1) FROM documents"
-            " UNION "
-            "SELECT DISTINCT split_part(drive_file_id, '_sheet_', 1) FROM documents"
-        )
-        db_file_ids = {row[0] for row in check_cur.fetchall()}
+                all_ok = True
+                for i, t in enumerate(tasks, 1):
+                    label = f"{t['label']}({t['part']})"
+                    indexable_ids = {
+                        f["id"] for f in t["files"]
+                        if f["mimeType"] not in SKIP_MIME_TYPES
+                    }
+                    found = len(indexable_ids & db_file_ids)
+                    expected = len(indexable_ids)
+                    missing = expected - found
 
-        all_ok = True
-        for i, t in enumerate(tasks, 1):
-            label = f"{t['label']}({t['part']})"
-            indexable_ids = {
-                f["id"] for f in t["files"]
-                if f["mimeType"] not in SKIP_MIME_TYPES
-            }
-            found = len(indexable_ids & db_file_ids)
-            expected = len(indexable_ids)
-            missing = expected - found
+                    if missing > 0 and missing > expected * 0.1:
+                        print(f"  ({i}/{len(tasks)}) {label}: 警告 DB {found}/{expected}"
+                              f" ({missing} 件不足)")
+                        all_ok = False
+                    else:
+                        print(f"  ({i}/{len(tasks)}) {label}: OK DB {found}/{expected}")
 
-            if missing > 0 and missing > expected * 0.1:
-                print(f"  ({i}/{len(tasks)}) {label}: 警告 DB {found}/{expected}"
-                      f" ({missing} 件不足)")
-                all_ok = False
-            else:
-                print(f"  ({i}/{len(tasks)}) {label}: OK DB {found}/{expected}")
-
-        check_cur.execute("SELECT COUNT(*) FROM documents")
-        total_db_rows = check_cur.fetchone()[0]
-        check_cur.close()
-        check_conn.close()
+                check_cur.execute("SELECT COUNT(*) FROM documents")
+                total_db_rows = check_cur.fetchone()[0]
+            finally:
+                check_cur.close()
+        finally:
+            check_conn.close()
 
         print(f"\n  DB 合計: {total_db_rows} レコード")
         if all_ok:
