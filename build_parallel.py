@@ -93,6 +93,29 @@ def _error_fallback(file_info, file_name, model, batch):
         return 0, 0, 1, 0  # 埋め込み生成も失敗した場合
 
 
+def _count_idle_workers(my_worker_id):
+    """他ワーカーの進捗 JSON を読み、idle（ready）状態のワーカー数を返す。"""
+    idle = 0
+    try:
+        for fname in os.listdir(PROGRESS_DIR):
+            if not fname.startswith("worker_") or not fname.endswith(".json"):
+                continue
+            path = os.path.join(PROGRESS_DIR, fname)
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+                wid = data.get("worker_id")
+                if wid == my_worker_id:
+                    continue
+                if data.get("status") == WorkerStatus.READY:
+                    idle += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return idle
+
+
 def _process_file(file_info, model, splitter, service, batch, sheets_semaphore=None, conn=None):
     """1ファイルを処理し、チャンクを batch に追加する。
 
@@ -279,15 +302,24 @@ def _worker_main(worker_id, task_queue, tasks_total, results_queue, sheets_semap
 
     progress(status=WorkerStatus.READY)
 
+    import queue as _queue_mod
+
     while True:
-        task = task_queue.get()  # ブロッキング取得（センチネル None で終了）
+        try:
+            task = task_queue.get(timeout=5)
+        except _queue_mod.Empty:
+            progress(status=WorkerStatus.READY)
+            continue
         if task is None:
             break
 
         task_id = task["task_id"]
         task_label = task["label"]
         drive_type = task["drive_type"]
-        files = all_task_data[task_id]
+        all_files = all_task_data[task_id]
+        file_start = task.get("file_start", 0)
+        file_end = task.get("file_end") or len(all_files)
+        files = all_files[file_start:file_end]
         task_part = task["part"]
         task_drive_total = task["drive_total"]
         task_size = len(files)
@@ -348,6 +380,38 @@ def _worker_main(worker_id, task_queue, tasks_total, results_queue, sheets_semap
                 "drive_type": drive_type, "part": task_part, "drive_total": task_drive_total,
             }
             progress(**_current_task_kwargs)
+
+            # --- ワークスティール: 遊んでいるワーカーに残りを再分配 ---
+            remaining_count = task_size - (fi + 1)
+            if remaining_count >= 100 and (fi + 1) % 50 == 0:
+                idle_count = _count_idle_workers(worker_id)
+                if idle_count >= 2:
+                    # 残りの 80% をサブタスクとしてキューに戻す
+                    keep_count = max(remaining_count // 5, 50)
+                    redistribute_start = file_start + (fi + 1) + keep_count
+                    redistribute_count = remaining_count - keep_count
+                    # サブタスク分割（idle ワーカー数に応じて）
+                    n_splits = min(idle_count, 4)
+                    split_size = redistribute_count // n_splits
+                    for si in range(n_splits):
+                        s_start = redistribute_start + si * split_size
+                        s_end = s_start + split_size if si < n_splits - 1 else file_end
+                        task_queue.put({
+                            "task_id": task_id,
+                            "label": task_label,
+                            "drive_type": drive_type,
+                            "part": f"{task_part}再{si+1}",
+                            "drive_total": task_drive_total,
+                            "file_start": s_start,
+                            "file_end": s_end,
+                        })
+                    # このワーカーは keep_count 分だけ処理して終了
+                    new_end = file_start + (fi + 1) + keep_count
+                    files = all_files[file_start:new_end]
+                    task_size = len(files)
+                    print(f"[{time.strftime('%H:%M:%S')}] W{worker_id} 再分配: "
+                          f"残り{redistribute_count}件を{n_splits}サブタスクに分割、"
+                          f"{keep_count}件を継続", flush=True)
 
         # タスク完了: 残りバッチ挿入
         if batch:
@@ -706,8 +770,8 @@ def main():
             part_num = int(tm["part"].split("/")[0])
             if part_num == part_round:
                 task_queue.put(tm)
-    for _ in range(n_workers):
-        task_queue.put(None)  # 終了マーカー
+    # sentinel は即時投入しない（ワークスティールのため、ワーカーは idle 時にポーリング待機）
+    # 全ワーカーが idle かつキューが空になったら、監視スレッドが sentinel を投入する
 
     os.makedirs(PROGRESS_DIR, exist_ok=True)
 
@@ -731,6 +795,44 @@ def main():
             time.sleep(WORKER_START_INTERVAL_SEC)
 
     print(f"\n{n_workers} ワーカー起動、{len(tasks)} タスクを処理中...")
+
+    # 全ワーカー idle 検知 → sentinel 投入スレッド
+    def _sentinel_monitor():
+        """全ワーカーが idle（ready）かつキューが空になったら sentinel を投入して終了させる。"""
+        import time as _t
+        _t.sleep(30)  # 起動直後は全員 ready なので待つ
+        while True:
+            _t.sleep(10)
+            if shutdown_requested:
+                return
+            # キューが空でなければまだタスクがある
+            if not task_queue.empty():
+                continue
+            # 全ワーカーの状態を確認
+            all_idle = True
+            worker_count = 0
+            for fname in os.listdir(PROGRESS_DIR):
+                if not fname.startswith("worker_") or not fname.endswith(".json"):
+                    continue
+                try:
+                    with open(os.path.join(PROGRESS_DIR, fname)) as f:
+                        data = json.load(f)
+                    status = data.get("status", "")
+                    worker_count += 1
+                    if status not in (WorkerStatus.READY, WorkerStatus.DONE):
+                        all_idle = False
+                        break
+                except Exception:
+                    all_idle = False
+                    break
+            if all_idle and worker_count >= n_workers:
+                print("\n全ワーカー idle 検知 → 終了シグナル送信", flush=True)
+                for _ in range(n_workers):
+                    task_queue.put(None)
+                return
+
+    _sentinel_thread = threading.Thread(target=_sentinel_monitor, daemon=True)
+    _sentinel_thread.start()
 
     # シャットダウン制御
     shutdown_requested = False
