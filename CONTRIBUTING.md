@@ -23,6 +23,21 @@ cp config.env.example config.env
 3. Ensure no sensitive files are included (`token.pickle`, `config.env`, `shared_drives_whitelist.txt`)
 4. Open a PR — the template will guide you through what to include
 
+## Lint / CI
+
+`master` への push と PR で GitHub Actions の lint が自動実行される。
+
+```bash
+# ローカルで事前チェック（CI と同じ設定）
+pip install flake8 pyflakes
+flake8 src/ gridworld-rag-mcp/ --max-line-length=120 \
+  --extend-ignore=E501,W503,E221,E402,E302,E305,E401 --exclude=.venv
+pyflakes build_parallel.py src/ gridworld-rag-mcp/ sync.py
+```
+
+- `flake8`: スタイルチェック（`.github/workflows/lint.yml` で定義）
+- `pyflakes`: 未使用 import・未定義変数の検出（CI 外だがローカルで必ず実行）
+
 ## Code Style
 
 - Python 3.12+
