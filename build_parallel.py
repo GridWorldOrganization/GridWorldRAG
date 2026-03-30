@@ -20,7 +20,6 @@ import multiprocessing
 import os
 import pickle
 import signal
-import socket
 import sys
 import threading
 import time
@@ -121,8 +120,8 @@ def _process_file(file_info, model, splitter, service, batch, sheets_semaphore=N
             sheets_semaphore.acquire()
         try:
             sheets = extract_spreadsheet_sheets(file_info["id"])
-        except (socket.timeout, OSError) as e:
-            print(f"  警告: スプレッドシートタイムアウト [{file_info.get('name', '?')}]: {e}", flush=True)
+        except Exception as e:
+            print(f"  警告: スプレッドシート取得失敗 [{file_info.get('name', '?')}]: {e}", flush=True)
             sheets = []
         finally:
             if sheets_semaphore:
@@ -198,6 +197,27 @@ def _worker(worker_id, task_queue, tasks_total, results_queue, sheets_semaphore)
         chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP,
     )
     conn = connect()
+    try:
+        _worker_main(worker_id, task_queue, tasks_total, results_queue, sheets_semaphore,
+                      model, splitter, conn)
+    except Exception as ex:
+        print(f"[FATAL] W{worker_id} ワーカー異常終了: {ex}", flush=True)
+        import traceback; traceback.print_exc()
+        # 異常終了時のみ結果を送信（正常終了時は _worker_main 内で送信済み）
+        results_queue.put({
+            "worker_id": worker_id,
+            "processed": 0, "skipped": 0, "errors": 0, "total_chunks": 0, "tasks_done": 0,
+        })
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _worker_main(worker_id, task_queue, tasks_total, results_queue, sheets_semaphore,
+                  model, splitter, conn):
+    """ワーカーのメインループ（conn の try/finally は呼び出し元で保護済み）。"""
     service = authenticate()
 
     total_processed = 0
@@ -291,7 +311,17 @@ def _worker(worker_id, task_queue, tasks_total, results_queue, sheets_semaphore)
 
             # バッチ挿入
             if len(batch) >= BATCH_SIZE:
-                insert_chunks(conn, batch)
+                try:
+                    insert_chunks(conn, batch)
+                except Exception as _db_ex:
+                    print(f"[{time.strftime('%H:%M:%S')}] W{worker_id} DB挿入エラー（{len(batch)}件ロスト）: {_db_ex}", flush=True)
+                    total_errors += 1
+                    # 接続復旧を試みる
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    conn = connect()
                 batch = []
 
             # 進捗更新（レート制限コールバック用にも反映）
@@ -303,7 +333,16 @@ def _worker(worker_id, task_queue, tasks_total, results_queue, sheets_semaphore)
 
         # タスク完了: 残りバッチ挿入
         if batch:
-            insert_chunks(conn, batch)
+            try:
+                insert_chunks(conn, batch)
+            except Exception as _db_ex:
+                print(f"[{time.strftime('%H:%M:%S')}] W{worker_id} DB挿入エラー（残{len(batch)}件ロスト）: {_db_ex}", flush=True)
+                total_errors += 1
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = connect()
 
         task_end = time.strftime("%H:%M:%S")
         task_p = total_processed - task_processed_before

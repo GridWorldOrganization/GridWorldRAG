@@ -31,65 +31,75 @@ def connect(db_name=None):
 def insert_chunks(conn, chunks_data):
     """チャンクデータを DB に一括挿入する（UPSERT）。"""
     cur = conn.cursor()
-    for chunk in chunks_data:
-        # PostgreSQL は NUL (0x00) を含む文字列を受け付けない
-        title = (chunk["title"] or "").replace("\x00", "")
-        content = (chunk["content"] or "").replace("\x00", "")
+    try:
+        for chunk in chunks_data:
+            # PostgreSQL は NUL (0x00) を含む文字列を受け付けない
+            title = (chunk["title"] or "").replace("\x00", "")
+            content = (chunk["content"] or "").replace("\x00", "")
 
-        cur.execute(
-            """
-            INSERT INTO documents
-                (drive_file_id, title, content, chunk_index, owner,
-                 source_url, file_type, drive_modified_at, embedding,
-                 sheet_gid, sheet_name, permissions, partial_content, folder_path)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (drive_file_id) DO UPDATE SET
-                title = EXCLUDED.title,
-                content = EXCLUDED.content,
-                chunk_index = EXCLUDED.chunk_index,
-                owner = EXCLUDED.owner,
-                source_url = EXCLUDED.source_url,
-                file_type = EXCLUDED.file_type,
-                drive_modified_at = EXCLUDED.drive_modified_at,
-                embedding = EXCLUDED.embedding,
-                sheet_gid = EXCLUDED.sheet_gid,
-                sheet_name = EXCLUDED.sheet_name,
-                permissions = EXCLUDED.permissions,
-                partial_content = EXCLUDED.partial_content,
-                folder_path = EXCLUDED.folder_path
-            """,
-            (
-                chunk["drive_file_id"],
-                title,
-                content,
-                chunk["chunk_index"],
-                chunk["owner"],
-                chunk["source_url"],
-                chunk["file_type"],
-                chunk["drive_modified_at"],
-                chunk["embedding"],
-                chunk.get("sheet_gid"),
-                chunk.get("sheet_name"),
-                json.dumps(chunk.get("permissions"), ensure_ascii=False) if chunk.get("permissions") else None,
-                chunk.get("partial_content", False),
-                chunk.get("folder_path", ""),
-            ),
-        )
-    conn.commit()
-    cur.close()
+            cur.execute(
+                """
+                INSERT INTO documents
+                    (drive_file_id, title, content, chunk_index, owner,
+                     source_url, file_type, drive_modified_at, embedding,
+                     sheet_gid, sheet_name, permissions, partial_content, folder_path)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (drive_file_id) DO UPDATE SET
+                    title = EXCLUDED.title,
+                    content = EXCLUDED.content,
+                    chunk_index = EXCLUDED.chunk_index,
+                    owner = EXCLUDED.owner,
+                    source_url = EXCLUDED.source_url,
+                    file_type = EXCLUDED.file_type,
+                    drive_modified_at = EXCLUDED.drive_modified_at,
+                    embedding = EXCLUDED.embedding,
+                    sheet_gid = EXCLUDED.sheet_gid,
+                    sheet_name = EXCLUDED.sheet_name,
+                    permissions = EXCLUDED.permissions,
+                    partial_content = EXCLUDED.partial_content,
+                    folder_path = EXCLUDED.folder_path
+                """,
+                (
+                    chunk["drive_file_id"],
+                    title,
+                    content,
+                    chunk["chunk_index"],
+                    chunk["owner"],
+                    chunk["source_url"],
+                    chunk["file_type"],
+                    chunk["drive_modified_at"],
+                    chunk["embedding"],
+                    chunk.get("sheet_gid"),
+                    chunk.get("sheet_name"),
+                    json.dumps(chunk.get("permissions"), ensure_ascii=False) if chunk.get("permissions") else None,
+                    chunk.get("partial_content", False),
+                    chunk.get("folder_path", ""),
+                ),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
 
 
 def delete_by_file_id(conn, drive_file_id_prefix):
     """指定した drive_file_id プレフィックスに一致するチャンクを削除する。"""
     cur = conn.cursor()
-    cur.execute(
-        "DELETE FROM documents WHERE drive_file_id LIKE %s",
-        (f"{drive_file_id_prefix}%",),
-    )
-    deleted = cur.rowcount
-    conn.commit()
-    cur.close()
-    return deleted
+    try:
+        cur.execute(
+            "DELETE FROM documents WHERE drive_file_id LIKE %s",
+            (f"{drive_file_id_prefix}%",),
+        )
+        deleted = cur.rowcount
+        conn.commit()
+        return deleted
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
 
 
 def extract_file_id_from_url(url):
@@ -155,22 +165,24 @@ def lookup_by_url(conn, url):
     target_gid = extract_gid_from_url(url)
 
     cur = conn.cursor()
-    # file_id で始まる全チャンクを取得（_chunk_ と _sheet_ の両方に対応）
-    cur.execute(
-        """
-        SELECT title, content, chunk_index, owner, source_url,
-               file_type, drive_modified_at, sheet_gid, sheet_name
-        FROM documents
-        WHERE drive_file_id LIKE %s
-        ORDER BY
-            CASE WHEN %s IS NOT NULL AND sheet_gid = %s THEN 0 ELSE 1 END,
-            sheet_gid NULLS FIRST,
-            chunk_index
-        """,
-        (f"{file_id}_%", target_gid, target_gid),
-    )
-    rows = cur.fetchall()
-    cur.close()
+    try:
+        # file_id で始まる全チャンクを取得（_chunk_ と _sheet_ の両方に対応）
+        cur.execute(
+            """
+            SELECT title, content, chunk_index, owner, source_url,
+                   file_type, drive_modified_at, sheet_gid, sheet_name
+            FROM documents
+            WHERE drive_file_id LIKE %s
+            ORDER BY
+                CASE WHEN %s IS NOT NULL AND sheet_gid = %s THEN 0 ELSE 1 END,
+                sheet_gid NULLS FIRST,
+                chunk_index
+            """,
+            (f"{file_id}_%", target_gid, target_gid),
+        )
+        rows = cur.fetchall()
+    finally:
+        cur.close()
 
     if not rows:
         return None
@@ -230,18 +242,20 @@ def search_similar(conn, embedding, n_results=5, owner=None, since=None):
     params = [embedding] + filter_params + [embedding, n_results]
 
     cur = conn.cursor()
-    cur.execute(
-        f"""
-        SELECT id, title, content, owner, source_url, file_type,
-               drive_modified_at, embedding <=> %s AS distance,
-               sheet_gid, sheet_name
-        FROM documents
-        {where}
-        ORDER BY embedding <=> %s
-        LIMIT %s
-        """,
-        tuple(params),
-    )
-    results = cur.fetchall()
-    cur.close()
-    return results
+    try:
+        cur.execute(
+            f"""
+            SELECT id, title, content, owner, source_url, file_type,
+                   drive_modified_at, embedding <=> %s AS distance,
+                   sheet_gid, sheet_name
+            FROM documents
+            {where}
+            ORDER BY embedding <=> %s
+            LIMIT %s
+            """,
+            tuple(params),
+        )
+        results = cur.fetchall()
+        return results
+    finally:
+        cur.close()
