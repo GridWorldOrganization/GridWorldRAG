@@ -884,6 +884,15 @@ def main():
 
     print(f"\n{n_workers} ワーカー起動、{len(tasks)} タスクを処理中...")
 
+    # atexit でゾンビプロセス防止（予期しない終了時の安全網）
+    import atexit
+    def _cleanup_workers():
+        for p in processes:
+            if p.is_alive():
+                p.kill()
+                p.join(timeout=3)
+    atexit.register(_cleanup_workers)
+
     # シャットダウン制御（_sentinel_monitor より先に定義する必要がある）
     shutdown_requested = False
 
@@ -943,6 +952,8 @@ def main():
             for p in processes:
                 if p.is_alive():
                     p.kill()
+            for p in processes:
+                p.join(timeout=3)  # ゾンビ回収
             sys.exit(1)
         shutdown_requested = True
         print("\n停止シグナル受信。子ワーカーを終了中...")
@@ -954,8 +965,11 @@ def main():
             p.join(timeout=10)
             if p.is_alive():
                 p.kill()
-                p.join(timeout=3)
-                print(f"  W{i} 強制終了")
+                p.join(timeout=5)
+                if p.is_alive():
+                    print(f"  W{i} ゾンビ（回収不能）")
+                else:
+                    print(f"  W{i} 強制終了")
             else:
                 print(f"  W{i} 停止完了")
 
@@ -963,7 +977,13 @@ def main():
     signal.signal(signal.SIGTERM, _shutdown)
 
     for p in processes:
-        p.join()
+        p.join(timeout=600)  # 最大10分待機（ゾンビ防止）
+    # join timeout 後にまだ生きているプロセスを強制終了
+    for i, p in enumerate(processes, 1):
+        if p.is_alive():
+            print(f"  W{i} がタイムアウト（600秒）。強制終了します。", flush=True)
+            p.kill()
+            p.join(timeout=5)
 
     elapsed = time.time() - start_time
 
