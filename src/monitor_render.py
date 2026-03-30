@@ -81,15 +81,9 @@ def render(worker_count, progress_dir, elapsed):
             # 更新停滞検出（30秒以上進捗更新なし → API待ち表示）
             _updated_at = d.get("updated_at", 0)
             _stalled_sec = int(_time.time() - _updated_at) if _updated_at else 0
-            _stalled = f" (API待ち {_stalled_sec}s)" if _stalled_sec >= 30 else ""
-            if resume_skip > 0 and _stalled:
-                lines.append(f"W{wid}[{bar}]{pct:3d}%{_stalled} {label} {cur}/{task_size}/{drive_total}")
-            elif resume_skip > 0:
-                lines.append(f"W{wid}[{bar}]{pct:3d}% skipping({resume_skip}) {label} {cur}/{task_size}/{drive_total}")
-            elif _stalled:
-                lines.append(f"W{wid}[{bar}]{pct:3d}%{_stalled} {label} {cur}/{task_size}/{drive_total}")
-            else:
-                lines.append(f"W{wid}[{bar}]{pct:3d}% {label} {cur}/{task_size}/{drive_total}")
+            _stalled = f"(API待ち {_stalled_sec}s) " if _stalled_sec >= 30 else ""
+            _skip = f"skipping({resume_skip}) " if resume_skip > 0 else ""
+            lines.append(f"W{wid}[{bar}]{pct:3d}% {_stalled}{_skip}{label} {cur}/{task_size}/{drive_total}")
 
     lines.append("---")
 
