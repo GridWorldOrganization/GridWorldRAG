@@ -54,7 +54,8 @@ def _write_progress(worker_id, *, task_label="", task_current=0, task_size=0,
                     processed=0, skipped=0, errors=0, chunks=0,
                     status=WorkerStatus.RUNNING, drive_type="共有",
                     tasks_done=0, tasks_total=0, part="", drive_total=0,
-                    completed_tasks=None, resume_skip_count=0):
+                    completed_tasks=None, resume_skip_count=0,
+                    updated_at=None):
     """ワーカーの進捗を JSON ファイルに書き出す（モニター用）。"""
     os.makedirs(PROGRESS_DIR, exist_ok=True)
     path = os.path.join(PROGRESS_DIR, f"worker_{worker_id}.json")
@@ -76,6 +77,7 @@ def _write_progress(worker_id, *, task_label="", task_current=0, task_size=0,
             "drive_total": drive_total,
             "completed_tasks": completed_tasks or [],
             "resume_skip_count": resume_skip_count,
+            "updated_at": time.time(),
         }, f)
 
 

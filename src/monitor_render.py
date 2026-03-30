@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+import time as _time
 
 from src.config import WorkerStatus
 
@@ -62,7 +63,7 @@ def render(worker_count, progress_dir, elapsed):
             label = f"{tp} {nm}({pt})" if pt else f"{tp} {nm}"
             filled = pct // 5
             bar = "#" * filled + "." * (20 - filled)
-            lines.append(f"W{wid}[{bar}]{pct:3d}%(レート制限待ち) {label}")
+            lines.append(f"W{wid}[{bar}]{pct:3d}%(レート制限待ち) {label} {cur}/{task_size}")
         elif status == WorkerStatus.READY:
             lines.append(f"W{wid}[....................] 待機中")
         else:
@@ -77,8 +78,16 @@ def render(worker_count, progress_dir, elapsed):
             pct = cur * 100 // task_size if task_size > 0 else 0
             filled = pct // 5
             bar = "#" * filled + "." * (20 - filled)
-            if resume_skip > 0:
+            # 更新停滞検出（30秒以上進捗更新なし → API待ち表示）
+            _updated_at = d.get("updated_at", 0)
+            _stalled_sec = int(_time.time() - _updated_at) if _updated_at else 0
+            _stalled = f" (API待ち {_stalled_sec}s)" if _stalled_sec >= 30 else ""
+            if resume_skip > 0 and _stalled:
+                lines.append(f"W{wid}[{bar}]{pct:3d}%{_stalled} {label} {cur}/{task_size}/{drive_total}")
+            elif resume_skip > 0:
                 lines.append(f"W{wid}[{bar}]{pct:3d}% skipping({resume_skip}) {label} {cur}/{task_size}/{drive_total}")
+            elif _stalled:
+                lines.append(f"W{wid}[{bar}]{pct:3d}%{_stalled} {label} {cur}/{task_size}/{drive_total}")
             else:
                 lines.append(f"W{wid}[{bar}]{pct:3d}% {label} {cur}/{task_size}/{drive_total}")
 
