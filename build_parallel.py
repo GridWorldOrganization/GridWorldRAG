@@ -54,7 +54,7 @@ def _write_progress(worker_id, *, task_label="", task_current=0, task_size=0,
                     processed=0, skipped=0, errors=0, chunks=0,
                     status=WorkerStatus.RUNNING, drive_type="共有",
                     tasks_done=0, tasks_total=0, part="", drive_total=0,
-                    completed_tasks=None):
+                    completed_tasks=None, resume_skip_count=0):
     """ワーカーの進捗を JSON ファイルに書き出す（モニター用）。"""
     os.makedirs(PROGRESS_DIR, exist_ok=True)
     path = os.path.join(PROGRESS_DIR, f"worker_{worker_id}.json")
@@ -75,6 +75,7 @@ def _write_progress(worker_id, *, task_label="", task_current=0, task_size=0,
             "part": part,
             "drive_total": drive_total,
             "completed_tasks": completed_tasks or [],
+            "resume_skip_count": resume_skip_count,
         }, f)
 
 
@@ -337,6 +338,7 @@ def _worker_main(worker_id, task_queue, tasks_total, results_queue, sheets_semap
         batch = []
         fi = 0
         _redistributed = False  # 1タスクにつき再分配は1回まで
+        _resume_skip_count = 0  # 連続 resumeSkip カウント（モニター表示用）
         while fi < task_size:
             file_info = files[fi]
             _fname = file_info.get("name", "?")
@@ -351,6 +353,9 @@ def _worker_main(worker_id, task_queue, tasks_total, results_queue, sheets_semap
                 _is_resume = (p == -1)
                 if _is_resume:
                     p = 0  # カウント上は通常スキップと同じ
+                    _resume_skip_count += 1
+                else:
+                    _resume_skip_count = 0  # 通常処理が来たらリセット
                 _file_elapsed = time.time() - _file_start
                 _ts = time.strftime("%H:%M:%S")
                 _result = "resumeSkip" if _is_resume else ("skip" if s else ("err" if e else "ok"))
@@ -386,6 +391,7 @@ def _worker_main(worker_id, task_queue, tasks_total, results_queue, sheets_semap
             _current_task_kwargs = {
                 "task_label": task_label, "task_current": fi, "task_size": task_size,
                 "drive_type": drive_type, "part": task_part, "drive_total": task_drive_total,
+                "resume_skip_count": _resume_skip_count,
             }
             progress(**_current_task_kwargs)
 

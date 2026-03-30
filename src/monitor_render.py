@@ -72,11 +72,15 @@ def render(worker_count, progress_dir, elapsed):
             cur = d.get("current", 0)
             task_size = d.get("total", 1)
             drive_total = d.get("drive_total", task_size)
+            resume_skip = d.get("resume_skip_count", 0)
             label = f"{tp} {nm}({pt})" if pt else f"{tp} {nm}"
             pct = cur * 100 // task_size if task_size > 0 else 0
             filled = pct // 5
             bar = "#" * filled + "." * (20 - filled)
-            lines.append(f"W{wid}[{bar}]{pct:3d}% {label} {cur}/{task_size}/{drive_total}")
+            if resume_skip > 0:
+                lines.append(f"W{wid}[{bar}]{pct:3d}% skipping({resume_skip}) {label} {cur}/{task_size}/{drive_total}")
+            else:
+                lines.append(f"W{wid}[{bar}]{pct:3d}% {label} {cur}/{task_size}/{drive_total}")
 
     lines.append("---")
 
