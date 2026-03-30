@@ -656,6 +656,7 @@ def collect_file_lists(service):
                 _prelim.append(fut.result())
         except KeyboardInterrupt:
             _probe_exec.shutdown(wait=False, cancel_futures=True)
+            _fetch_stop.set()
             raise
         finally:
             _probe_exec.shutdown(wait=False)
@@ -891,10 +892,17 @@ def main():
         """全ワーカーが idle（ready）かつキューが空になったら sentinel を投入して終了させる。
         レース回避: 2回連続で全員 idle を確認してから終了判定。"""
         import time as _t
-        _t.sleep(30)  # 起動直後は全員 ready なので待つ
+        # 起動直後は全員 ready なので待つ（1秒刻みで shutdown チェック）
+        for _ in range(30):
+            if shutdown_requested:
+                return
+            _t.sleep(1)
         consecutive_idle = 0
         while True:
-            _t.sleep(10)
+            for _ in range(10):
+                if shutdown_requested:
+                    return
+                _t.sleep(1)
             if shutdown_requested:
                 return
             # 全ワーカーの状態を確認
@@ -930,7 +938,12 @@ def main():
     def _shutdown(signum, frame):
         nonlocal shutdown_requested
         if shutdown_requested:
-            return
+            # 2回目の Ctrl+C → 即座に強制終了
+            print("\n強制終了します。", flush=True)
+            for p in processes:
+                if p.is_alive():
+                    p.kill()
+            sys.exit(1)
         shutdown_requested = True
         print("\n停止シグナル受信。子ワーカーを終了中...")
         for i, p in enumerate(processes, 1):
