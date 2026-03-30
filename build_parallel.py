@@ -558,7 +558,15 @@ def collect_file_lists(service):
         with _thread_name_lock:
             if tid not in _thread_names:
                 idx = len(_thread_names)
-                _thread_names[tid] = _thread_labels[idx] if idx < len(_thread_labels) else chr(65 + idx)
+                if idx < len(_thread_labels):
+                    lbl = _thread_labels[idx]
+                else:
+                    lbl = chr(65 + idx)
+                    # 動的ラベルを _thread_current にも登録（表示に反映）
+                    with _fetch_lock:
+                        _thread_current[lbl] = "-"
+                    _thread_labels.append(lbl)
+                _thread_names[tid] = lbl
             return _thread_names[tid]
 
     def _fetch_start(idx):
@@ -588,8 +596,19 @@ def collect_file_lists(service):
             drive_file_lists.append(("マイドライブ", "マイ", my_files))
 
     if INDEX_SHARED_DRIVES and whitelist:
-        drives_response = service.drives().list(pageSize=100).execute()
-        drive_names = {d["id"]: d["name"] for d in drives_response.get("drives", [])}
+        # 共有ドライブ名を取得（100超対応のページネーション）
+        drive_names = {}
+        _drives_page_token = None
+        while True:
+            _drives_kwargs = {"pageSize": 100}
+            if _drives_page_token:
+                _drives_kwargs["pageToken"] = _drives_page_token
+            drives_response = service.drives().list(**_drives_kwargs).execute()
+            for d in drives_response.get("drives", []):
+                drive_names[d["id"]] = d["name"]
+            _drives_page_token = drives_response.get("nextPageToken")
+            if not _drives_page_token:
+                break
 
         # スレッド間のレート制限協調
         rate_lock = threading.Lock()
@@ -625,9 +644,10 @@ def collect_file_lists(service):
             while True:
                 with rate_lock:
                     wait_until = rate_backoff[0]
-                if time.time() >= wait_until:
+                remaining = wait_until - time.time()
+                if remaining <= 0:
                     break
-                time.sleep(wait_until - time.time())
+                time.sleep(remaining)
             try:
                 svc = authenticate()
                 files = list_files_in_drive(svc, drive_id=drive_id)
@@ -662,7 +682,11 @@ def collect_file_lists(service):
 
             results = []
             for future in as_completed(futures):
-                idx, drive_name, files, error = future.result()
+                try:
+                    idx, drive_name, files, error = future.result()
+                except Exception as _fut_ex:
+                    print(f"ERROR: ファイル一覧取得スレッド例外: {_fut_ex}", file=sys.stderr)
+                    continue
                 if error:
                     print(f"ERROR: {drive_name}: {error}", file=sys.stderr)
                 elif files:
