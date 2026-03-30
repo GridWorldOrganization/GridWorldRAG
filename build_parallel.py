@@ -289,6 +289,10 @@ def _worker(worker_id, task_queue, tasks_total, results_queue, sheets_semaphore)
             if _pt.is_alive():
                 print(f"[{_ts}] W{worker_id} {fi+1}/{task_size} timeout {_file_elapsed:.1f}s  [{_folder}] {_fname}", flush=True)
                 p, s, e, c = 0, 0, 1, 0
+                # タイムアウトした daemon スレッドが古い SSL 接続を掴んだまま残るため、
+                # service を再作成して壊れたコネクションプールを捨てる（SEGFAULT 防止）
+                service = authenticate()
+                print(f"[{_ts}] W{worker_id} service 再作成（timeout後のSSL接続リセット）", flush=True)
             elif _perror[0] is not None:
                 print(f"[{_ts}] W{worker_id} {fi+1}/{task_size} err   {_file_elapsed:.1f}s  [{_folder}] {_fname}  ({_perror[0]})", flush=True)
                 p, s, e, c = 0, 0, 1, 0
