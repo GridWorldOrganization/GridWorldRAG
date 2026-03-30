@@ -377,6 +377,7 @@ def _worker_main(worker_id, task_queue, tasks_total, results_queue, sheets_semap
                     except Exception:
                         pass
                     conn = connect()
+                    print(f"[{time.strftime('%H:%M:%S')}] W{worker_id} DB接続復旧", flush=True)
                 batch = []
 
             fi += 1
@@ -434,6 +435,7 @@ def _worker_main(worker_id, task_queue, tasks_total, results_queue, sheets_semap
                 except Exception:
                     pass
                 conn = connect()
+                print(f"[{time.strftime('%H:%M:%S')}] W{worker_id} DB接続復旧", flush=True)
 
         task_end = time.strftime("%H:%M:%S")
         task_p = total_processed - task_processed_before
@@ -514,6 +516,11 @@ def _split_into_tasks(drive_file_lists):
 # ---------------------------------------------------------------------------
 # ファイル一覧取得
 # ---------------------------------------------------------------------------
+
+def _log(msg):
+    """Phase 1 のログ出力（stderr → run_build.sh でログファイルに記録）。"""
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
+
 
 def collect_file_lists(service):
     """全ドライブのファイル一覧を収集する。結果は stdout に出力。"""
@@ -630,11 +637,15 @@ def collect_file_lists(service):
                     supportsAllDrives=True, includeItemsFromAllDrives=True,
                 ).execute()
                 _est = 10000 if "nextPageToken" in _probe else len(_probe.get("files", []))
-            except Exception:
+            except Exception as _probe_ex:
+                _log(f"プローブ失敗 {drive_name}: {_probe_ex}")
                 _est = 0
             _prelim.append((drive_id, drive_name, _est))
         # 大きい順にソート（大きいドライブを先に開始 → 最後に小さいのが残る）
         _prelim.sort(key=lambda x: -x[2])
+        _log("ドライブサイズ推定（大きい順）:")
+        for _did, _dname, _dest in _prelim:
+            _log(f"  {_dname}: {'1000+' if _dest >= 10000 else _dest}")
 
         fetch_list = []
         for drive_id, drive_name, _est in _prelim:
@@ -656,10 +667,12 @@ def collect_file_lists(service):
                 files = list_files_in_drive(svc, drive_id=drive_id)
                 attach_folder_paths(files, drive_name)
                 _fetch_complete(idx)
+                _log(f"取得完了 #{idx} {drive_name}: {len(files)}件")
                 return idx, drive_name, files, None
             except Exception as e:
                 error_str = str(e)
                 if "rate limit" in error_str.lower() or "429" in error_str:
+                    _log(f"レート制限 #{idx} {drive_name}: 10秒後リトライ")
                     with rate_lock:
                         rate_backoff[0] = time.time() + 10
                     time.sleep(10)
@@ -668,10 +681,13 @@ def collect_file_lists(service):
                         files = list_files_in_drive(svc, drive_id=drive_id)
                         attach_folder_paths(files, drive_name)
                         _fetch_complete(idx)
+                        _log(f"リトライ成功 #{idx} {drive_name}: {len(files)}件")
                         return idx, drive_name, files, None
                     except Exception as e2:
+                        _log(f"リトライ失敗 #{idx} {drive_name}: {e2}")
                         _fetch_complete(idx)
                         return idx, drive_name, None, e2
+                _log(f"取得失敗 #{idx} {drive_name}: {e}")
                 _fetch_complete(idx)
                 return idx, drive_name, None, e
 
@@ -842,6 +858,7 @@ def main():
         p.daemon = True
         p.start()
         processes.append(p)
+        print(f"[{time.strftime('%H:%M:%S')}] W{i} 起動 (PID {p.pid})", flush=True)
         if i < n_workers - 1:
             time.sleep(WORKER_START_INTERVAL_SEC)
 
