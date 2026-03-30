@@ -20,6 +20,7 @@ import multiprocessing
 import os
 import pickle
 import signal
+import socket
 import sys
 import threading
 import time
@@ -35,7 +36,7 @@ from src.config import (
 from src.drive_client import (
     authenticate, list_files_in_drive, extract_text,
     extract_spreadsheet_sheets, SKIP_MIME_TYPES,
-    set_rate_limit_callback, _download_with_sigalrm, _DownloadTimeoutError,
+    set_rate_limit_callback,
     attach_folder_paths,
 )
 from src.indexer import make_chunk_entry
@@ -119,12 +120,9 @@ def _process_file(file_info, model, splitter, service, batch, sheets_semaphore=N
         if sheets_semaphore:
             sheets_semaphore.acquire()
         try:
-            sheets = _download_with_sigalrm(
-                lambda: extract_spreadsheet_sheets(file_info["id"]),
-                DRIVE_DOWNLOAD_TIMEOUT_SEC,
-            )
-        except _DownloadTimeoutError:
-            print(f"  警告: スプレッドシートタイムアウト [{file_info.get('name', '?')}]", flush=True)
+            sheets = extract_spreadsheet_sheets(file_info["id"])
+        except (socket.timeout, OSError) as e:
+            print(f"  警告: スプレッドシートタイムアウト [{file_info.get('name', '?')}]: {e}", flush=True)
             sheets = []
         finally:
             if sheets_semaphore:
@@ -194,7 +192,8 @@ def _worker(worker_id, task_queue, tasks_total, results_queue, sheets_semaphore)
     from src.db import connect, insert_chunks
 
     model = SentenceTransformer(EMBEDDING_MODEL)
-    _model_lock = threading.Lock()  # model.encode() の排他制御（タイムアウト時の競合防止）
+    # Note: _model_lock は廃止。daemon スレッドによるタイムアウトを廃止し
+    # httplib2 ソケットタイムアウトに移行したため、スレッド競合は発生しない。
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP,
     )
@@ -274,32 +273,17 @@ def _worker(worker_id, task_queue, tasks_total, results_queue, sheets_semaphore)
             print(f"[{_ts_start}] W{worker_id} {fi+1}/{task_size} 開始  [{_folder}] {_fname} ({_mime})", flush=True)
 
             _file_start = time.time()
-            _presult = [None]; _perror = [None]
-            def _run_process():
-                try:
-                    with _model_lock:
-                        _presult[0] = _process_file(file_info, model, splitter, service, batch, sheets_semaphore)
-                except Exception as _ex:
-                    _perror[0] = _ex
-            _pt = threading.Thread(target=_run_process, daemon=True)
-            _pt.start()
-            _pt.join(timeout=DRIVE_DOWNLOAD_TIMEOUT_SEC)
-            _file_elapsed = time.time() - _file_start
-            _ts = time.strftime("%H:%M:%S")
-            if _pt.is_alive():
-                print(f"[{_ts}] W{worker_id} {fi+1}/{task_size} timeout {_file_elapsed:.1f}s  [{_folder}] {_fname}", flush=True)
-                p, s, e, c = 0, 0, 1, 0
-                # タイムアウトした daemon スレッドが古い SSL 接続を掴んだまま残るため、
-                # service を再作成して壊れたコネクションプールを捨てる（SEGFAULT 防止）
-                service = authenticate()
-                print(f"[{_ts}] W{worker_id} service 再作成（timeout後のSSL接続リセット）", flush=True)
-            elif _perror[0] is not None:
-                print(f"[{_ts}] W{worker_id} {fi+1}/{task_size} err   {_file_elapsed:.1f}s  [{_folder}] {_fname}  ({_perror[0]})", flush=True)
-                p, s, e, c = 0, 0, 1, 0
-            else:
-                p, s, e, c = _presult[0]
+            try:
+                p, s, e, c = _process_file(file_info, model, splitter, service, batch, sheets_semaphore)
+                _file_elapsed = time.time() - _file_start
+                _ts = time.strftime("%H:%M:%S")
                 _result = "skip" if s else ("err" if e else "ok")
                 print(f"[{_ts}] W{worker_id} {fi+1}/{task_size} {_result}   {_file_elapsed:.1f}s  [{_folder}] {_fname}", flush=True)
+            except Exception as _ex:
+                _file_elapsed = time.time() - _file_start
+                _ts = time.strftime("%H:%M:%S")
+                print(f"[{_ts}] W{worker_id} {fi+1}/{task_size} err   {_file_elapsed:.1f}s  [{_folder}] {_fname}  ({_ex})", flush=True)
+                p, s, e, c = 0, 0, 1, 0
             total_processed += p
             total_skipped += s
             total_errors += e

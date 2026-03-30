@@ -180,7 +180,13 @@ def authenticate():
             pickle.dump(creds, f)
 
     _credentials = creds
-    return build("drive", "v3", credentials=creds)
+    # httplib2 にソケットタイムアウトを設定（SSL ハング防止）
+    # daemon スレッドでのタイムアウト制御は SSL double-free を引き起こすため、
+    # ソケットレベルでタイムアウトさせる
+    import httplib2, google_auth_httplib2
+    authorized_http = google_auth_httplib2.AuthorizedHttp(
+        creds, http=httplib2.Http(timeout=DRIVE_DOWNLOAD_TIMEOUT_SEC))
+    return build("drive", "v3", http=authorized_http)
 
 
 _sheets_service_cache = None
@@ -192,7 +198,10 @@ def get_sheets_service():
         return _sheets_service_cache
     if _credentials is None:
         raise RuntimeError("authenticate() を先に呼んでください")
-    _sheets_service_cache = build("sheets", "v4", credentials=_credentials)
+    import httplib2, google_auth_httplib2
+    authorized_http = google_auth_httplib2.AuthorizedHttp(
+        _credentials, http=httplib2.Http(timeout=DRIVE_DOWNLOAD_TIMEOUT_SEC))
+    _sheets_service_cache = build("sheets", "v4", http=authorized_http)
     return _sheets_service_cache
 
 
@@ -332,16 +341,15 @@ def list_all_files(service):
 
 
 def _download_content(service, file_id):
-    """ファイルをバイナリでダウンロードする（SIGALRM タイムアウト付き）。"""
-    def _do():
-        request = _api_call_with_retry(lambda: service.files().get_media(fileId=file_id))
-        content = io.BytesIO()
-        downloader = MediaIoBaseDownload(content, request)
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
-        return content
-    return _download_with_sigalrm(_do, DRIVE_DOWNLOAD_TIMEOUT_SEC)
+    """ファイルをバイナリでダウンロードする。
+    タイムアウトは httplib2 のソケットタイムアウトで制御。"""
+    request = _api_call_with_retry(lambda: service.files().get_media(fileId=file_id))
+    content = io.BytesIO()
+    downloader = MediaIoBaseDownload(content, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return content
 
 
 def extract_text(service, file_info):
@@ -382,10 +390,10 @@ def extract_text(service, file_info):
                 while not done:
                     _, done = downloader.next_chunk()
                 return content
-            content = _download_with_sigalrm(_do_export, DRIVE_DOWNLOAD_TIMEOUT_SEC)
+            content = _do_export()
             return content.getvalue().decode("utf-8", errors="replace"), False
-        except _DownloadTimeoutError:
-            print(f"  警告: エクスポートタイムアウト [{file_info['name']}]", flush=True)
+        except (socket.timeout, OSError) as e:
+            print(f"  警告: エクスポートタイムアウト [{file_info['name']}]: {e}", flush=True)
             return None, False
         except Exception as e:
             print(f"  警告: エクスポート失敗 [{file_info['name']}]: {e}", flush=True)
@@ -396,8 +404,8 @@ def extract_text(service, file_info):
         try:
             content = _download_content(service, file_id)
             return content.getvalue().decode("utf-8", errors="replace"), False
-        except _DownloadTimeoutError:
-            print(f"  警告: ダウンロードタイムアウト [{file_info['name']}]", flush=True)
+        except (socket.timeout, OSError) as e:
+            print(f"  警告: ダウンロードタイムアウト [{file_info['name']}]: {e}", flush=True)
             return None, False
         except Exception as e:
             print(f"  警告: ダウンロード失敗 [{file_info['name']}]: {e}", flush=True)
@@ -421,8 +429,8 @@ def extract_text(service, file_info):
                 print("  警告: pypdf がインストールされていません。PDF はスキップします。", flush=True)
                 return f"[PDF] {file_info['name']}", False
             return f"[スキャンPDF] {file_info['name']}", False
-        except _DownloadTimeoutError:
-            print(f"  警告: PDF ダウンロードタイムアウト [{file_info['name']}]", flush=True)
+        except (socket.timeout, OSError) as e:
+            print(f"  警告: PDF ダウンロードタイムアウト [{file_info['name']}]: {e}", flush=True)
             return f"[PDF] {file_info['name']}", False
         except Exception as e:
             print(f"  警告: PDF 処理失敗 [{file_info['name']}]: {e}", flush=True)
@@ -433,8 +441,8 @@ def extract_text(service, file_info):
         try:
             content = _download_content(service, file_id)
             return _try_ocr_image(content, file_info["name"]), False
-        except _DownloadTimeoutError:
-            print(f"  警告: 画像ダウンロードタイムアウト [{file_info['name']}]", flush=True)
+        except (socket.timeout, OSError) as e:
+            print(f"  警告: 画像ダウンロードタイムアウト [{file_info['name']}]: {e}", flush=True)
             return f"[画像] {file_info['name']}", False
         except Exception as e:
             print(f"  警告: 画像処理失敗 [{file_info['name']}]: {e}", flush=True)
