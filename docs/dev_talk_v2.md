@@ -234,3 +234,42 @@ FETCH_THREADS=3
 - `'folder_id' in parents` は直接の子のみ（再帰なし）
 - 再帰するとフォルダ数分のAPIコール（GW_LIB_過去PJ実績: 8,820回 vs 現在の34回）
 - 現在の一括取得（`corpora=drive`）が API 的に最速
+
+---
+
+## 6. ゾンビプロセス防止とCtrl+C対策
+
+### 問題
+
+- ワーカーが異常終了すると `wait()` されずゾンビプロセスが残る
+- Ctrl+C 後の `_shutdown` が全ワーカーの `join(timeout=10)` を待つ間、2回目の Ctrl+C が無視される
+- `ThreadPoolExecutor` の `with` 文が `shutdown(wait=True)` を呼び、Ctrl+C 中にスレッド完了を待ち続ける
+
+### 解決
+
+1. **atexit ハンドラ**: 予期しないメインプロセス終了時に全ワーカーを kill → join
+2. **2回目 Ctrl+C**: 即座に全ワーカー kill → join(3s) → sys.exit(1)
+3. **正常終了の join(timeout=600)**: 無期限ブロックを防止、タイムアウト後は強制終了
+4. **sentinel 監視スレッド**: 1秒刻みで `shutdown_requested` をチェック（長い sleep で応答不能にならない）
+5. **ThreadPoolExecutor**: `with` 文を使わず手動で `shutdown(wait=False, cancel_futures=True)`
+
+---
+
+## 7. モニター表示の改善
+
+### resume 時の skipping 表示
+
+処理済みファイルを resumeSkip で飛ばしている間、モニターに `skipping(N)` を表示。
+連続 resumeSkip のカウントを進捗 JSON に記録し、通常処理が来たらリセット。
+
+### レート制限待ち表示
+
+ワーカーの進捗 JSON に `updated_at` タイムスタンプを記録。
+モニターが30秒以上更新なしを検知すると `(レート制限待ちNs)` を表示。
+Sheets API レート制限やネットワーク待ちで進捗が止まっている状態が可視化される。
+
+### 余剰行クリア
+
+`tput sc/rc` 方式で画面更新する際、前回のレンダリングより行数が減った場合に
+前回の残骸が表示されたままになる問題。レンダリング後に `TOTAL_LINES` まで
+空行 + `\033[K` で埋めることで解決。

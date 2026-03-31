@@ -41,21 +41,26 @@ Claude Code ←→ mcp_server.py ───────────────�
 1. `config.env` の `INDEX_MY_DRIVE` / `INDEX_SHARED_DRIVES` を確認
 2. `shared_drives_whitelist.txt` からホワイトリストを読み込み
 3. 取得対象ドライブ数を算出
-4. マイドライブ（有効時）:
+4. **サイズプローブ**（共有ドライブのみ）:
+   - 各ドライブに `pageSize=1000` で1ページだけ API コール（`FETCH_THREADS` スレッドで並列）
+   - `nextPageToken` の有無で「1000件超」かを推定
+   - 推定結果を大きい順にソート（最大ドライブを先に処理開始 → 最後に小さいドライブが残る）
+   - プローブ結果・ソート順は stderr 経由でログファイルに記録
+5. マイドライブ（有効時）:
    - `list_files_in_drive(service, corpora="user")` で全ファイル取得
    - 自分がオーナーかつ共有ドライブ外のファイルのみに絞り込み
-5. 共有ドライブ（有効時）:
-   - ホワイトリストの各ドライブ ID に対して `list_files_in_drive(service, drive_id=id)` を実行
-   - `PROGRESS n/n` をログ出力（run_build.sh が表示に利用）
-6. 取得した全ファイルには以下のメタデータが含まれる:
+6. 共有ドライブ（有効時）:
+   - ソート順に `FETCH_THREADS`（config.env、デフォルト 3）スレッドで並列取得
+   - 各ドライブの取得完了時にログ記録（件数付き）
+   - レート制限（429）時は10秒バックオフ→1回リトライ
+7. 取得した全ファイルには以下のメタデータが含まれる:
    - `id`, `name`, `mimeType`, `modifiedTime`, `owners`, `webViewLink`, `driveId`
    - `permissions(emailAddress, role, type, displayName)`
-7. ファイル一覧を `FILELIST_START` / `FILELIST_END` ブロックでログ出力
 8. 結果: `[(drive_name, drive_type, [files]), ...]`
 
 #### run_build.sh 側の表示
 
-- `--fetch-only` はフォアグラウンドで実行されるため、stdout がそのまま画面に表示される
+- `--fetch-only` はフォアグラウンドで実行。stdout はターミナル、stderr はログファイル
 - ファイル一覧取得完了後、結果を `/tmp/gridworldrag_filelist.pkl` に pickle 保存
 - `--work-only` でワーカーフェーズに遷移
 
@@ -96,25 +101,48 @@ Claude Code ←→ mcp_server.py ───────────────�
 2. `authenticate()` で認証（`_credentials` をセット、ワーカー内の Sheets API で必要）
 3. `min(PARALLEL_WORKERS, タスク数)` 個のワーカープロセスを生成
 4. 各ワーカーは `daemon=True`（親プロセス終了時に自動停止）
-5. SIGINT / SIGTERM ハンドラを設定（Ctrl+C で全ワーカーを terminate → join）
-6. 各ワーカーの初期化（`_worker` → `_worker_main`）:
+5. `atexit` ハンドラ登録（予期しない終了時にワーカーを kill → join でゾンビ防止）
+6. SIGINT / SIGTERM ハンドラ設定:
+   - 1回目 Ctrl+C: 全ワーカーに terminate → join(10s) → kill
+   - 2回目 Ctrl+C: 即座に全ワーカー kill → join(3s) → sys.exit(1)
+7. sentinel 監視スレッド起動（全ワーカー idle 検知で終了シグナル送信）
+8. 各ワーカーの初期化（`_worker` → `_worker_main`）:
    - `SentenceTransformer(EMBEDDING_MODEL)` をロード（約 420MB / ワーカー）
    - `RecursiveCharacterTextSplitter` を生成
    - PostgreSQL に接続（`try/finally` で `conn.close()` を保護）
    - Google Drive API に認証（`httplib2.Http(timeout=N)` でソケットタイムアウト付き）
+   - 起動時に PID をログ記録
 
-### Phase 6: ファイル処理（_worker → _process_file）
+### Phase 6: ファイル処理（_worker_main）
 
-各ワーカーはキューからタスクを1つ取得し、完了したら次のタスクを取る。
+各ワーカーはキューからタスクを `get(timeout=5)` で取得（ポーリング待機）し、完了したら次のタスクを取る。sentinel (`None`) を受け取ると終了。
 
 #### 6-1. タスクの取得
 
-```
+```python
 while True:
-    task = task_queue.get()  # ブロッキング取得（センチネル None で終了）
+    try:
+        task = task_queue.get(timeout=5)  # ポーリング（ワークスティール対応）
+    except queue.Empty:
+        continue  # idle 状態で待機（sentinel 監視スレッドが終了を判定）
     if task is None:
         break
 ```
+
+タスクは `file_start` / `file_end` フィールドを持ち、元タスクのファイルリストのスライスを参照する（ワークスティールのサブタスク対応）。
+
+#### 6-1.5. Resume チェック
+
+各ファイル処理の前に DB に既存データがあるかチェック:
+
+```python
+cur.execute("SELECT 1 FROM documents WHERE drive_file_id LIKE %s LIMIT 1", (f"{file_id}_%",))
+if cur.fetchone():
+    return -1, 1, 0, 0  # resumeSkip（ログに resumeSkip と表示）
+```
+
+- btree インデックスのプレフィックス一致で高速
+- 再実行時に処理済みファイルを瞬時スキップ
 
 #### 6-2. ファイルごとの処理（_process_file）
 
@@ -151,6 +179,28 @@ while True:
 - NUL 文字 (`\x00`) は自動除去
 - `insert_chunks()` 失敗時は `rollback()` → DB接続を再作成して処理継続（バッチロストはログ記録）
 - カーソルは `try/finally` で確実に `close()`
+
+#### 6-6. ワークスティール
+
+50ファイルごとに `_count_idle_workers()` で他ワーカーの進捗 JSON をチェック。以下の条件を全て満たすとき発動:
+
+- 残りファイル数 >= 100
+- idle ワーカー数 >= 2
+- 同一タスク内で未発動（`_redistributed` フラグで1回制限）
+
+発動時:
+1. 残りの80%をサブタスクとして `task_queue` に投入（最大4分割）
+2. 自身は残り20%を継続処理
+3. idle ワーカーがサブタスクを即座に取得
+
+```
+例: 5000件中250件目でワークスティール発動
+  W2 継続: 250〜1200（950件）
+  サブタスク1 → W1 が取得: 1200〜2150（950件）
+  サブタスク2 → W3 が取得: 2150〜3100（950件）
+  サブタスク3 → W5 が取得: 3100〜4050（950件）
+  サブタスク4 → W7 が取得: 4050〜5000（950件）
+```
 
 #### 6-6. 進捗更新
 
