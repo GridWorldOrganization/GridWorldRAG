@@ -65,7 +65,9 @@ trap cleanup INT TERM
 $PYTHON build_parallel.py --fetch-only $DB_OPT 2>>"$LOG_FILE"
 
 # Phase 2: ワーカー処理（バックグラウンド）
-$PYTHON build_parallel.py --work-only $DB_OPT >> "$LOG_FILE" 2>&1 &
+# resource_tracker のセマフォリーク偽陽性警告を抑制
+PYTHONWARNINGS="ignore::UserWarning:multiprocessing.resource_tracker" \
+  $PYTHON build_parallel.py --work-only $DB_OPT >> "$LOG_FILE" 2>&1 &
 BUILD_PID=$!
 
 # モニター

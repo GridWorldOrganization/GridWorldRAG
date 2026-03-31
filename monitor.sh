@@ -33,9 +33,16 @@ while true; do
 
     # カーソルを保存位置に戻して上書き
     tput rc 2>/dev/null
+    LINE_COUNT=0
     while IFS= read -r line; do
         printf '\033[K%s\n' "$line"
+        LINE_COUNT=$((LINE_COUNT + 1))
     done <<< "$OUTPUT"
+    # 余剰行をクリア（前回の表示残りを消す）
+    while [ $LINE_COUNT -lt $TOTAL_LINES ]; do
+        printf '\033[K\n'
+        LINE_COUNT=$((LINE_COUNT + 1))
+    done
 
     # プロセス終了チェック
     if [ -n "$BUILD_PID" ] && ! kill -0 "$BUILD_PID" 2>/dev/null; then
