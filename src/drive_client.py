@@ -1,7 +1,7 @@
 """Google Drive API クライアント。
 
 認証・ファイル一覧取得・テキスト抽出を提供する。
-build_index.py, watcher.py など複数スクリプトから利用される。
+build_parallel.py, sync.py, gridworld-rag-mcp/server.py から利用される。
 """
 
 import io

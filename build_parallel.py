@@ -233,8 +233,7 @@ def _worker(worker_id, task_queue, tasks_total, results_queue, sheets_semaphore)
     from src.db import connect
 
     model = SentenceTransformer(EMBEDDING_MODEL)
-    # Note: _model_lock は廃止。daemon スレッドによるタイムアウトを廃止し
-    # httplib2 ソケットタイムアウトに移行したため、スレッド競合は発生しない。
+    # httplib2 ソケットタイムアウトに移行済み。スレッド競合なし（daemon スレッド廃止）。
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP,
     )
@@ -398,6 +397,8 @@ def _worker_main(worker_id, task_queue, tasks_total, results_queue, sheets_semap
             progress(**_current_task_kwargs)
 
             # --- ワークスティール: 遊んでいるワーカーに残りを再分配 ---
+            # 閾値: 残り100件以上、50件ごとにチェック、idle 2ワーカー以上で発動
+            # 分割: 残りの80%を最大4サブタスクに分配、20%は自身で継続
             remaining_count = task_size - fi
             if not _redistributed and remaining_count >= 100 and fi % 50 == 0:
                 idle_count = _count_idle_workers(worker_id)

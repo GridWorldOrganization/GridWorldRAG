@@ -16,6 +16,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Worker fatal error reporting** — separated `_worker` into init + `_worker_main` so fatal errors are logged and `results_queue` always receives a response (prevents parent deadlock)
 - **Resume support** — `_process_file` checks DB for existing data before processing; re-running the build skips already-indexed files instantly and processes only new/unprocessed files
 
+### Added
+
+- **Work stealing** — busy workers detect idle workers and redistribute 80% of remaining files as sub-tasks; eliminates the "2 workers stuck, 5 idle" problem
+- **Resume support** — re-running the build skips already-indexed files instantly (`resumeSkip` in logs and monitor)
+- **File listing optimization** — probe drives with single API call to estimate size, sort largest-first, configurable `FETCH_THREADS` (default 3)
+- **Monitor improvements** — `skipping(N)` display during resume, `(レート制限待ちNs)` for stalled workers, worker PID logging
+- **Zombie prevention** — `atexit` handler, double Ctrl+C force-kill, join with timeout on all exit paths
+- **Comprehensive logging** — Phase 1 probe results/sort order/per-drive completion to log file via stderr
+
 ### Removed
 
 - `_download_with_sigalrm` / `_DownloadTimeoutError` — daemon thread timeout mechanism (replaced by httplib2 socket timeout)

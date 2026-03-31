@@ -31,7 +31,8 @@ def render(worker_count, progress_dir, elapsed):
             lines.append(f"W{idx}[....................] 停止中")
             continue
         try:
-            d = json.load(open(f))
+            with open(f) as fp:
+                d = json.load(fp)
         except (json.JSONDecodeError, IOError):
             lines.append(f"W{idx}[....................] 読込中")
             continue
