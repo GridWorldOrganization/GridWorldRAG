@@ -342,6 +342,49 @@ claude mcp add gridworld-rag-mcp -- python gridworld-rag-mcp/server.py --db 0
 
 > **注意**: インポート先では `build_parallel.py` や `sync.py` は不要。MCPサーバーのみ動かせばよい。
 
+## 内部運用: secrets の管理（GridWorldOrganization メンバー向け）
+
+`config.env` と `shared_drives_whitelist.txt` は `.gitignore` で公開リポから除外しているため、ローカルで失うと復旧不能になる。そこで、これらだけを保管する**プライベート姉妹リポ**を使って運用する。
+
+- **リポ**: [GridWorldOrganization/GridWorldRAG-secrets](https://github.com/GridWorldOrganization/GridWorldRAG-secrets)（**private**）
+- **配置**: このリポと**兄弟ディレクトリ**に clone（`GridWorldRAG/` の中には入れない）
+- **接続**: `GridWorldRAG/config.env` と `GridWorldRAG/shared_drives_whitelist.txt` は symlink として secrets リポの実体を指す
+
+```
+~/dev/claude_code/dev/
+├── GridWorldRAG/                          ← 公開リポ（このリポ）
+│   ├── config.env → ../GridWorldRAG-secrets/config.env
+│   └── shared_drives_whitelist.txt → ../GridWorldRAG-secrets/shared_drives_whitelist.txt
+└── GridWorldRAG-secrets/                  ← private リポ（実体）
+    ├── config.env
+    └── shared_drives_whitelist.txt
+```
+
+### 新環境での復旧手順
+
+```bash
+cd ~/dev/claude_code/dev/
+git clone https://github.com/GridWorldOrganization/GridWorldRAG.git
+git clone https://github.com/GridWorldOrganization/GridWorldRAG-secrets.git
+cd GridWorldRAG
+ln -s ../GridWorldRAG-secrets/config.env config.env
+ln -s ../GridWorldRAG-secrets/shared_drives_whitelist.txt shared_drives_whitelist.txt
+```
+
+### 更新時の運用
+
+`GridWorldRAG/config.env` を編集すると symlink 経由で実体（secrets リポ側）が更新されるので、secrets リポで commit/push するだけ：
+
+```bash
+cd ~/dev/claude_code/dev/GridWorldRAG-secrets
+git add -A && git commit -m "update: config.env" && git push
+```
+
+### 備考
+
+- `credentials.json` と `token.pickle` は secrets リポに入れない（GCP で再発行・再認証で復元可能なため）
+- OSS 利用者は secrets リポを使わず、`config.env.example` をコピーして自前で設定すれば良い
+
 ## ライセンス
 
 [MIT License](LICENSE)
