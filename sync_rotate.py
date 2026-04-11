@@ -17,10 +17,15 @@ launchd (LaunchAgent) から 5 分間隔で呼び出す想定。
 
 import argparse
 import json
+import logging
 import os
+import shutil
 import sys
 import time
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
+
+import psycopg2
 
 from src.config import (
     EMBEDDING_MODEL, CHUNK_SIZE, CHUNK_OVERLAP,
@@ -34,12 +39,67 @@ from src.drive_client import (
     extract_spreadsheet_sheets,
     resolve_folder_path_api,
     SKIP_MIME_TYPES,
+    _api_call_with_retry,
 )
 from src.db import connect, upsert_file_chunks, delete_by_file_id
 from src.indexer import make_chunk_entry
 
 LOCK_FILE = Path("/tmp/gridworldrag_rotate.lock")
 _STALE_LOCK_SEC = 1200  # 20分以上古いロックは stale 扱い
+
+# 空き容量チェックの閾値 (1GB)
+MIN_FREE_BYTES = 1 * 1024 * 1024 * 1024
+
+# ログ出力先: macOS 慣例に従い ~/Library/Logs/ を使用
+LOG_DIR = Path.home() / "Library" / "Logs" / "gridworldrag"
+LOG_FILE = LOG_DIR / "sync_rotate.log"
+LOG_MAX_BYTES = 5 * 1024 * 1024  # 5MB ごとにローテート
+LOG_BACKUP_COUNT = 3             # 3世代保持
+
+log = logging.getLogger("sync_rotate")
+
+
+class DiskFullHalt(Exception):
+    """ディスク満杯を検出したため処理全体を中止するシグナル。"""
+
+
+def _setup_logging():
+    """RotatingFileHandler + StreamHandler でロガーを構成する。"""
+    if log.handlers:
+        return  # 二重初期化防止（テストから呼ばれた時など）
+
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # ログディレクトリが作れなくても stderr にフォールバック
+        pass
+
+    fmt = logging.Formatter(
+        "%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    # 標準出力（launchd の StandardOutPath 経由でも残る）
+    stream = logging.StreamHandler(sys.stdout)
+    stream.setFormatter(fmt)
+    log.addHandler(stream)
+
+    # ファイル（ローテート付き）
+    if LOG_DIR.exists():
+        try:
+            rotating = RotatingFileHandler(
+                LOG_FILE,
+                maxBytes=LOG_MAX_BYTES,
+                backupCount=LOG_BACKUP_COUNT,
+                encoding="utf-8",
+            )
+            rotating.setFormatter(fmt)
+            log.addHandler(rotating)
+        except OSError:
+            pass  # ディスク満杯などで作れなくても stream は残る
+
+    log.setLevel(logging.INFO)
+    log.propagate = False
 
 
 def _acquire_lock():
@@ -49,7 +109,7 @@ def _acquire_lock():
         except FileNotFoundError:
             age = _STALE_LOCK_SEC + 1
         if age <= _STALE_LOCK_SEC:
-            print(f"[{time.strftime('%H:%M:%S')}] 前回実行中 (age={int(age)}s) スキップ", flush=True)
+            log.info("前回実行中 (age=%ds) スキップ", int(age))
             sys.exit(0)
         try:
             LOCK_FILE.unlink()
@@ -78,6 +138,7 @@ CREATE TABLE IF NOT EXISTS sync_state (
 """
 _TOKEN_PREFIX = "rotate_token_"
 _RESULT_KEY = "last_sync_result"
+_FAILED_FILES_KEY = "failed_files"
 
 
 def _ensure_sync_state_table(conn):
@@ -140,6 +201,75 @@ def _save_sync_result(conn, result):
         cur.close()
 
 
+def _load_failed_files(conn):
+    """再試行待ちのファイルIDリストを取得する。"""
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT value FROM sync_state WHERE key = %s", (_FAILED_FILES_KEY,))
+        row = cur.fetchone()
+    finally:
+        cur.close()
+    if not row:
+        return []
+    try:
+        return json.loads(row[0])
+    except (ValueError, TypeError):
+        return []
+
+
+def _save_failed_files(conn, failed):
+    """再試行待ちのファイルIDリストを保存する。"""
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            INSERT INTO sync_state (key, value, updated_at)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (key) DO UPDATE SET
+                value = EXCLUDED.value,
+                updated_at = NOW()
+            """,
+            (_FAILED_FILES_KEY, json.dumps(failed, ensure_ascii=False)),
+        )
+        conn.commit()
+    finally:
+        cur.close()
+
+
+# ---------------------------------------------------------------------------
+# ディスク容量チェック
+# ---------------------------------------------------------------------------
+
+def _check_disk_space(path=None):
+    """PG データディレクトリの空き容量を返す。
+
+    Returns:
+        (ok: bool, free_bytes: int, total_bytes: int)
+    """
+    if path is None:
+        # PostgreSQL@17 の標準パス。存在しなければ '/' にフォールバック
+        path = "/opt/homebrew/var/postgresql@17"
+        if not Path(path).exists():
+            path = "/"
+    try:
+        usage = shutil.disk_usage(path)
+    except Exception:
+        # 計測できない場合は失敗を返す（安全側）
+        return False, 0, 0
+    return usage.free >= MIN_FREE_BYTES, usage.free, usage.total
+
+
+def _is_disk_full_error(exc):
+    """例外が DB のディスク満杯系か判定する。"""
+    if isinstance(exc, psycopg2.errors.DiskFull):  # psycopg2 2.9+
+        return True
+    msg = str(exc).lower()
+    for needle in ("no space", "disk full", "out of space", "space left"):
+        if needle in msg:
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # チャンク生成
 # ---------------------------------------------------------------------------
@@ -165,7 +295,7 @@ def _build_chunks(file_info, service, model, splitter):
             try:
                 embeddings = model.encode(text_chunks)
             except Exception as e:
-                print(f"  警告: embed失敗 [{file_info.get('name','?')}/{sheet['name']}]: {e}", flush=True)
+                log.warning("embed失敗 [%s/%s]: %s", file_info.get("name", "?"), sheet["name"], e)
                 continue
             for ci, (chunk_text, emb) in enumerate(zip(text_chunks, embeddings)):
                 chunks.append(make_chunk_entry(
@@ -195,8 +325,17 @@ def _build_chunks(file_info, service, model, splitter):
 # ---------------------------------------------------------------------------
 
 def _process_drive_changes(service, conn, model, splitter, drive_id, changes):
-    """1ドライブの Changes API 結果を処理する。"""
+    """1ドライブの Changes API 結果を処理する。
+
+    Raises:
+        DiskFullHalt: DB がディスク満杯を検出した場合。呼び出し側は直ちに中止すべき。
+
+    Returns:
+        (added, updated, deleted, errors, skipped, failed_ids)
+        failed_ids は再試行キューに追加すべき file_id のリスト。
+    """
     added, updated, deleted = [], [], []
+    failed_ids = []
     errors = skipped = 0
     folder_cache = {}
 
@@ -216,13 +355,15 @@ def _process_drive_changes(service, conn, model, splitter, drive_id, changes):
             try:
                 n = delete_by_file_id(conn, file_id)
             except Exception as e:
-                print(f"  警告: 削除失敗 [{file_id}]: {e}", flush=True)
+                if _is_disk_full_error(e):
+                    raise DiskFullHalt(f"DB ディスク満杯 (削除時): {e}") from e
+                log.warning("削除失敗 [%s]: %s", file_id, e)
                 errors += 1
                 continue
             if n > 0:
                 fname = (file_info or {}).get("name", file_id)
                 furl = (file_info or {}).get("webViewLink", "")
-                print(f"  削除: {fname}", flush=True)
+                log.info("削除: %s", fname)
                 deleted.append({"name": fname, "url": furl, "id": file_id})
             continue
 
@@ -250,8 +391,9 @@ def _process_drive_changes(service, conn, model, splitter, drive_id, changes):
         try:
             chunks = _build_chunks(file_info, service, model, splitter)
         except Exception as e:
-            print(f"  エラー: {fname} ({e})", flush=True)
+            log.error("chunk生成エラー: %s (%s)", fname, e)
             errors += 1
+            failed_ids.append({"drive_id": drive_id, "file_id": file_id})
             continue
 
         if not chunks:
@@ -261,34 +403,178 @@ def _process_drive_changes(service, conn, model, splitter, drive_id, changes):
         try:
             status = upsert_file_chunks(conn, file_id, chunks)
         except Exception as e:
-            print(f"  警告: DB書込失敗 [{fname}]: {e}", flush=True)
+            if _is_disk_full_error(e):
+                raise DiskFullHalt(f"DB ディスク満杯 [{fname}]: {e}") from e
+            log.warning("DB書込失敗 [%s]: %s", fname, e)
             errors += 1
+            failed_ids.append({"drive_id": drive_id, "file_id": file_id})
             continue
 
         entry = {"name": fname, "url": furl, "id": file_id}
         if status == "updated":
-            print(f"  更新: {fname}", flush=True)
+            log.info("更新: %s", fname)
             updated.append(entry)
         else:
-            print(f"  追加: {fname}", flush=True)
+            log.info("追加: %s", fname)
             added.append(entry)
 
-    return added, updated, deleted, errors, skipped
+    return added, updated, deleted, errors, skipped, failed_ids
 
 
 # ---------------------------------------------------------------------------
 # メインループ
 # ---------------------------------------------------------------------------
 
+def _get_model_and_splitter():
+    """SentenceTransformer と splitter を遅延ロードする。"""
+    from sentence_transformers import SentenceTransformer
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+    log.info("モデルロード中...")
+    model = SentenceTransformer(EMBEDDING_MODEL)
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP,
+    )
+    log.info("モデルロード完了")
+    return model, splitter
+
+
+def _retry_failed_files(service, conn, model_getter):
+    """前回失敗したファイルを再処理する。
+
+    Args:
+        model_getter: モデルを遅延取得する callable (引数なし) 。
+                      返り値は (model, splitter)。
+
+    Returns:
+        (recovered, still_failed, errors, disk_full)
+        still_failed は再び失敗したエントリの list、disk_full は True なら halt 要求。
+    """
+    queue = _load_failed_files(conn)
+    if not queue:
+        return [], [], 0, False
+
+    log.info("再試行キュー: %d件", len(queue))
+
+    still_failed = []
+    recovered = []
+    errors = 0
+    model = splitter = None
+
+    for entry in queue:
+        drive_id = entry.get("drive_id", "")
+        file_id = entry.get("file_id", "")
+        if not file_id:
+            continue
+
+        try:
+            file_info = _api_call_with_retry(lambda: service.files().get(
+                fileId=file_id,
+                fields=(
+                    "id,name,mimeType,modifiedTime,trashed,owners,"
+                    "webViewLink,driveId,parents,"
+                    "permissions(emailAddress,role,type,displayName)"
+                ),
+                supportsAllDrives=True,
+            ).execute())
+        except Exception as e:
+            log.warning("再取得失敗 [%s]: %s", file_id, e)
+            still_failed.append(entry)
+            errors += 1
+            continue
+
+        if file_info.get("trashed"):
+            # ゴミ箱へ移動済み: DB から消して成功扱い
+            try:
+                delete_by_file_id(conn, file_id)
+                recovered.append(file_id)
+            except Exception as e:
+                if _is_disk_full_error(e):
+                    still_failed.append(entry)
+                    still_failed.extend([
+                        q for q in queue
+                        if q.get("file_id") not in recovered
+                        and q.get("file_id") != file_id
+                    ])
+                    _save_failed_files(conn, still_failed)
+                    return recovered, still_failed, errors, True
+                log.warning("再試行削除失敗 [%s]: %s", file_id, e)
+                still_failed.append(entry)
+                errors += 1
+            continue
+
+        if model is None:
+            model, splitter = model_getter()
+
+        try:
+            file_info["folder_path"] = resolve_folder_path_api(service, file_info, {})
+            chunks = _build_chunks(file_info, service, model, splitter)
+        except Exception as e:
+            log.warning("再試行 chunk 生成失敗 [%s]: %s", file_id, e)
+            still_failed.append(entry)
+            errors += 1
+            continue
+
+        if not chunks:
+            recovered.append(file_id)
+            continue
+
+        try:
+            upsert_file_chunks(conn, file_id, chunks)
+            log.info("再試行成功: %s", file_info.get("name", file_id))
+            recovered.append(file_id)
+        except Exception as e:
+            if _is_disk_full_error(e):
+                # 残りはすべて未処理として保存
+                still_failed.append(entry)
+                still_failed.extend([
+                    q for q in queue
+                    if q.get("file_id") not in recovered
+                    and q.get("file_id") != file_id
+                ])
+                _save_failed_files(conn, still_failed)
+                return recovered, still_failed, errors, True
+            log.warning("再試行 upsert 失敗 [%s]: %s", file_id, e)
+            still_failed.append(entry)
+            errors += 1
+
+    _save_failed_files(conn, still_failed)
+    return recovered, still_failed, errors, False
+
+
 def _run(args):
+    _setup_logging()
+
     whitelist = load_shared_drives_whitelist()
     if not whitelist:
-        print("ホワイトリストが空です", flush=True)
+        log.warning("ホワイトリストが空です")
         return
 
-    print(f"[{time.strftime('%H:%M:%S')}] Drive認証中...", end="", flush=True)
+    # 事前の空き容量チェック（PG データディレクトリ）
+    ok, free, total = _check_disk_space()
+    if not ok and not args.init:
+        log.error(
+            "空き容量不足: free=%.2fGB total=%.2fGB 閾値=%.2fGB 処理を中断",
+            free / 1024**3, total / 1024**3, MIN_FREE_BYTES / 1024**3,
+        )
+        # 結果を記録してから退出（トークンは進めない）
+        try:
+            conn = connect()
+            _ensure_sync_state_table(conn)
+            _save_sync_result(conn, {
+                "synced_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "aborted": True,
+                "reason": "disk_full_preflight",
+                "free_bytes": free,
+                "total_bytes": total,
+            })
+            conn.close()
+        except Exception:
+            pass
+        sys.exit(2)
+
+    log.info("Drive認証中...")
     service = authenticate()
-    print(" 完了", flush=True)
+    log.info("Drive認証完了")
 
     conn = connect()
     _ensure_sync_state_table(conn)
@@ -299,9 +585,9 @@ def _run(args):
             try:
                 token = get_changes_start_token(service, drive_id=drive_id)
                 _save_token(conn, drive_id, token)
-                print(f"  初期化: {drive_id[:20]}... → {token}", flush=True)
+                log.info("初期化: %s... → %s", drive_id[:20], token)
             except Exception as e:
-                print(f"  エラー: {drive_id[:20]}... {e}", flush=True)
+                log.error("初期化失敗: %s... %s", drive_id[:20], e)
         conn.close()
         return
 
@@ -309,79 +595,101 @@ def _run(args):
     if args.drive:
         target_drives = [args.drive] if args.drive in whitelist else []
         if not target_drives:
-            print(f"指定ドライブ {args.drive} はホワイトリストにありません", flush=True)
+            log.error("指定ドライブ %s はホワイトリストにありません", args.drive)
             conn.close()
             return
     else:
         target_drives = whitelist
 
-    # トークンを 1 クエリでまとめて取得
-    tokens = _load_tokens(conn, target_drives)
-
     # 遅延ロード: 変更があった時だけモデルを構築
     model = None
     splitter = None
 
+    def _ensure_model():
+        nonlocal model, splitter
+        if model is None:
+            model, splitter = _get_model_and_splitter()
+        return model, splitter
+
+    # 先に再試行キューを処理
+    disk_full = False
+    retry_recovered, retry_still_failed, retry_errors, disk_full = _retry_failed_files(
+        service, conn, _ensure_model
+    )
+
+    if disk_full:
+        log.error("再試行中にディスク満杯を検出、処理を中断")
+        _save_sync_result(conn, {
+            "synced_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "aborted": True,
+            "reason": "disk_full_during_retry",
+            "retry_recovered": len(retry_recovered),
+            "retry_still_failed": len(retry_still_failed),
+        })
+        conn.close()
+        sys.exit(2)
+
+    # トークンを 1 クエリでまとめて取得
+    tokens = _load_tokens(conn, target_drives)
+
     all_added, all_updated, all_deleted = [], [], []
     total_errors = total_skipped = 0
     drives_with_changes = drives_checked = 0
+    new_failed_files = []
 
-    for drive_id in target_drives:
-        token = tokens.get(drive_id)
-        if token is None:
-            # 未初期化: 今のトークンを取って保存するだけ（次回から効く）
+    try:
+        for drive_id in target_drives:
+            token = tokens.get(drive_id)
+            if token is None:
+                # 未初期化: 今のトークンを取って保存するだけ
+                try:
+                    new_token = get_changes_start_token(service, drive_id=drive_id)
+                    _save_token(conn, drive_id, new_token)
+                    log.info("%s...: トークン初期化", drive_id[:16])
+                except Exception as e:
+                    log.warning("%s...: トークン取得失敗 %s", drive_id[:16], e)
+                    total_errors += 1
+                continue
+
             try:
-                new_token = get_changes_start_token(service, drive_id=drive_id)
-                _save_token(conn, drive_id, new_token)
-                print(f"[{time.strftime('%H:%M:%S')}] {drive_id[:16]}...: トークン初期化", flush=True)
+                changes, new_token = list_changes(service, token, drive_id=drive_id)
             except Exception as e:
-                print(f"[{time.strftime('%H:%M:%S')}] {drive_id[:16]}...: トークン取得失敗 {e}", flush=True)
+                log.warning("%s...: Changes取得失敗 %s", drive_id[:16], e)
                 total_errors += 1
-            continue
+                continue
 
-        try:
-            changes, new_token = list_changes(service, token, drive_id=drive_id)
-        except Exception as e:
-            print(f"[{time.strftime('%H:%M:%S')}] {drive_id[:16]}...: Changes取得失敗 {e}", flush=True)
-            total_errors += 1
-            continue
+            drives_checked += 1
 
-        drives_checked += 1
+            if not changes:
+                if new_token != token:
+                    _save_token(conn, drive_id, new_token)
+                continue
 
-        if not changes:
-            # 変更なし: トークンがローテーションした時だけ更新（fast path の fsync を削減）
-            if new_token != token:
-                _save_token(conn, drive_id, new_token)
-            continue
+            drives_with_changes += 1
+            log.info("%s...: %d件の変更", drive_id[:16], len(changes))
 
-        drives_with_changes += 1
-        print(f"[{time.strftime('%H:%M:%S')}] {drive_id[:16]}...: {len(changes)}件の変更", flush=True)
+            _ensure_model()
 
-        # モデル遅延ロード
-        if model is None:
-            print(f"[{time.strftime('%H:%M:%S')}] モデルロード中...", end="", flush=True)
-            from sentence_transformers import SentenceTransformer
-            from langchain_text_splitters import RecursiveCharacterTextSplitter
-            model = SentenceTransformer(EMBEDDING_MODEL)
-            splitter = RecursiveCharacterTextSplitter(
-                chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP,
+            added, updated, deleted, errors, skipped, failed_ids = _process_drive_changes(
+                service, conn, model, splitter, drive_id, changes
             )
-            print(" 完了", flush=True)
+            all_added.extend(added)
+            all_updated.extend(updated)
+            all_deleted.extend(deleted)
+            total_errors += errors
+            total_skipped += skipped
+            new_failed_files.extend(failed_ids)
 
-        added, updated, deleted, errors, skipped = _process_drive_changes(
-            service, conn, model, splitter, drive_id, changes
-        )
-        all_added.extend(added)
-        all_updated.extend(updated)
-        all_deleted.extend(deleted)
-        total_errors += errors
-        total_skipped += skipped
+            # トークン保存: 失敗ファイルも retry queue に積まれているので安全に前進可能
+            _save_token(conn, drive_id, new_token)
 
-        # トークン保存は処理成功後（エラーがあっても前進させる実装にするなら errors 判定を外す）
-        # WHY: ここで新トークンを保存しないと次回同じ変更を再フェッチすることになり、
-        # 変更ゼロ時の fast path で余計な処理が発生する。エラーファイルは再取得不能だが、
-        # 手動で --init で再初期化できる。
-        _save_token(conn, drive_id, new_token)
+    except DiskFullHalt as e:
+        log.error("ディスク満杯のため処理中断: %s", e)
+        disk_full = True
+
+    # retry queue の更新: 既存の still_failed + 今回の新 failed
+    combined_failed = list(retry_still_failed) + list(new_failed_files)
+    _save_failed_files(conn, combined_failed)
 
     _save_sync_result(conn, {
         "synced_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -389,25 +697,35 @@ def _run(args):
         "updated": all_updated,
         "deleted": all_deleted,
         "skipped": total_skipped,
-        "errors": total_errors,
+        "errors": total_errors + retry_errors,
         "drives_checked": drives_checked,
         "drives_with_changes": drives_with_changes,
+        "retry_recovered": len(retry_recovered),
+        "retry_pending": len(combined_failed),
+        "disk_full": disk_full,
     })
 
     total_changes = len(all_added) + len(all_updated) + len(all_deleted)
-    if total_changes == 0:
-        print(
-            f"[{time.strftime('%H:%M:%S')}] 変更なし "
-            f"({drives_checked}/{len(target_drives)} drives)",
-            flush=True,
+    if disk_full:
+        log.error(
+            "完了（中断）: 追加=%d 更新=%d 削除=%d エラー=%d 未処理=%d",
+            len(all_added), len(all_updated), len(all_deleted),
+            total_errors + retry_errors, len(combined_failed),
+        )
+        conn.close()
+        sys.exit(2)
+    elif total_changes == 0 and not retry_recovered:
+        log.info(
+            "変更なし (%d/%d drives) retry_pending=%d",
+            drives_checked, len(target_drives), len(combined_failed),
         )
     else:
-        print(
-            f"[{time.strftime('%H:%M:%S')}] 完了: "
-            f"追加={len(all_added)} 更新={len(all_updated)} 削除={len(all_deleted)} "
-            f"スキップ={total_skipped} エラー={total_errors} "
-            f"({drives_with_changes}/{drives_checked} drives)",
-            flush=True,
+        log.info(
+            "完了: 追加=%d 更新=%d 削除=%d スキップ=%d エラー=%d retry復旧=%d retry残=%d (%d/%d drives)",
+            len(all_added), len(all_updated), len(all_deleted),
+            total_skipped, total_errors + retry_errors,
+            len(retry_recovered), len(combined_failed),
+            drives_with_changes, drives_checked,
         )
 
     conn.close()
@@ -428,7 +746,8 @@ def main():
         _cfg.DB_NAME = f"gridworldrag_{args.db}"
         import src.db as _db
         _db.DB_NAME = f"gridworldrag_{args.db}"
-        print(f"DB: gridworldrag_{args.db}", flush=True)
+        _setup_logging()
+        log.info("DB: gridworldrag_%d", args.db)
 
     _acquire_lock()
     try:
