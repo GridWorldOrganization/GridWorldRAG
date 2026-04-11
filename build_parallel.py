@@ -1011,14 +1011,13 @@ def main():
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
+    # ワーカーの自然終了を無制限に待つ。
+    # 正常終了: sentinel スレッドが pending_tasks==0 を検知して None を投入 → 全ワーカー break
+    # 緊急時: Ctrl+C / SIGTERM が _shutdown ハンドラに入り、そこで terminate()+kill() を実行
+    # 以前は p.join(timeout=600) のシーケンシャル待機があり、実質「600 秒 × n_workers」の
+    # ビルド時間ハードキャップとして機能してしまっていた (30 分で強制 kill される事故の原因)。
     for p in processes:
-        p.join(timeout=600)  # 最大10分待機（ゾンビ防止）
-    # join timeout 後にまだ生きているプロセスを強制終了
-    for i, p in enumerate(processes, 1):
-        if p.is_alive():
-            print(f"  W{i} がタイムアウト（600秒）。強制終了します。", flush=True)
-            p.kill()
-            p.join(timeout=5)
+        p.join()
 
     elapsed = time.time() - start_time
 
