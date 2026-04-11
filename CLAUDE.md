@@ -108,6 +108,16 @@ GridWorldRAG/
 - 埋め込みモデルは遅延ロード
 - プロジェクトスコープで登録済み: `claude mcp add gridworld-rag-mcp --scope project`
 
+### ローテーション型差分同期（sync_rotate.py）
+
+- 共有ドライブごとに独立した Changes API ページトークンを保持（`sync_state.rotate_token_<drive_id>`）
+- 1実行 = 全ドライブを一巡チェック。変更ゼロのドライブは Changes API 1コールで即スキップ
+- 22ドライブ×変更ゼロで実測 **約7秒**/実行
+- 埋め込みモデルは変更発生時のみ遅延ロード
+- `/tmp/gridworldrag_rotate.lock` で多重起動防止（20分 stale）
+- launchd の LaunchAgent（`launchd/co.gridworld.gridworldrag.sync.plist`）から5分間隔実行
+- sync.py（旧実装、グローバル Changes API）は残しているが使わない方針
+
 ## 開発で踏んだ落とし穴
 
 - **EXPORT_MIME_MAP にスプレッドシートを含めると最初のシートしかCSV exportされない** → Sheets API で個別取得に変更

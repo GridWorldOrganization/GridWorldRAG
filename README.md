@@ -342,6 +342,79 @@ claude mcp add gridworld-rag-mcp -- python gridworld-rag-mcp/server.py --db 0
 
 > **注意**: インポート先では `build_parallel.py` や `sync.py` は不要。MCPサーバーのみ動かせばよい。
 
+## 差分同期の自動化（Mac 版）
+
+`sync_rotate.py` は共有ドライブ単位で独立した Changes API トークンを持ち、**5分間隔の頻回実行で変更があったドライブだけ処理する**ローテーション型差分同期。launchd の LaunchAgent から定期実行する。
+
+### なぜローテーション型か
+
+- 1ドライブ 1 Changes API コールで「変更の有無」を判定できる（変更ゼロなら即スキップ）
+- 変更ゼロの状態で 22 ドライブを一巡しても 7 秒程度
+- 埋め込みモデル（SentenceTransformer）は変更が1件でも見つかった時にだけロード（遅延ロード）
+- `/tmp/gridworldrag_rotate.lock` で多重起動防止
+
+### 使い方（手動）
+
+```bash
+# 初回のみ: 全ドライブの変更追跡トークンを初期化
+./run_sync_rotate.sh --db 3 --init
+
+# 通常実行（全ドライブを巡回）
+./run_sync_rotate.sh --db 3
+
+# 特定ドライブのみ
+./run_sync_rotate.sh --db 3 --drive 0ABCxyz...
+```
+
+実行結果は `sync_state.last_sync_result` に記録され、MCP の `recent_changes` ツールから確認できる。
+
+### launchd (LaunchAgent) への登録
+
+LaunchAgent 定義ファイル: `launchd/co.gridworld.gridworldrag.sync.plist`（リポジトリに含まれるテンプレート）
+
+インストール:
+```bash
+# LaunchAgents ディレクトリにコピー
+cp launchd/co.gridworld.gridworldrag.sync.plist ~/Library/LaunchAgents/
+
+# ロード（これで自動起動＋5分間隔の定期実行が始まる）
+launchctl load ~/Library/LaunchAgents/co.gridworld.gridworldrag.sync.plist
+```
+
+アンロード:
+```bash
+launchctl unload ~/Library/LaunchAgents/co.gridworld.gridworldrag.sync.plist
+```
+
+手動トリガー（次の5分を待たず即実行）:
+```bash
+launchctl start co.gridworld.gridworldrag.sync
+```
+
+ログ確認:
+```bash
+tail -f /tmp/gridworldrag_sync.log   # 標準出力
+tail -f /tmp/gridworldrag_sync.err   # 標準エラー
+```
+
+### 動作仕様
+
+| 項目 | 値 |
+|---|---|
+| 実行間隔 | 300秒（5分） |
+| スリープ中 | 発火せず（復帰後に `RunAtLoad` で1回走る） |
+| CPU優先度 | Nice=5（低優先、他作業の邪魔をしない） |
+| 前回終了後の最短間隔 | 10秒（ThrottleInterval） |
+| 多重起動 | lockfile で防止（20分stale） |
+| 接続先DB | `--db 3`（plist内で固定） |
+| 絶対パス | plist 内にハードコード（マシン固有） |
+
+### トラブルシュート
+
+- **「前回実行中 skip」と毎回出る**: `/tmp/gridworldrag_rotate.lock` を確認。20分以上古ければ自動解除されるが、即時復旧したいなら手動で `rm`
+- **変更があるはずなのに反応しない**: Changes API はトークン発行時点以降の変更しか拾わない。過去の未反映ファイルは拾えない → フル再ビルドが必要
+- **PostgreSQL エラー**: `plist` の `EnvironmentVariables.PATH` に ARM 版 `/opt/homebrew/opt/postgresql@17/bin` が入っているか確認
+
 ## 内部運用: secrets の管理（GridWorldOrganization メンバー向け）
 
 `config.env` と `shared_drives_whitelist.txt` は `.gitignore` で公開リポから除外しているため、ローカルで失うと復旧不能になる。そこで、これらだけを保管する**プライベート姉妹リポ**を使って運用する。

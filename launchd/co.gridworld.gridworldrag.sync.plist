@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>co.gridworld.gridworldrag.sync</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/tobisako/dev/claude_code/dev/GridWorldRAG/run_sync_rotate.sh</string>
+        <string>--db</string>
+        <string>3</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/tobisako/dev/claude_code/dev/GridWorldRAG</string>
+
+    <!-- 5分(300秒) 間隔で実行。スリープ中は発火せず、復帰後にまとめて1回走る -->
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <!-- ログイン/plistロード直後にも1回実行 -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- 前回終了後10秒は再起動しない（暴走防止） -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- CPU優先度を下げて他作業の邪魔をしない -->
+    <key>Nice</key>
+    <integer>5</integer>
+
+    <!-- 標準出力・エラーログ -->
+    <key>StandardOutPath</key>
+    <string>/tmp/gridworldrag_sync.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/gridworldrag_sync.err</string>
+
+    <!-- PATH: postgresql@17 をARM版で解決できるようにする -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/opt/postgresql@17/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>
