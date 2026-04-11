@@ -217,8 +217,11 @@ def _process_file(file_info, model, splitter, service, batch, sheets_semaphore=N
     return 1, 0, 0, len(chunks)
 
 
-def _worker(worker_id, task_queue, tasks_total, results_queue, sheets_semaphore):
-    """ワーカープロセス: キューからタスクを取得して順次処理する。"""
+def _worker(worker_id, task_queue, tasks_total, results_queue, sheets_semaphore, pending_tasks):
+    """ワーカープロセス: キューからタスクを取得して順次処理する。
+
+    pending_tasks: 未完了タスク数の共有カウンタ (multiprocessing.Value('i', ...))
+    """
     # 起動中マーカー（モデルロード前に即座に書き出し）
     _write_progress(worker_id, status=WorkerStatus.LOADING, tasks_total=tasks_total)
 
@@ -234,7 +237,7 @@ def _worker(worker_id, task_queue, tasks_total, results_queue, sheets_semaphore)
     conn = connect()
     try:
         _worker_main(worker_id, task_queue, tasks_total, results_queue, sheets_semaphore,
-                      model, splitter, conn)
+                      model, splitter, conn, pending_tasks)
     except Exception as ex:
         print(f"[FATAL] W{worker_id} ワーカー異常終了: {ex}", flush=True)
         import traceback; traceback.print_exc()
@@ -251,8 +254,13 @@ def _worker(worker_id, task_queue, tasks_total, results_queue, sheets_semaphore)
 
 
 def _worker_main(worker_id, task_queue, tasks_total, results_queue, sheets_semaphore,
-                  model, splitter, conn):
-    """ワーカーのメインループ（conn の try/finally は呼び出し元で保護済み）。"""
+                  model, splitter, conn, pending_tasks):
+    """ワーカーのメインループ（conn の try/finally は呼び出し元で保護済み）。
+
+    pending_tasks: 未完了タスク数のアトミック共有カウンタ。
+                   タスク完了時に -1、ワークスティールで新サブタスクを投入時に +1。
+                   sentinel が 0 を検知したらシャットダウン。
+    """
     from src.db import connect, insert_chunks
 
     service = authenticate()
@@ -406,6 +414,9 @@ def _worker_main(worker_id, task_queue, tasks_total, results_queue, sheets_semap
                     if n_splits == 0:
                         continue  # 再分配不要、そのまま継続
                     split_size = redistribute_count // n_splits
+                    # カウンタ増分はループより先に一括で行う (sentinel が途中で誤発火しないように)
+                    with pending_tasks.get_lock():
+                        pending_tasks.value += n_splits
                     for si in range(n_splits):
                         s_start = redistribute_start + si * split_size
                         s_end = s_start + split_size if si < n_splits - 1 else file_end
@@ -444,8 +455,13 @@ def _worker_main(worker_id, task_queue, tasks_total, results_queue, sheets_semap
         task_p = total_processed - task_processed_before
         task_s = total_skipped - task_skipped_before
         task_e = total_errors - task_errors_before
+        # タスク完了をカウンタに反映 (sentinel がこの値を見てシャットダウン判定する)
+        with pending_tasks.get_lock():
+            pending_tasks.value -= 1
+            _remaining = pending_tasks.value
         print(f"[{task_end}] W{worker_id} 完了: {task_label}({task_part})"
-              f"  処理:{task_p} スキップ:{task_s} エラー:{task_e}", flush=True)
+              f"  処理:{task_p} スキップ:{task_s} エラー:{task_e}  残タスク:{_remaining}",
+              flush=True)
         completed_tasks.append(f"{task_label}({task_part})")
         tasks_done += 1
 
@@ -873,10 +889,14 @@ def main():
     results_queue = multiprocessing.Queue()
     processes = []
 
+    # 未完了タスク数のアトミックカウンタ (sentinel がこの値でシャットダウン判定)
+    # task_queue.empty() は IPC バッファリングで不正確 (旧実装で drive 7-14 未処理事故)
+    pending_tasks = multiprocessing.Value('i', len(tasks))
+
     for i in range(1, n_workers + 1):
         p = multiprocessing.Process(
             target=_worker,
-            args=(i, task_queue, len(tasks), results_queue, sheets_semaphore),
+            args=(i, task_queue, len(tasks), results_queue, sheets_semaphore, pending_tasks),
         )
         p.daemon = True
         p.start()
@@ -901,8 +921,14 @@ def main():
 
     # 全ワーカー idle 検知 → sentinel 投入スレッド
     def _sentinel_monitor():
-        """全ワーカーが idle（ready）かつキューが空になったら sentinel を投入して終了させる。
-        レース回避: 2回連続で全員 idle を確認してから終了判定。"""
+        """未完了タスクが 0 かつ全ワーカーが idle になったら sentinel を投入して終了させる。
+
+        task_queue.empty() は multiprocessing.Queue の IPC バッファリング特性上
+        不正確で、偽陽性でシャットダウンする不具合があった (drive 7-14 が未処理になった事例)。
+        代わりに pending_tasks アトミックカウンタ (0 で完了) を信用する。
+
+        レース回避: 2回連続で確認してから終了判定。
+        """
         import time as _t
         # 起動直後は全員 ready なので待つ（1秒刻みで shutdown チェック）
         for _ in range(30):
@@ -934,10 +960,11 @@ def main():
                 except Exception:
                     all_idle = False
                     break
-            if all_idle and worker_count >= n_workers and task_queue.empty():
+            pending = pending_tasks.value
+            if all_idle and worker_count >= n_workers and pending <= 0:
                 consecutive_idle += 1
                 if consecutive_idle >= 2:
-                    print("\n全ワーカー idle 検知 → 終了シグナル送信", flush=True)
+                    print(f"\n全ワーカー idle + 未完了タスク 0 → 終了シグナル送信", flush=True)
                     for _ in range(n_workers):
                         task_queue.put(None)
                     return
