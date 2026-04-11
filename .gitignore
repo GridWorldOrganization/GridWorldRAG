@@ -13,6 +13,8 @@ credentials.json
 .env
 config.env
 shared_drives_whitelist.txt
+shared_drives_whitelist.txt.bak
+.mcp.json
 
 # OS
 .DS_Store
