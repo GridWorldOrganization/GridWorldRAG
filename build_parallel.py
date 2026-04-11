@@ -768,17 +768,35 @@ def collect_file_lists(service):
 
 
 def print_file_list_summary(drive_file_lists):
-    """ファイル一覧のサマリを stdout に出力する。"""
+    """ファイル一覧のサマリを stdout に出力する。
+
+    ドライブごとに、何タスクに分割されるかも表示する
+    (TASK_SPLIT_THRESHOLD を超えたドライブは N parts に分割される)。
+    """
     total_fc = sum(
         sum(1 for f in files if f["mimeType"] != FOLDER_MIME)
         for _, _, files in drive_file_lists
     )
     total_dc = sum(len(files) for _, _, files in drive_file_lists) - total_fc
+    threshold = TASK_SPLIT_THRESHOLD
 
+    total_tasks = 0
     for i, (name, dtype, files) in enumerate(drive_file_lists, 1):
         fc, dc = _count_files_folders(files)
-        print(f"  ({i}/{len(drive_file_lists)}) {name} {fc + dc}アイテム ({fc}ファイル {dc}フォルダ)")
-    print(f"合計: {len(drive_file_lists)} ドライブ, {total_fc + total_dc}アイテム ({total_fc}ファイル {total_dc}フォルダ)")
+        items = fc + dc
+        # 分割ロジックを _split_into_tasks と一致させる:
+        # threshold 以下: 1 task / 超える場合: ceil(items / threshold) parts
+        n_parts = 1 if items <= threshold else (items + threshold - 1) // threshold
+        total_tasks += n_parts
+        parts_label = f"{n_parts} tasks" if n_parts > 1 else "1 task"
+        print(
+            f"  ({i}/{len(drive_file_lists)}) {name} "
+            f"{items}アイテム ({fc}ファイル {dc}フォルダ) → {parts_label}"
+        )
+    print(
+        f"合計: {len(drive_file_lists)} drives, {total_tasks} tasks, "
+        f"{total_fc + total_dc}アイテム ({total_fc}ファイル {total_dc}フォルダ)"
+    )
 
 
 # ---------------------------------------------------------------------------

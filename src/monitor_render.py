@@ -156,9 +156,27 @@ def render(worker_count, progress_dir, elapsed):
                     pass
         total_drive_count = len(all_drive_names) if all_drive_names else "?"
 
-    # pickle の total_tasks があればそっちを優先 (ワーカー集計はダブルカウントや取りこぼしが起きうる)
+    # pickle の total_tasks は初期値。ワークスティールで生成されたサブタスクを含むように
+    # 観測された distinct ラベル数と max を取る。
+    #   - all_completed: すでに完了した "label(part)" 群
+    #   - 各ワーカーが現在処理中の "drive(part)" 群
+    # これらを set で合わせて len を取り、pickle 初期値より大きければそちらを採用。
+    observed_tasks = set(all_completed)
+    for i in range(1, worker_count + 1):
+        wf = os.path.join(progress_dir, f"worker_{i}.json")
+        if os.path.exists(wf):
+            try:
+                wd = json.load(open(wf))
+                _drv = wd.get("drive", "")
+                _part = wd.get("part", "")
+                if _drv and _part:
+                    observed_tasks.add(f"{_drv}({_part})")
+            except (json.JSONDecodeError, IOError):
+                pass
     if total_tasks_from_pickle is not None:
-        total_tasks = total_tasks_from_pickle
+        total_tasks = max(total_tasks_from_pickle, len(observed_tasks))
+    else:
+        total_tasks = max(total_tasks, len(observed_tasks))
 
     # 全体進捗バー（アイテム数ベース）
     total_current = total_proc + total_skip + total_errors
