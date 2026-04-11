@@ -51,9 +51,16 @@ def _get_conn():
     return _conn
 
 
-# 埋め込みモデル（サーバー起動時にプリロード）
-from sentence_transformers import SentenceTransformer
-_model = SentenceTransformer(EMBEDDING_MODEL)
+# 埋め込みモデル（遅延ロード：MCP 起動タイムアウトを避けるため初回 search 時にロード）
+_model = None
+
+
+def _get_model():
+    global _model
+    if _model is None:
+        from sentence_transformers import SentenceTransformer
+        _model = SentenceTransformer(EMBEDDING_MODEL)
+    return _model
 
 
 def _contains_url(text):
@@ -99,7 +106,7 @@ def search(query: str, n_results: int = 5, owner: str = None) -> str:
         ).strip()
 
         if non_url_query:
-            embedding = _model.encode(non_url_query)
+            embedding = _get_model().encode(non_url_query)
             similar = search_similar(conn, embedding, n_results=n_results, owner=owner)
             results.extend([_format_search_result(r) for r in similar])
 
@@ -108,7 +115,7 @@ def search(query: str, n_results: int = 5, owner: str = None) -> str:
         return "該当するドキュメントが見つかりませんでした。"
 
     # 通常のセマンティック検索
-    embedding = _model.encode(query)
+    embedding = _get_model().encode(query)
     results = search_similar(conn, embedding, n_results=n_results, owner=owner)
 
     if not results:
