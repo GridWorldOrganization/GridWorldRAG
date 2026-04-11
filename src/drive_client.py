@@ -35,8 +35,19 @@ def set_rate_limit_callback(callback):
     global _rate_limit_callback
     _rate_limit_callback = callback
 
-def _api_call_with_retry(func, max_retries=5):  # max_retries=1 で失敗即諦め可
-    """Google API 呼び出しをレート制限対応のリトライ付きで実行する。"""
+def _api_call_with_retry(func, max_retries=6, base_delay=5):
+    """Google API 呼び出しをレート制限対応のリトライ付きで実行する。
+
+    Sheets API の per-minute クォータ (60req/min) 回復には最大 60 秒かかるため、
+    バックオフの累計待ち時間が 60 秒を超えるように設計する:
+        base_delay * (2^0 + 2^1 + ... + 2^5) = 5 * 63 = 315 秒 (理論最大)
+    実際は途中で成功するので平均的な待ち時間は数十秒〜1分程度。
+
+    Args:
+        func: 実行する関数（引数なしの callable）
+        max_retries: 最大試行回数（デフォルト 6）
+        base_delay: バックオフの基準遅延秒（デフォルト 5 秒）
+    """
     for attempt in range(max_retries):
         try:
             return func()
@@ -45,7 +56,8 @@ def _api_call_with_retry(func, max_retries=5):  # max_retries=1 で失敗即諦�
             if "rate limit" in error_str.lower() or "429" in error_str or "quota" in error_str.lower():
                 if _rate_limit_callback:
                     _rate_limit_callback(True)
-                wait = (2 ** attempt) + _random.uniform(0, 1)
+                # 指数バックオフ + ジッター: base_delay * 2^attempt + [0, base_delay) ランダム
+                wait = base_delay * (2 ** attempt) + _random.uniform(0, base_delay)
                 _time.sleep(wait)
                 if _rate_limit_callback:
                     _rate_limit_callback(False)
@@ -201,14 +213,14 @@ def extract_spreadsheet_sheets(file_id):
             continue
 
         try:
-            # シート値取得はmax_retries=1（429等で失敗したら即諦めてpartialとして保存）
+            # シート値取得: デフォルトの max_retries=6 でバックオフ累計 >60 秒までリトライ
+            # 60 秒経っても 429 が続くなら諦めて partial として保存
             sheet_range = f"'{name}'"
             values_response = _api_call_with_retry(
                 lambda sr=sheet_range: service.spreadsheets().values().get(
                     spreadsheetId=file_id,
                     range=sr,
                 ).execute(),
-                max_retries=1,
             )
             values = values_response.get("values", [])
             if not values:
