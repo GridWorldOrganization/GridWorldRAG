@@ -89,10 +89,11 @@ def render(worker_count, progress_dir, elapsed):
     lines.append("---")
 
     # 完了タスク数・ドライブ数を集計
+    # ワーカーIDは 1 始まり (worker_1.json, worker_2.json, ...) なので range(1, N+1)
     all_completed = []
     total_tasks_done = 0
     total_tasks = 0
-    for i in range(worker_count):
+    for i in range(1, worker_count + 1):
         wf = os.path.join(progress_dir, f"worker_{i}.json")
         if os.path.exists(wf):
             try:
@@ -118,25 +119,11 @@ def render(worker_count, progress_dir, elapsed):
         if len(parts) >= drive_total_parts.get(name, 999)
     )
 
-    # 総ドライブ数（完了+処理中）
-    all_drive_names = set()
-    for ct in all_completed:
-        m = re.match(r"^(.+)\(\d+/\d+\)$", ct)
-        if m:
-            all_drive_names.add(m.group(1))
-    for i in range(worker_count):
-        wf = os.path.join(progress_dir, f"worker_{i}.json")
-        if os.path.exists(wf):
-            try:
-                wd = json.load(open(wf))
-                if wd.get("drive", ""):
-                    all_drive_names.add(wd["drive"])
-            except (json.JSONDecodeError, IOError):
-                pass
-    total_drive_count = len(all_drive_names) if all_drive_names else "?"
-
-    # 全アイテム数を pickle から取得
+    # 総ドライブ数・総タスク数・総アイテム数を pickle から取得（信頼できる値）
+    # ワーカー JSON からの集計は完了/処理中のものしか拾えないため、pickle bundle を優先する
     total_items = "?"
+    total_drives_from_pickle = None
+    total_tasks_from_pickle = None
     task_data_pkl = "/tmp/gridworldrag_taskdata.pkl"
     if os.path.exists(task_data_pkl):
         try:
@@ -144,8 +131,34 @@ def render(worker_count, progress_dir, elapsed):
             with open(task_data_pkl, "rb") as pf:
                 bundle = pickle.load(pf)
             total_items = bundle.get("total_items", "?")
+            total_drives_from_pickle = bundle.get("total_drives")
+            total_tasks_from_pickle = bundle.get("total_tasks")
         except Exception:
             pass
+
+    # pickle に total_drives がない場合のフォールバック: 既知ドライブ名の数
+    if total_drives_from_pickle is not None:
+        total_drive_count = total_drives_from_pickle
+    else:
+        all_drive_names = set()
+        for ct in all_completed:
+            m = re.match(r"^(.+)\(\d+/\d+\)$", ct)
+            if m:
+                all_drive_names.add(m.group(1))
+        for i in range(1, worker_count + 1):
+            wf = os.path.join(progress_dir, f"worker_{i}.json")
+            if os.path.exists(wf):
+                try:
+                    wd = json.load(open(wf))
+                    if wd.get("drive", ""):
+                        all_drive_names.add(wd["drive"])
+                except (json.JSONDecodeError, IOError):
+                    pass
+        total_drive_count = len(all_drive_names) if all_drive_names else "?"
+
+    # pickle の total_tasks があればそっちを優先 (ワーカー集計はダブルカウントや取りこぼしが起きうる)
+    if total_tasks_from_pickle is not None:
+        total_tasks = total_tasks_from_pickle
 
     # 全体進捗バー（アイテム数ベース）
     total_current = total_proc + total_skip + total_errors

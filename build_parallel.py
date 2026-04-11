@@ -866,7 +866,12 @@ def main():
     # ファイルデータと全アイテム数を pickle に保存（ワーカー・モニターが読み込む）
     total_items = sum(len(t["files"]) for t in tasks)
     with open(TASK_DATA_PKL, "wb") as f:
-        pickle.dump({"files": task_file_data, "total_items": total_items}, f)
+        pickle.dump({
+            "files": task_file_data,
+            "total_items": total_items,
+            "total_drives": len(drive_file_lists),
+            "total_tasks": len(tasks),
+        }, f)
 
     # 各ドライブの 1/n → 全ドライブの 2/n → ... の順でキューに入れる
     max_parts = max((int(t["part"].split("/")[1]) for t in tasks), default=1)
