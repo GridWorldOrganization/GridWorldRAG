@@ -10,6 +10,16 @@ from pgvector.psycopg2 import register_vector
 from src.config import DB_NAME, DB_USER, DB_HOST, DB_PORT
 
 
+def _escape_like_literal(value):
+    """PostgreSQL LIKE のメタ文字 (\\ % _) をエスケープする。
+
+    Drive file ID は base64url で '_' を含みうるため、生の値を LIKE パターンに
+    埋め込むと '_' がワイルドカードとして解釈されて誤爆する。必ずこれを通すこと。
+    呼び出し側は LIKE ... ESCAPE '\\' を指定すること。
+    """
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def connect(db_name=None):
     """PostgreSQL に接続する。db_name を指定すると config の DB_NAME を上書きする。"""
     try:
@@ -28,8 +38,11 @@ def connect(db_name=None):
         sys.exit(1)
 
 
-def insert_chunks(conn, chunks_data):
-    """チャンクデータを DB に一括挿入する（UPSERT）。"""
+def insert_chunks(conn, chunks_data, commit=True):
+    """チャンクデータを DB に一括挿入する（UPSERT）。
+
+    commit=False の場合はトランザクションを閉じずに返す（呼び出し側で commit/rollback を管理）。
+    """
     cur = conn.cursor()
     try:
         for chunk in chunks_data:
@@ -76,28 +89,84 @@ def insert_chunks(conn, chunks_data):
                     chunk.get("folder_path", ""),
                 ),
             )
-        conn.commit()
+        if commit:
+            conn.commit()
     except Exception:
-        conn.rollback()
+        if commit:
+            conn.rollback()
         raise
     finally:
         cur.close()
 
 
-def delete_by_file_id(conn, drive_file_id_prefix):
-    """指定した drive_file_id プレフィックスに一致するチャンクを削除する。"""
+def delete_by_file_id(conn, drive_file_id_prefix, commit=True):
+    """指定した drive_file_id プレフィックスに一致するチャンクを削除する。
+
+    Drive file ID は '_' を含みうるため LIKE メタ文字をエスケープする。
+    commit=False の場合は呼び出し側でトランザクションを管理する。
+    """
     cur = conn.cursor()
     try:
+        pattern = _escape_like_literal(drive_file_id_prefix) + "%"
         cur.execute(
-            "DELETE FROM documents WHERE drive_file_id LIKE %s",
-            (f"{drive_file_id_prefix}%",),
+            r"DELETE FROM documents WHERE drive_file_id LIKE %s ESCAPE '\'",
+            (pattern,),
         )
         deleted = cur.rowcount
-        conn.commit()
+        if commit:
+            conn.commit()
         return deleted
+    except Exception:
+        if commit:
+            conn.rollback()
+        raise
+    finally:
+        cur.close()
+
+
+def upsert_file_chunks(conn, file_id, chunks):
+    """1ファイル分のチャンクをアトミックに置換する。
+
+    既存チャンクを削除し新チャンクを挿入する操作を単一トランザクションで実行する。
+    途中で失敗した場合は rollback し、DB 状態は変更されない。
+
+    Returns:
+        "updated": 既存チャンクを上書きした
+        "added":   新規ファイルを追加した
+    """
+    # 既存チェック（読み取りのみ、commit 不要）
+    cur = conn.cursor()
+    try:
+        pattern = _escape_like_literal(file_id) + "%"
+        cur.execute(
+            r"SELECT 1 FROM documents WHERE drive_file_id LIKE %s ESCAPE '\' LIMIT 1",
+            (pattern,),
+        )
+        existed = cur.fetchone() is not None
+    finally:
+        cur.close()
+
+    try:
+        delete_by_file_id(conn, file_id, commit=False)
+        insert_chunks(conn, chunks, commit=False)
+        conn.commit()
     except Exception:
         conn.rollback()
         raise
+
+    return "updated" if existed else "added"
+
+
+def file_exists(conn, file_id):
+    """file_id のチャンクが DB に 1 件でも存在するかを返す。"""
+    cur = conn.cursor()
+    try:
+        pattern = _escape_like_literal(file_id) + "%"
+        cur.execute(
+            r"SELECT 1 FROM documents WHERE drive_file_id LIKE %s ESCAPE '\' LIMIT 1",
+            (pattern,),
+        )
+        return cur.fetchone() is not None
     finally:
         cur.close()
 
@@ -167,18 +236,20 @@ def lookup_by_url(conn, url):
     cur = conn.cursor()
     try:
         # file_id で始まる全チャンクを取得（_chunk_ と _sheet_ の両方に対応）
+        # LIKE メタ文字をエスケープしてから '_%' を付けて「literal underscore + anything」を表す
+        pattern = _escape_like_literal(file_id) + r"\_%"
         cur.execute(
-            """
+            r"""
             SELECT title, content, chunk_index, owner, source_url,
                    file_type, drive_modified_at, sheet_gid, sheet_name
             FROM documents
-            WHERE drive_file_id LIKE %s
+            WHERE drive_file_id LIKE %s ESCAPE '\'
             ORDER BY
                 CASE WHEN %s IS NOT NULL AND sheet_gid = %s THEN 0 ELSE 1 END,
                 sheet_gid NULLS FIRST,
                 chunk_index
             """,
-            (f"{file_id}_%", target_gid, target_gid),
+            (pattern, target_gid, target_gid),
         )
         rows = cur.fetchall()
     finally:

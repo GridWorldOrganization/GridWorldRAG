@@ -133,16 +133,10 @@ def _process_file(file_info, model, splitter, service, batch, sheets_semaphore=N
 
     # resume: DB に既に存在するファイルはスキップ（再実行時の高速化）
     if conn is not None:
-        file_id = file_info["id"]
+        from src.db import file_exists
         try:
-            cur = conn.cursor()
-            try:
-                cur.execute("SELECT 1 FROM documents WHERE drive_file_id LIKE %s LIMIT 1",
-                            (f"{file_id}_%",))
-                if cur.fetchone():
-                    return -1, 1, 0, 0  # -1 = resume スキップ（通常の skip は 0）
-            finally:
-                cur.close()
+            if file_exists(conn, file_info["id"]):
+                return -1, 1, 0, 0  # -1 = resume スキップ（通常の skip は 0）
         except Exception:
             pass  # DB チェック失敗時は通常処理に fallback
 
