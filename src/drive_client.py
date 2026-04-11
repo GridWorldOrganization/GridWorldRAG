@@ -542,23 +542,51 @@ def resolve_folder_path_api(service, file_info, cache=None):
     return " / ".join(path_parts)
 
 
-def get_changes_start_token(service):
-    """Changes API の開始トークンを取得する。"""
-    response = service.changes().getStartPageToken().execute()
+# Changes API の fields 文字列は drive_id の有無に関わらず統一する
+_CHANGES_FIELDS = (
+    "nextPageToken, newStartPageToken, "
+    "changes(fileId, removed, file("
+    "id, name, mimeType, modifiedTime, trashed, owners, "
+    "webViewLink, driveId, parents, "
+    "permissions(emailAddress, role, type, displayName)))"
+)
+
+
+def get_changes_start_token(service, drive_id=None):
+    """Changes API の開始トークンを取得する。
+
+    drive_id を指定すると特定の共有ドライブのトークンを取得する。
+    """
+    kwargs = {"supportsAllDrives": True}
+    if drive_id:
+        kwargs["driveId"] = drive_id
+    response = _api_call_with_retry(
+        lambda: service.changes().getStartPageToken(**kwargs).execute()
+    )
     return response["startPageToken"]
 
 
-def list_changes(service, page_token):
-    """前回トークン以降の変更ファイルを取得する。"""
+def list_changes(service, page_token, drive_id=None):
+    """前回トークン以降の変更ファイルを取得する。
+
+    drive_id を指定すると特定の共有ドライブに限定した変更のみ返す。
+    """
     changes = []
     while True:
-        response = service.changes().list(
-            pageToken=page_token,
-            spaces="drive",
-            includeItemsFromAllDrives=True,
-            supportsAllDrives=True,
-            fields="nextPageToken, newStartPageToken, changes(fileId, removed, file(id, name, mimeType, modifiedTime, owners, webViewLink, driveId, parents))",
-        ).execute()
+        kwargs = {
+            "pageToken": page_token,
+            "includeItemsFromAllDrives": True,
+            "supportsAllDrives": True,
+            "fields": _CHANGES_FIELDS,
+        }
+        if drive_id:
+            kwargs["driveId"] = drive_id
+        else:
+            kwargs["spaces"] = "drive"
+
+        response = _api_call_with_retry(
+            lambda: service.changes().list(**kwargs).execute()
+        )
 
         changes.extend(response.get("changes", []))
 
@@ -567,3 +595,5 @@ def list_changes(service, page_token):
             return changes, new_token
 
         page_token = response["nextPageToken"]
+
+
