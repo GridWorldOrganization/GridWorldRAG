@@ -132,6 +132,20 @@ conn.close()
 
 Google API（特に Sheets API）には1分あたり60リクエストの制限がある。複数ワーカーが同時にスプレッドシートを処理すると、この制限に到達することがある。レート制限に到達するとワーカーは自動的にバックオフ（数秒〜十数秒待機）し、制限解除後に処理を再開する。処理が失敗したりデータが欠落することはない。
 
+## 差分同期（初回ビルド後）
+
+初回のフルビルドが終わったら、`sync_rotate.py` を 5 分間隔で自動実行して Drive の変更を差分追従する。
+
+```bash
+# 初回: 全ドライブの Changes API トークンを初期化（必須）
+./run_sync_rotate.sh --db 0 --init
+
+# 手動で1回実行
+./run_sync_rotate.sh --db 0
+```
+
+launchd (LaunchAgent) への登録手順と耐障害性の詳細は `README.md` の「差分同期の自動化（Mac版）」セクション参照。
+
 ## トラブルシューティング
 
 | 症状 | 対処 |
@@ -141,3 +155,5 @@ Google API（特に Sheets API）には1分あたり60リクエストの制限�
 | `torch` インストール失敗 | ARM 版 Python (`/opt/homebrew/opt/python@3.12/bin/python3.12`) で venv を再作成 |
 | Google 認証エラー | `token.pickle` を削除して再実行 |
 | 共有ドライブが取得できない | `shared_drives_whitelist.txt` にドライブ ID があるか確認 |
+| `sync_rotate.py` が `exit 2` で止まる | PG データディレクトリの空き容量が 1GB 未満。`df -h /opt/homebrew/var/postgresql@17` で確認 |
+| `trushed` のない変更が `sync_rotate` で拾えない | `--init` でトークンを再初期化。トークン発行時点以前の変更は Changes API が返さないため |

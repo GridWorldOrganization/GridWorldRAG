@@ -31,33 +31,45 @@ export PATH="/opt/homebrew/opt/postgresql@17/bin:$PATH"
 
 ```
 GridWorldRAG/
-├── build_parallel.py      # メイン：並列インデックスビルド（タスクキュー方式）
-├── build_single.py        # シングルプロセス版（デバッグ用）
-├── calc_workers.py        # ワーカー数自動計算
-├── ocr_scan.py            # OCR スキャンツール
+├── build_parallel.py       # メイン：並列インデックスビルド（タスクキュー方式）
+├── build_single.py         # シングルプロセス版（デバッグ用）
+├── sync_rotate.py          # ローテーション型差分同期（5分間隔 launchd 実行）
+├── calc_workers.py         # ワーカー数自動計算
+├── ocr_scan.py             # OCR スキャンツール
 ├── src/
-│   ├── config.py          # config.env 読み込み＋設定値管理
-│   ├── db.py              # PostgreSQL + pgvector 操作（UPSERT、検索）
-│   ├── drive_client.py    # Google Drive API クライアント（認証、テキスト抽出）
-│   ├── indexer.py         # チャンク作成、パーミッション抽出等のヘルパー
-│   └── monitor_render.py  # モニター画面のレンダリング（Python）
+│   ├── config.py           # config.env 読み込み＋設定値管理
+│   ├── db.py               # PostgreSQL + pgvector 操作（UPSERT、検索、upsert_file_chunks）
+│   ├── drive_client.py     # Google Drive API クライアント（認証、テキスト抽出、Changes API）
+│   ├── indexer.py          # チャンク作成、パーミッション抽出等のヘルパー
+│   └── monitor_render.py   # モニター画面のレンダリング（Python）
 ├── gridworld-rag-mcp/
-│   ├── server.py          # MCP サーバー（search, lookup, stats）
-│   └── run_mcp.sh         # MCP 起動スクリプト
-├── run_build.sh           # 2フェーズ実行ランチャー
-├── run_build_single.sh    # シングルプロセス版ランチャー
-├── run_calc_workers.sh    # ワーカー数計算ランチャー
-├── monitor.sh             # リアルタイムモニター（tput sc/rc）
-├── setup.sh               # 環境セットアップ
-├── schema.sql             # DBスキーマ（ALTER TABLE含む）
-├── config.env             # 設定ファイル（Git管理外）
-├── config.env.example     # 設定ファイルテンプレート
-├── shared_drives_whitelist.txt  # 対象共有ドライブID一覧
+│   ├── server.py           # MCP サーバー（search, lookup, stats, folder_tree, recent_changes）
+│   └── run_mcp.sh          # MCP 起動スクリプト
+├── launchd/
+│   └── co.gridworld.gridworldrag.sync.plist  # LaunchAgent 定義（5分間隔）
+├── tests/                  # 単体テスト（DB・Drive API モックなし、全30件）
+│   ├── test_db_escape.py
+│   ├── test_sync_rotate_lock.py
+│   ├── test_drive_fields.py
+│   ├── test_disk_check.py
+│   ├── test_log_rotation.py
+│   └── test_retry_queue.py
+├── run_build.sh            # 2フェーズ実行ランチャー
+├── run_build_single.sh     # シングルプロセス版ランチャー
+├── run_sync_rotate.sh      # sync_rotate 起動スクリプト
+├── run_calc_workers.sh     # ワーカー数計算ランチャー
+├── monitor.sh              # リアルタイムモニター（tput sc/rc）
+├── setup.sh                # 環境セットアップ
+├── schema.sql              # DBスキーマ（ALTER TABLE含む）
+├── config.env              # 設定ファイル（Git管理外、secrets リポの symlink）
+├── config.env.example      # 設定ファイルテンプレート
+├── shared_drives_whitelist.txt  # 対象共有ドライブID一覧（symlink）
 ├── docs/
-│   ├── technical.md       # 技術リファレンス
-│   └── vectordb.md        # ベクトルDB関連メモ
-├── QUICKSTART.md          # クイックスタートガイド
-└── README.md              # プロジェクト概要
+│   ├── technical.md        # 技術リファレンス
+│   └── vectordb.md         # ベクトルDB関連メモ
+├── QUICKSTART.md           # クイックスタートガイド
+├── CHANGELOG.md            # 変更履歴
+└── README.md               # プロジェクト概要
 ```
 
 ## アーキテクチャの要点
@@ -90,10 +102,14 @@ GridWorldRAG/
 - UPSERT でべき等操作
 - `lookup_by_url()`: gid パラメータ対応（スプレッドシートのシート特定）
 - NUL 文字（`\x00`）は `insert_chunks()` で除去（PDF テキストに含まれることがある）
-- カラム: title, content, embedding, owner, source_url, file_type, modified_at, file_id, sheet_gid, sheet_name, permissions(JSONB)
+- カラム: drive_file_id, title, content, chunk_index, owner, source_url, file_type, drive_modified_at, embedding, sheet_gid, sheet_name, permissions(JSONB), partial_content, folder_path, created_at
 - **全関数でカーソルを `try/finally` で保護**（例外時もリーク防止）
 - **書き込み系は例外時に `rollback()`**（未コミットトランザクション防止）
 - `psycopg2`（ソースビルド版）を使用。`psycopg2-binary`（バンドル版）は libssl 重複でクラッシュするため使わない
+- **LIKE エスケープ**: `_escape_like_literal()` で `_` `%` `\` をエスケープ。Drive file ID が `_` を含むため、全 LIKE クエリに `ESCAPE '\'` を必須
+- `upsert_file_chunks(conn, file_id, chunks)`: 1 ファイル分の delete + insert を単一トランザクションで実行、`"added"|"updated"` を返す
+- `file_exists(conn, file_id)`: チャンク存在チェック（build_parallel.py の resume 判定に使用）
+- `insert_chunks` と `delete_by_file_id` に `commit=False` フラグあり（upsert_file_chunks での合成用）
 
 ### モニター（monitor.sh + monitor_render.py）
 
@@ -103,9 +119,9 @@ GridWorldRAG/
 
 ### MCP サーバー（gridworld-rag-mcp/server.py）
 
-- FastMCP ベース、3ツール: `search`（セマンティック検索）, `lookup`（URL直接取得）, `stats`（統計）
+- FastMCP ベース、5ツール: `search`（セマンティック検索）, `lookup`（URL直接取得）, `stats`（統計）, `folder_tree`（DB からフォルダツリー再構築）, `recent_changes`（直近の差分同期結果）
 - `search` はクエリ内の URL を自動検出し、URL lookup + セマンティック検索を併用
-- 埋め込みモデルは遅延ロード
+- 埋め込みモデルは遅延ロード（初回 search 時にロード、FastMCP tool 呼び出しは serialize されるためスレッド安全性は問題なし）
 - プロジェクトスコープで登録済み: `claude mcp add gridworld-rag-mcp --scope project`
 
 ### ローテーション型差分同期（sync_rotate.py）
@@ -116,7 +132,16 @@ GridWorldRAG/
 - 埋め込みモデルは変更発生時のみ遅延ロード
 - `/tmp/gridworldrag_rotate.lock` で多重起動防止（20分 stale）
 - launchd の LaunchAgent（`launchd/co.gridworld.gridworldrag.sync.plist`）から5分間隔実行
-- sync.py（旧実装、グローバル Changes API）は残しているが使わない方針
+- sync.py（旧実装）は削除済み。`drive_client.list_changes(service, token, drive_id=None)` に統合
+
+### 耐障害性（sync_rotate.py）
+
+- **ログローテーション**: `~/Library/Logs/gridworldrag/sync_rotate.log` へ `logging.handlers.RotatingFileHandler`（5MB × 3世代、最大15MB）で書き込み。全 `print()` は logger 呼び出しに置換済み
+- **空き容量プリフライトチェック**: `shutil.disk_usage()` で PG データディレクトリ `/opt/homebrew/var/postgresql@17` の空き容量を測定、`MIN_FREE_BYTES=1GB` 未満なら abort マーカーを `sync_state` に記録して `exit(2)`（トークンは進めない）
+- **DB ディスク満杯検出**: `_is_disk_full_error()` が `psycopg2.errors.DiskFull` および "no space" / "disk full" / "out of space" 等のメッセージ文字列を検出、`DiskFullHalt` 例外で処理ループを halt
+- **failed_files 再試行キュー**: `sync_state.failed_files` に JSON で失敗ファイルID + drive_id を積み、次回実行時に `_retry_failed_files()` が `files().get()` で再取得 → upsert。トークン前進が安全になる（永久データロス防止）
+- **アトミック upsert**: `upsert_file_chunks()` が delete + insert を単一トランザクションで実行、途中失敗時も整合性を保つ
+- **last_sync_result 拡張フィールド**: `retry_recovered`, `retry_pending`, `disk_full`, `aborted`, `reason`（MCP の recent_changes で可視化）
 
 ## 開発で踏んだ落とし穴
 
@@ -158,6 +183,12 @@ GridWorldRAG/
 
 ## GitHub Issues（既知の課題）
 
-- #1: DB サイズ見積もり
-- #2: ファイル単位の進捗表示
-- #3: Enter キー表示バグ
+- #1: ファイル一覧取得後に DB 容量の推計を表示
+- #2: 巨大ファイル処理中のファイル内進捗表示
+- #3: モニター表示中に Enter を押すとヘッダ行が重複する
+- #4: PDF 処理タイムアウト：壊れた PDF が長時間ブロックする問題
+- #5: Sheets API リトライ設定を config.env で変更可能にする
+- #6: PyTorch MPS backend crash during model.encode() on Apple Silicon
+- #7: sync_rotate: retry_pending 閾値超えで Telegram 通知
+- #8: sync_rotate: disk_full 履歴の集計とトレンド分析
+- #9: sync_rotate: failed_files の TTL と諦めロジック

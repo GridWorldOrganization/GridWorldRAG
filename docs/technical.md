@@ -136,10 +136,15 @@ while True:
 各ファイル処理の前に DB に既存データがあるかチェック:
 
 ```python
-cur.execute("SELECT 1 FROM documents WHERE drive_file_id LIKE %s LIMIT 1", (f"{file_id}_%",))
-if cur.fetchone():
+from src.db import file_exists
+
+if file_exists(conn, file_info["id"]):
     return -1, 1, 0, 0  # resumeSkip（ログに resumeSkip と表示）
 ```
+
+内部的には `drive_file_id LIKE 'file_id%' ESCAPE '\'`（`_escape_like_literal` で `_` を
+エスケープ済み）。Drive file ID に含まれる `_` が LIKE のワイルドカードとして誤解釈される
+バグがあり、`src/db.py` の helper 経由でのみアクセスする設計に統一した（v0.1.2）。
 
 - btree インデックスのプレフィックス一致で高速
 - 再実行時に処理済みファイルを瞬時スキップ

@@ -30,13 +30,27 @@ cp config.env.example config.env
 ```bash
 # ローカルで事前チェック（CI と同じ設定）
 pip install flake8 pyflakes
-flake8 src/ gridworld-rag-mcp/ --max-line-length=120 \
+flake8 src/ gridworld-rag-mcp/ tests/ --max-line-length=120 \
   --extend-ignore=E501,W503,E221,E402,E302,E305,E401 --exclude=.venv
-pyflakes build_parallel.py src/ gridworld-rag-mcp/ sync.py
+pyflakes build_parallel.py src/ gridworld-rag-mcp/ sync_rotate.py tests/
 ```
 
 - `flake8`: スタイルチェック（`.github/workflows/lint.yml` で定義）
 - `pyflakes`: 未使用 import・未定義変数の検出（CI 外だがローカルで必ず実行）
+
+## Tests
+
+単体テストは `tests/` 配下、外部依存なしの純ロジック系のみ。DB や Drive API のモックは最小限。
+
+```bash
+# 全テスト実行（~1秒で全 30 件）
+for t in tests/test_*.py; do .venv/bin/python "$t"; done
+```
+
+テストの追加ポリシー:
+- 外部リソース（Drive API, PostgreSQL）にアクセスしないもののみ
+- LIKE エスケープ・lockfile・Drive API `fields` 文字列の構文チェック等、単一関数の挙動を直接検証
+- 統合テストは追加しない（実環境で smoke test する方針）
 
 ## Code Style
 

@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.1.2] - 2026-04-11
+
+### Fixed
+
+- **SQL LIKE wildcard bug** — Drive file IDs contain `_` which is a LIKE metacharacter in PostgreSQL, causing `delete_by_file_id` and `lookup_by_url` to silently match unrelated rows. Added `_escape_like_literal()` helper and `ESCAPE '\'` to every LIKE query. Verified empirically: `'ABXCD' LIKE 'AB_CD%'` returns TRUE.
+- **Non-atomic delete+insert** — `upsert_file_chunks(conn, file_id, chunks)` now wraps the delete + insert of a single file in one transaction, rolling back cleanly on failure.
+- **Daemon thread SSL anti-pattern** — deleted the old `sync.py` which still used `threading.Thread(daemon=True)` for per-file timeout (documented as forbidden in CLAUDE.md). `sync_rotate.py` correctly uses httplib2 socket timeouts.
+
+### Added
+
+- **Rotation-based differential sync** (`sync_rotate.py`) — iterates each shared drive independently using drive-scoped Changes API tokens. Fast path: 22 drives × 1 Changes API call each, ~7 seconds when no changes. Embedding model loads lazily only when changes are detected.
+- **launchd LaunchAgent** (`launchd/co.gridworld.gridworldrag.sync.plist`) — 5-minute interval with sleep-aware `RunAtLoad` and `Nice=5`. Install via `launchctl load ~/Library/LaunchAgents/...`.
+- **Log rotation** — `sync_rotate.py` writes to `~/Library/Logs/gridworldrag/sync_rotate.log` via `logging.handlers.RotatingFileHandler` (5MB × 3 backups, ~15MB total). Replaces all `print()` calls with structured logger output.
+- **Disk space pre-flight check** — `shutil.disk_usage()` on the PostgreSQL data directory with a 1GB threshold. Insufficient space aborts the run with exit(2) without advancing any Changes API token, and records a `disk_full_preflight` marker.
+- **DiskFull exception handling** — `_is_disk_full_error()` detects `psycopg2.errors.DiskFull` plus "no space"/"disk full"/"out of space" message strings. Raises `DiskFullHalt` to halt the drive loop cleanly.
+- **Failed-files retry queue** — files that error during a run enter `sync_state.failed_files` as JSON, and are retried first on the next run via `files().get()` before the normal per-drive loop. Token advancement is now safe because errored files cannot be silently skipped.
+- **First test suite** (`tests/`) — 30 unit tests across 6 files covering LIKE escape, lockfile behavior, Drive API field string validity, disk space check, log rotation, and retry queue helpers. No DB or Drive API mocking required — all pure logic.
+- **`src/db.py` new helpers** — `upsert_file_chunks(conn, file_id, chunks)`, `file_exists(conn, file_id)`, `_escape_like_literal(value)`. `insert_chunks` and `delete_by_file_id` now accept `commit=False` for composition inside `upsert_file_chunks`.
+- **`src/drive_client.py` unified Changes API** — `list_changes(service, token, drive_id=None)` replaces the duplicated `list_changes` + `list_changes_for_drive` pair. Field string now includes `trashed` and `permissions(...)` consistently.
+- **Lazy MCP embedding model load** (`gridworld-rag-mcp/server.py`) — SentenceTransformer now loads on first `search()` instead of at startup, avoiding MCP handshake timeout.
+- **`GridWorldRAG-secrets` sibling repo workflow** — private companion repository for `config.env` and `shared_drives_whitelist.txt`, connected via symlinks. Documented under "内部運用" in README.
+- **Project `CLAUDE.md`** — architecture notes, gotchas, and resilience docs for sync_rotate. Added to repo root.
+
+### Removed
+
+- `sync.py` — replaced by `sync_rotate.py` (per-drive rotation with safer error handling)
+- `run_sync.sh` — replaced by `run_sync_rotate.sh`
+- Legacy `list_changes_for_drive` / `get_changes_start_token_for_drive` in favor of unified `drive_id=None` parameter
+
 ## [0.1.1] - 2026-03-31
 
 ### Fixed

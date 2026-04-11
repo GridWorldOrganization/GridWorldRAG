@@ -133,14 +133,14 @@ GridWorldRAG/
 ├── setup.sh                       ← 初回セットアップ
 ├── build_parallel.py              ← 全件インデックス構築（並列・推奨）
 ├── build_single.py                ← 全件インデックス構築（シングル）
-├── sync.py                        ← 差分同期（Google Drive Changes API）
+├── sync_rotate.py                 ← ローテーション型差分同期（5分間隔想定）
 ├── calc_workers.py                ← 最適並列ワーカー数の算出
 ├── ocr_scan.py                    ← 画像OCR後追いツール
 ├── export_db.sh                   ← DBダンプ出力
 ├── import_db.sh                   ← DBダンプ取り込み
 ├── run_build.sh                   ← 並列ビルド起動 + モニター
 ├── run_build_single.sh            ← シングルプロセスビルド
-├── run_sync.sh                    ← 差分同期実行
+├── run_sync_rotate.sh             ← 差分同期実行（launchd から呼ぶ）
 ├── run_calc_workers.sh            ← 最適並列数の計算
 ├── monitor.sh                     ← リアルタイムモニター
 ├── list_dbs.sh                    ← DB一覧・サイズ表示
@@ -153,6 +153,15 @@ GridWorldRAG/
 ├── gridworld-rag-mcp/
 │   ├── server.py                  ← MCP サーバー（search / lookup / stats 等）
 │   └── run_mcp.sh                 ← MCP サーバー起動スクリプト
+├── launchd/
+│   └── co.gridworld.gridworldrag.sync.plist  ← LaunchAgent テンプレート
+├── tests/
+│   ├── test_db_escape.py          ← LIKE エスケープ
+│   ├── test_sync_rotate_lock.py   ← lockfile 挙動
+│   ├── test_drive_fields.py       ← Drive API fields 文字列検証
+│   ├── test_disk_check.py         ← 空き容量チェック
+│   ├── test_log_rotation.py       ← RotatingFileHandler
+│   └── test_retry_queue.py        ← 再試行キュー + DiskFull検出
 └── docs/
     ├── technical.md               ← 技術リファレンス
     └── vectordb.md                ← ベクトルDB設計メモ
@@ -181,21 +190,28 @@ text = extract_text(service, files[0])
 | `attach_folder_paths(files, drive_name)` | ファイルリストからフォルダパスを解決（追加 API コールなし） |
 | `extract_text(service, file_info)` | ファイルからテキストを抽出（Docs/PDF/画像OCR 対応） |
 | `extract_spreadsheet_sheets(file_id)` | スプレッドシートの全シートをシート別に取得 |
-| `get_changes_start_token(service)` | Changes API の開始トークンを取得 |
-| `list_changes(service, page_token)` | 前回以降の変更ファイルを取得 |
+| `get_changes_start_token(service, drive_id=None)` | Changes API の開始トークンを取得（`drive_id` 指定で特定の共有ドライブ用） |
+| `list_changes(service, page_token, drive_id=None)` | 前回以降の変更ファイルを取得（`drive_id` 指定で特定ドライブに限定） |
 
 ### `src/db.py`
 
 PostgreSQL + pgvector の操作を担当。
 
 ```python
-from src.db import connect, insert_chunks, search_similar, lookup_by_url
+from src.db import connect, insert_chunks, search_similar, lookup_by_url, upsert_file_chunks, file_exists
 
 conn = connect()
-insert_chunks(conn, chunks_data)
+insert_chunks(conn, chunks_data)                       # 一括 UPSERT
+status = upsert_file_chunks(conn, file_id, chunks)     # 1 ファイル分をアトミックに置換（"added"|"updated"）
+exists = file_exists(conn, file_id)                    # チャンク存在チェック
 results = search_similar(conn, query_embedding, n_results=5)
 doc = lookup_by_url(conn, "https://docs.google.com/spreadsheets/d/.../edit?gid=123")
 ```
+
+内部ヘルパー `_escape_like_literal(value)` は Drive file ID に含まれる `_` を
+PostgreSQL LIKE のメタ文字から守るためのエスケープ関数。`delete_by_file_id` /
+`lookup_by_url` / `file_exists` / `upsert_file_chunks` は全てこの helper 経由で
+`LIKE ... ESCAPE '\'` を使う。
 
 ### `gridworld-rag-mcp/server.py`
 
@@ -207,7 +223,7 @@ Claude Code 用の MCP サーバー。FastMCP ベースで 5 ツールを提供�
 | `lookup` | Google Drive/Docs の URL からファイル内容を直接取得 |
 | `stats` | インデックス DB の統計（総件数・ファイルタイプ・オーナー別集計） |
 | `folder_tree` | DB からフォルダ構成ツリーを再構築して表示 |
-| `recent_changes` | 直近の差分同期（`sync.py`）で追加・更新・削除されたファイル一覧 |
+| `recent_changes` | 直近の差分同期（`sync_rotate.py`）で追加・更新・削除されたファイル一覧 |
 
 ```bash
 # Claude Code への登録
@@ -232,7 +248,7 @@ claude mcp add gridworld-rag-mcp -- python gridworld-rag-mcp/server.py --db 1
 | テキスト分割 | `langchain-text-splitters` |
 | PDF 抽出 | `pypdf` |
 | 画像 OCR | `pytesseract` + Tesseract 5.5 (jpn+eng) |
-| Claude Code 連携 | MCP サーバー（予定） |
+| Claude Code 連携 | MCP サーバー（gridworld-rag-mcp、`search` / `lookup` / `stats` / `folder_tree` / `recent_changes`） |
 
 ## ファイル種別ごとの対応状況
 
@@ -340,7 +356,7 @@ claude mcp add gridworld-rag-mcp -- python gridworld-rag-mcp/server.py
 claude mcp add gridworld-rag-mcp -- python gridworld-rag-mcp/server.py --db 0
 ```
 
-> **注意**: インポート先では `build_parallel.py` や `sync.py` は不要。MCPサーバーのみ動かせばよい。
+> **注意**: インポート先では `build_parallel.py` や `sync_rotate.py` は不要。MCPサーバーのみ動かせばよい。
 
 ## 差分同期の自動化（Mac 版）
 
@@ -352,6 +368,14 @@ claude mcp add gridworld-rag-mcp -- python gridworld-rag-mcp/server.py --db 0
 - 変更ゼロの状態で 22 ドライブを一巡しても 7 秒程度
 - 埋め込みモデル（SentenceTransformer）は変更が1件でも見つかった時にだけロード（遅延ロード）
 - `/tmp/gridworldrag_rotate.lock` で多重起動防止
+
+### 耐障害性
+
+- **ログローテーション**: `~/Library/Logs/gridworldrag/sync_rotate.log` に書き込み、Python 標準の `RotatingFileHandler` で 5MB × 3 世代自動管理（最大 15MB）
+- **空き容量プリフライトチェック**: PostgreSQL データディレクトリの空き容量が `MIN_FREE_BYTES` (= 1GB) を切ると処理を中止しトークンを進めない
+- **DB ディスク満杯検出**: `psycopg2.errors.DiskFull` または "no space" 等のメッセージを検出すると `DiskFullHalt` 例外で処理を中断し、`last_sync_result.disk_full=true` を記録
+- **再試行キュー**: 失敗したファイルは `sync_state.failed_files` に積まれ、次回実行時に最優先で再処理。トークン前進が安全になり永久データロスを防ぐ
+- **アトミック upsert**: `src/db.py` の `upsert_file_chunks` が 1 ファイル分の delete + insert を単一トランザクションで実行し、途中失敗時も整合性を保つ
 
 ### 使い方（手動）
 
@@ -393,8 +417,12 @@ launchctl start co.gridworld.gridworldrag.sync
 
 ログ確認:
 ```bash
-tail -f /tmp/gridworldrag_sync.log   # 標準出力
-tail -f /tmp/gridworldrag_sync.err   # 標準エラー
+# プライマリ: RotatingFileHandler のログ (5MB × 3世代)
+tail -f ~/Library/Logs/gridworldrag/sync_rotate.log
+
+# launchd の標準出力・エラー (起動直後の bootstrap エラーはこちら)
+tail -f /tmp/gridworldrag_sync.log
+tail -f /tmp/gridworldrag_sync.err
 ```
 
 ### 動作仕様
@@ -414,6 +442,27 @@ tail -f /tmp/gridworldrag_sync.err   # 標準エラー
 - **「前回実行中 skip」と毎回出る**: `/tmp/gridworldrag_rotate.lock` を確認。20分以上古ければ自動解除されるが、即時復旧したいなら手動で `rm`
 - **変更があるはずなのに反応しない**: Changes API はトークン発行時点以降の変更しか拾わない。過去の未反映ファイルは拾えない → フル再ビルドが必要
 - **PostgreSQL エラー**: `plist` の `EnvironmentVariables.PATH` に ARM 版 `/opt/homebrew/opt/postgresql@17/bin` が入っているか確認
+- **`exit 2` で毎回落ちる**: `shutil.disk_usage` がしきい値 (1GB) 未満を検出している可能性。`df -h /opt/homebrew/var/postgresql@17` で確認
+- **`retry_pending` が減らない**: 永続的にエラーを出すファイルが失敗キューに溜まっている。`recent_changes` MCP ツールで確認し、必要なら `psql -d gridworldrag_3 -c "DELETE FROM sync_state WHERE key='failed_files'"` でリセット
+
+## テスト
+
+純ロジック系の単体テストを `tests/` 配下に配置（DB や Drive API のモック不要）。
+
+```bash
+# 全テスト実行
+for t in tests/test_*.py; do .venv/bin/python "$t"; done
+
+# 個別実行
+.venv/bin/python tests/test_db_escape.py       # LIKE エスケープ helper
+.venv/bin/python tests/test_sync_rotate_lock.py  # lockfile 挙動
+.venv/bin/python tests/test_drive_fields.py   # Drive API fields 文字列検証
+.venv/bin/python tests/test_disk_check.py     # 空き容量チェック
+.venv/bin/python tests/test_log_rotation.py   # RotatingFileHandler
+.venv/bin/python tests/test_retry_queue.py    # 再試行キュー + DiskFull検出
+```
+
+テスト総数: 30 件 (6 ファイル)。外部依存なしで ~1 秒で全件通る。
 
 ## 内部運用: secrets の管理（GridWorldOrganization メンバー向け）
 
