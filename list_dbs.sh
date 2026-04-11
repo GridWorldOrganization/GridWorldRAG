@@ -1,12 +1,14 @@
 #!/bin/bash
 # GridWorldRAG - DBリスト表示
+set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
-source .venv/bin/activate
 
 export PATH="/opt/homebrew/opt/postgresql@17/bin:$PATH"
+# venv の activate はプロジェクト移動時に壊れるので .venv/bin/python を直叩き
+PYTHON="$SCRIPT_DIR/.venv/bin/python"
 
-python3 - <<'EOF'
+"$PYTHON" - <<'EOF'
 import os, sys
 sys.path.insert(0, '.')
 os.environ['GRIDWORLDRAG_SKIP_CONFIG'] = '1'

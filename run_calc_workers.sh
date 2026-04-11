@@ -5,5 +5,6 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-source .venv/bin/activate
-python calc_workers.py "$@"
+# venv の activate はプロジェクト移動時に壊れるので .venv/bin/python を直叩き
+PYTHON="$SCRIPT_DIR/.venv/bin/python"
+exec "$PYTHON" calc_workers.py "$@"
