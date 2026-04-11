@@ -339,17 +339,23 @@ def extract_text(service, file_info):
     - Google Docs / Sheets / Slides（エクスポート）
     - テキスト系ファイル（直接ダウンロード）
     - PDF（pypdf でテキスト抽出、タイムアウト付き）
+    - その他: ファイル名をメタデータとして返す（未対応 MIME 種別のフォールバック）
 
     Returns:
-        (text, is_partial): text は抽出テキスト（Noneの場合は抽出不可）、
-                            is_partial は PDF が途中でタイムアウトした場合 True。
+        (text, is_partial): text は抽出テキスト。
+                            extract_text 単体で Noneを返すのは、呼び出し側が別系統で
+                            処理すべき場合のみ（スプレッドシートは extract_spreadsheet_sheets
+                            で処理、SKIP_MIME_TYPES は明示的に無視）。
+                            is_partial は PDF が途中でタイムアウトした場合 True、
+                            未対応 MIME / 失敗フォールバックでメタデータのみ保存する場合も True。
     """
     mime_type = file_info["mimeType"]
     file_id = file_info["id"]
+    file_name = file_info["name"]
 
     # フォルダ: フォルダ名をメタデータとして返す
     if mime_type == "application/vnd.google-apps.folder":
-        return f"[フォルダ] {file_info['name']}", False
+        return f"[フォルダ] {file_name}", False
 
     if mime_type in SKIP_MIME_TYPES:
         return None, False
@@ -373,11 +379,11 @@ def extract_text(service, file_info):
             content = _do_export()
             return content.getvalue().decode("utf-8", errors="replace"), False
         except (socket.timeout, OSError) as e:
-            print(f"  警告: エクスポートタイムアウト [{file_info['name']}]: {e}", flush=True)
-            return None, False
+            print(f"  警告: エクスポートタイムアウト [{file_name}]: {e}", flush=True)
+            return f"[Doc] {file_name}", True
         except Exception as e:
-            print(f"  警告: エクスポート失敗 [{file_info['name']}]: {e}", flush=True)
-            return None, False
+            print(f"  警告: エクスポート失敗 [{file_name}]: {e}", flush=True)
+            return f"[Doc] {file_name}", True
 
     # テキスト系ファイル: ダウンロード
     if mime_type in TEXT_MIME_TYPES:
@@ -385,11 +391,11 @@ def extract_text(service, file_info):
             content = _download_content(service, file_id)
             return content.getvalue().decode("utf-8", errors="replace"), False
         except (socket.timeout, OSError) as e:
-            print(f"  警告: ダウンロードタイムアウト [{file_info['name']}]: {e}", flush=True)
-            return None, False
+            print(f"  警告: ダウンロードタイムアウト [{file_name}]: {e}", flush=True)
+            return f"[テキスト] {file_name}", True
         except Exception as e:
-            print(f"  警告: ダウンロード失敗 [{file_info['name']}]: {e}", flush=True)
-            return None, False
+            print(f"  警告: ダウンロード失敗 [{file_name}]: {e}", flush=True)
+            return f"[テキスト] {file_name}", True
 
     # PDF: タイムアウト付きテキスト抽出
     #   - さくっと読めた → (text, False)
@@ -430,13 +436,17 @@ def extract_text(service, file_info):
 
     # 動画: メタデータのみ
     if mime_type.startswith("video/"):
-        return f"[動画] {file_info['name']}", False
+        return f"[動画] {file_name}", False
 
     # 音声: メタデータのみ
     if mime_type.startswith("audio/"):
-        return f"[音声] {file_info['name']}", False
+        return f"[音声] {file_name}", False
 
-    return None, False
+    # 未対応 MIME タイプ: ファイル名をメタデータとして返す (partial=True でマーク)。
+    # これにより Office系 (.docx/.pptx)、アーカイブ (.zip/.epub)、バイナリ (application/
+    # octet-stream) 等もファイル名検索で見つかる。integrity check の missing 誤検知も解消。
+    # CLAUDE.md の原則「処理失敗時でもファイル名は記録される」を全 MIME に適用。
+    return f"[ファイル] {file_name}", True
 
 
 def _try_ocr_image(content, filename):

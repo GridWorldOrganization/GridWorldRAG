@@ -163,8 +163,15 @@ def _process_file(file_info, model, splitter, service, batch, sheets_semaphore=N
             if sheets_semaphore:
                 sheets_semaphore.release()
 
+        # シートメタデータが一切取れなかった場合: ファイル名だけ記録
         if not sheets:
-            return 0, 1, 0, 0
+            try:
+                text = f"[スプレッドシート] {file_name}"
+                emb = model.encode([text])[0]
+                batch.append(make_chunk_entry(file_info, text, emb, 0, partial_content=True))
+                return 1, 0, 0, 1
+            except Exception:
+                return _error_fallback(file_info, file_name, model, batch)
 
         file_chunks = 0
         file_errors = 0
@@ -195,16 +202,19 @@ def _process_file(file_info, model, splitter, service, batch, sheets_semaphore=N
 
         if file_chunks > 0:
             return 1, 0, file_errors, file_chunks
-        return 0, 1, file_errors, 0
+        # 全シートで embed 失敗: ファイル名だけ記録
+        return _error_fallback(file_info, file_name, model, batch)
 
-    # その他のファイル（Docs, PDF, フォルダ, テキスト, 動画, 音声 等）
+    # その他のファイル（Docs, PDF, フォルダ, テキスト, 動画, 音声, 未対応 MIME 等）
+    # 注: 未対応 MIME でも extract_text が `[ファイル] name` を返す設計 (drive_client.py)
     text, is_partial = extract_text(service, file_info)
     if not text or not text.strip():
+        # spreadsheet / SKIP_MIME_TYPES は明示的に None を返すので skip 扱いで正しい
         return 0, 1, 0, 0
 
     chunks = splitter.split_text(text)
     if not chunks:
-        return 0, 1, 0, 0
+        chunks = [text]  # metadata-only テキストでも必ず 1 件保存
 
     try:
         embeddings = model.encode(chunks)
