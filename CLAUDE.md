@@ -58,7 +58,7 @@ GridWorldRAG/
 ├── run_build_single.sh     # シングルプロセス版ランチャー
 ├── run_sync_rotate.sh      # sync_rotate 起動スクリプト
 ├── run_calc_workers.sh     # ワーカー数計算ランチャー
-├── monitor.sh              # リアルタイムモニター（tput sc/rc）
+├── monitor.sh              # リアルタイムモニター（相対カーソルアップ方式）
 ├── setup.sh                # 環境セットアップ
 ├── schema.sql              # DBスキーマ（ALTER TABLE含む）
 ├── config.env              # 設定ファイル（Git管理外、secrets リポの symlink）
@@ -113,7 +113,7 @@ GridWorldRAG/
 
 ### モニター（monitor.sh + monitor_render.py）
 
-- `tput sc/rc`（カーソル保存/復元）で画面更新（他の方式は全て失敗した）
+- 相対カーソルアップ方式（`\033[NA]` で前回印刷行数分だけ戻る）で画面更新
 - Python でレンダリング、shell でループ制御
 - ワーカーステータス: done, loading, ready, rate_limited, rate_limited_running, running
 
@@ -147,7 +147,7 @@ GridWorldRAG/
 
 - **EXPORT_MIME_MAP にスプレッドシートを含めると最初のシートしかCSV exportされない** → Sheets API で個別取得に変更
 - **multiprocessing.Queue に大きなデータを入れるとパイプがブロックする** → Pickle ファイルに分離
-- **モニターのカーソル制御**: `\033[nA]`, `clear`, `\033[H]` は全て問題あり → `tput sc/rc` が正解
+- **モニターのカーソル制御**: `clear`, `\033[H]` は全て問題あり。`tput sc/rc` はサブプロセスが ESC 7 を発行すると保存位置が上書きされ 20-30% の確率で表示崩れ → 相対カーソルアップ（`\033[NA]` + 前回行数追跡）が正解
 - **Ctrl+C でゾンビプロセスが残る** → `p.daemon=True` + SIGTERM ハンドラ + `terminate()` → `join(timeout=10)` → `kill()`
 - **Sheets API 429**: 8ワーカーで 60req/min 超過 → `Semaphore(2)` で解決
 - **PDF の NUL 文字**: PostgreSQL が `\x00` を拒否 → `insert_chunks()` で除去

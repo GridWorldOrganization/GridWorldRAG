@@ -32,11 +32,11 @@ _restore_stty() {
 }
 trap _restore_stty EXIT INT TERM
 
-# 表示領域を確保してカーソル位置を保存
-TOTAL_LINES=$((WORKER_COUNT + 4))
-printf '\n%.0s' $(seq 1 $TOTAL_LINES)
-printf "\033[${TOTAL_LINES}A"
-tput sc 2>/dev/null
+# 前回印刷した行数を追跡（相対カーソルアップで巻き戻す）
+# tput sc/rc はサブプロセスが ESC 7 を発行すると保存位置が上書きされ、
+# 20-30% の確率で表示がスクロールしてしまう問題があった。
+# 相対カーソルアップ方式なら外部状態に依存しないため安定する。
+LAST_LINE_COUNT=0
 
 while true; do
     # 経過時間
@@ -47,18 +47,24 @@ while true; do
     # Python で表示テキストを生成
     OUTPUT=$(python3 -m src.monitor_render "$WORKER_COUNT" "$PROGRESS_DIR" "$ELAPSED_STR" 2>/dev/null)
 
-    # カーソルを保存位置に戻して上書き
-    tput rc 2>/dev/null
+    # 前回印刷した行数分だけカーソルを上に戻す
+    if [ $LAST_LINE_COUNT -gt 0 ]; then
+        printf "\033[${LAST_LINE_COUNT}A\r"
+    fi
+
     LINE_COUNT=0
     while IFS= read -r line; do
         printf '\033[K%s\n' "$line"
         LINE_COUNT=$((LINE_COUNT + 1))
     done <<< "$OUTPUT"
-    # 余剰行をクリア（前回の表示残りを消す）
-    while [ $LINE_COUNT -lt $TOTAL_LINES ]; do
+    # 前回より行数が減った場合、余剰行をクリア
+    EXTRA=$((LAST_LINE_COUNT - LINE_COUNT))
+    while [ $EXTRA -gt 0 ]; do
         printf '\033[K\n'
         LINE_COUNT=$((LINE_COUNT + 1))
+        EXTRA=$((EXTRA - 1))
     done
+    LAST_LINE_COUNT=$LINE_COUNT
 
     # プロセス終了チェック
     if [ -n "$BUILD_PID" ] && ! kill -0 "$BUILD_PID" 2>/dev/null; then
