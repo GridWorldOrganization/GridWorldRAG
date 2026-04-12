@@ -25,7 +25,7 @@ import argparse
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
 
-from src.config import EMBEDDING_MODEL, CHUNK_SIZE, CHUNK_OVERLAP, BATCH_SIZE
+from src.config import EMBEDDING_MODEL, CHUNK_SIZE, CHUNK_OVERLAP, BATCH_SIZE, EMBEDDING_DEVICE
 from src.drive_client import authenticate, extract_text, _download_content, _try_ocr_image
 from src.db import connect, insert_chunks, extract_file_id_from_url
 
@@ -127,7 +127,7 @@ def main():
 
     # モデル・DB準備
     print(f"\n埋め込みモデル({EMBEDDING_MODEL})を読み込み中...")
-    model = SentenceTransformer(EMBEDDING_MODEL)
+    model = SentenceTransformer(EMBEDDING_MODEL, device=(None if EMBEDDING_DEVICE == "auto" else EMBEDDING_DEVICE))
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,

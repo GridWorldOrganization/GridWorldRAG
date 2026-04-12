@@ -9,7 +9,7 @@ Google Drive の全ファイルを取得し、テキスト抽出 → チャン�
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
 
-from src.config import EMBEDDING_MODEL, CHUNK_SIZE, CHUNK_OVERLAP, BATCH_SIZE, INDEX_IMAGE_OCR
+from src.config import EMBEDDING_MODEL, CHUNK_SIZE, CHUNK_OVERLAP, BATCH_SIZE, INDEX_IMAGE_OCR, EMBEDDING_DEVICE
 from src.drive_client import (
     authenticate, list_all_files, extract_text,
     extract_spreadsheet_sheets,
@@ -34,7 +34,7 @@ def main():
 
     # 3. 埋め込みモデル読み込み
     print(f"\n[3/5] 埋め込みモデル({EMBEDDING_MODEL})を読み込み中...")
-    model = SentenceTransformer(EMBEDDING_MODEL)
+    model = SentenceTransformer(EMBEDDING_MODEL, device=(None if EMBEDDING_DEVICE == "auto" else EMBEDDING_DEVICE))
     print("  モデル読み込み完了")
 
     # 4. テキスト分割器

@@ -26,7 +26,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from src.config import (
-    EMBEDDING_MODEL, CHUNK_SIZE, CHUNK_OVERLAP, BATCH_SIZE,
+    EMBEDDING_MODEL, EMBEDDING_DEVICE, CHUNK_SIZE, CHUNK_OVERLAP, BATCH_SIZE,
     GOOGLE_EMAIL, INDEX_MY_DRIVE, INDEX_SHARED_DRIVES, INDEX_IMAGE_OCR,
     PARALLEL_WORKERS, TASK_SPLIT_THRESHOLD, MONITOR_INTERVAL_MS,
     WORKER_START_INTERVAL_SEC, FETCH_THREADS,
@@ -220,13 +220,39 @@ def _process_file(file_info, model, splitter, service, batch, sheets_semaphore=N
     if not chunks:
         chunks = [text]  # metadata-only テキストでも必ず 1 件保存
 
-    try:
-        embeddings = model.encode(chunks)
-    except Exception:
-        return _error_fallback(file_info, file_name, model, batch)
-
-    for ci, (chunk_text, emb) in enumerate(zip(chunks, embeddings)):
-        batch.append(make_chunk_entry(file_info, chunk_text, emb, ci, partial_content=is_partial))
+    # 大きなファイルはバッチエンコードに分割 (issue #2)
+    # デフォルト 64 チャンクごと。これで 1000 チャンク級の技術書 PDF でも
+    # ファイル内で 16 回の stdout 更新が出る → モニターが固まって見えない
+    ENCODE_BATCH = int(os.environ.get("ENCODE_BATCH_SIZE", "64"))
+    if len(chunks) <= ENCODE_BATCH:
+        # 通常ファイル: 従来通り 1 回で embed
+        try:
+            embeddings = model.encode(chunks)
+        except Exception:
+            return _error_fallback(file_info, file_name, model, batch)
+        for ci, (chunk_text, emb) in enumerate(zip(chunks, embeddings)):
+            batch.append(make_chunk_entry(file_info, chunk_text, emb, ci, partial_content=is_partial))
+    else:
+        # 大ファイル: バッチ分割 + 進捗表示
+        total_chunks_in_file = len(chunks)
+        for batch_start in range(0, total_chunks_in_file, ENCODE_BATCH):
+            sub_chunks = chunks[batch_start:batch_start + ENCODE_BATCH]
+            try:
+                sub_embs = model.encode(sub_chunks)
+            except Exception:
+                # 残りを諦めて既存分だけ保存
+                break
+            for offset, (chunk_text, emb) in enumerate(zip(sub_chunks, sub_embs)):
+                ci = batch_start + offset
+                batch.append(make_chunk_entry(file_info, chunk_text, emb, ci, partial_content=is_partial))
+            # ファイル内進捗を stdout に出す (モニターが拾える)
+            _done = min(batch_start + ENCODE_BATCH, total_chunks_in_file)
+            _ts = time.strftime("%H:%M:%S")
+            print(
+                f"[{_ts}] encode進捗 [{file_info.get('name', '?')}] "
+                f"{_done}/{total_chunks_in_file} chunks",
+                flush=True,
+            )
 
     return 1, 0, 0, len(chunks)
 
@@ -243,7 +269,7 @@ def _worker(worker_id, task_queue, tasks_total, results_queue, sheets_semaphore,
     from sentence_transformers import SentenceTransformer
     from src.db import connect
 
-    model = SentenceTransformer(EMBEDDING_MODEL)
+    model = SentenceTransformer(EMBEDDING_MODEL, device=(None if EMBEDDING_DEVICE == "auto" else EMBEDDING_DEVICE))
     # httplib2 ソケットタイムアウトに移行済み。スレッド競合なし（daemon スレッド廃止）。
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP,
@@ -900,6 +926,7 @@ def print_file_list_summary(drive_file_lists):
 
     ドライブごとに、何タスクに分割されるかも表示する
     (TASK_SPLIT_THRESHOLD を超えたドライブは N parts に分割される)。
+    末尾に DB 容量推計も出す (issue #1)。
     """
     total_fc = sum(
         sum(1 for f in files if f["mimeType"] != FOLDER_MIME)
@@ -907,6 +934,19 @@ def print_file_list_summary(drive_file_lists):
     )
     total_dc = sum(len(files) for _, _, files in drive_file_lists) - total_fc
     threshold = TASK_SPLIT_THRESHOLD
+
+    # Drive API の size / quotaBytesUsed フィールドを集計 (取得できてれば)
+    drive_bytes = 0
+    _bytes_seen = False
+    for _, _, files in drive_file_lists:
+        for f in files:
+            _sz = f.get("size") or f.get("quotaBytesUsed")
+            if _sz:
+                try:
+                    drive_bytes += int(_sz)
+                    _bytes_seen = True
+                except (TypeError, ValueError):
+                    pass
 
     total_tasks = 0
     for i, (name, dtype, files) in enumerate(drive_file_lists, 1):
@@ -925,6 +965,38 @@ def print_file_list_summary(drive_file_lists):
         f"合計: {len(drive_file_lists)} drives, {total_tasks} tasks, "
         f"{total_fc + total_dc}アイテム ({total_fc}ファイル {total_dc}フォルダ)"
     )
+
+    # DB 容量推計 (issue #1)
+    # ベクトル 768次元 × 4bytes = 3072
+    # テキスト 平均 600文字 ≒ 1800 bytes (UTF-8 日本語)
+    # メタデータ + インデックス: 約 1000 bytes/chunk
+    # → 約 6 KB/chunk
+    #
+    # チャンク数の推計は難しいので 2 パターン表示する:
+    #   - 楽観 (各ファイル 1 chunk): total_fc chunks
+    #   - 保守 (PDFやDocsが多めに分割される想定): total_fc * 3 chunks
+    bytes_per_chunk = 6 * 1024
+    est_low_chunks = total_fc  # 大部分がフォルダ/動画/音声/画像で 1 chunk
+    est_high_chunks = total_fc * 3  # PDFやテキストが多いドライブ
+    est_low_bytes = est_low_chunks * bytes_per_chunk
+    est_high_bytes = est_high_chunks * bytes_per_chunk
+
+    def _fmt_bytes(n):
+        if n < 1024:
+            return f"{n} B"
+        for unit in ("KB", "MB", "GB", "TB"):
+            n /= 1024
+            if n < 1024:
+                return f"{n:.1f} {unit}"
+        return f"{n:.1f} PB"
+
+    print("")
+    print("--- 容量推計 ---")
+    if _bytes_seen:
+        print(f"  Drive 使用量: {_fmt_bytes(drive_bytes)}")
+    print(f"  推定 DB 容量: {_fmt_bytes(est_low_bytes)} 〜 {_fmt_bytes(est_high_bytes)}")
+    print(f"    (推定チャンク数: {est_low_chunks:,} 〜 {est_high_chunks:,}, "
+          f"6KB/chunk)")
 
 
 # ---------------------------------------------------------------------------

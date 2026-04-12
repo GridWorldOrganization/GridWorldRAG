@@ -17,6 +17,7 @@ from src.config import (
     GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_EMAIL, TOKEN_PATH,
     INDEX_MY_DRIVE, INDEX_SHARED_DRIVES, load_shared_drives_whitelist,
     DRIVE_DOWNLOAD_TIMEOUT_SEC,
+    API_MAX_RETRIES, API_BASE_DELAY_SEC, API_SHEET_MAX_RETRIES,
 )
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
@@ -63,7 +64,7 @@ def _is_retriable_error(error_str):
     return False
 
 
-def _api_call_with_retry(func, max_retries=6, base_delay=5):
+def _api_call_with_retry(func, max_retries=None, base_delay=None):
     """Google API 呼び出しをレート制限・一時的サーバエラー対応のリトライ付きで実行する。
 
     リトライ対象:
@@ -73,6 +74,10 @@ def _api_call_with_retry(func, max_retries=6, base_delay=5):
     - Connection reset / aborted
     _is_retriable_error() を参照。
 
+    デフォルト値は config.env から読み込まれる:
+    - API_MAX_RETRIES       (デフォルト 6)
+    - API_BASE_DELAY_SEC    (デフォルト 5 秒)
+
     Sheets API の per-minute クォータ (60req/min) 回復には最大 60 秒かかるため、
     バックオフの累計待ち時間が 60 秒を超えるように設計する:
         base_delay * (2^0 + 2^1 + ... + 2^5) = 5 * 63 = 315 秒 (理論最大)
@@ -80,9 +85,13 @@ def _api_call_with_retry(func, max_retries=6, base_delay=5):
 
     Args:
         func: 実行する関数（引数なしの callable）
-        max_retries: 最大試行回数（デフォルト 6）
-        base_delay: バックオフの基準遅延秒（デフォルト 5 秒）
+        max_retries: 最大試行回数 (None で config.env の API_MAX_RETRIES)
+        base_delay: バックオフの基準遅延秒 (None で config.env の API_BASE_DELAY_SEC)
     """
+    if max_retries is None:
+        max_retries = API_MAX_RETRIES
+    if base_delay is None:
+        base_delay = API_BASE_DELAY_SEC
     for attempt in range(max_retries):
         try:
             return func()
@@ -248,14 +257,15 @@ def extract_spreadsheet_sheets(file_id):
             continue
 
         try:
-            # シート値取得: デフォルトの max_retries=6 でバックオフ累計 >60 秒までリトライ
-            # 60 秒経っても 429 が続くなら諦めて partial として保存
+            # シート値取得: config.env の API_SHEET_MAX_RETRIES で制御 (デフォルト 6)
+            # 回数を減らすと即 partial 保存に倒せる (quota 逼迫時の高速化)
             sheet_range = f"'{name}'"
             values_response = _api_call_with_retry(
                 lambda sr=sheet_range: service.spreadsheets().values().get(
                     spreadsheetId=file_id,
                     range=sr,
                 ).execute(),
+                max_retries=API_SHEET_MAX_RETRIES,
             )
             values = values_response.get("values", [])
             if not values:
@@ -281,7 +291,9 @@ def list_files_in_drive(service, drive_id=None, corpora="user"):
     kwargs = {
         "q": query,
         "spaces": "drive",
-        "fields": "nextPageToken, files(id, name, mimeType, modifiedTime, owners, webViewLink, driveId, parents, permissions(emailAddress, role, type, displayName))",
+        "fields": ("nextPageToken, files(id, name, mimeType, modifiedTime, "
+                   "size, quotaBytesUsed, owners, webViewLink, driveId, "
+                   "parents, permissions(emailAddress, role, type, displayName))"),
         "pageSize": 1000,
         "supportsAllDrives": True,
         "includeItemsFromAllDrives": True,

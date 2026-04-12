@@ -26,7 +26,7 @@ for _i, _arg in enumerate(sys.argv[1:]):
 
 from mcp.server.fastmcp import FastMCP
 
-from src.config import EMBEDDING_MODEL
+from src.config import EMBEDDING_MODEL, EMBEDDING_DEVICE
 from src.db import connect, search_similar, lookup_by_url
 
 mcp = FastMCP("gridworld-rag-mcp")
@@ -59,7 +59,7 @@ def _get_model():
     global _model
     if _model is None:
         from sentence_transformers import SentenceTransformer
-        _model = SentenceTransformer(EMBEDDING_MODEL)
+        _model = SentenceTransformer(EMBEDDING_MODEL, device=(None if EMBEDDING_DEVICE == "auto" else EMBEDDING_DEVICE))
     return _model
 
 
@@ -266,6 +266,81 @@ def recent_changes() -> str:
     if not added and not updated and not deleted:
         lines.append("")
         lines.append("変更はありませんでした。")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def sync_history(days: int = 7) -> str:
+    """sync_rotate の実行履歴を返す (issue #8)。
+
+    Args:
+        days: 過去 N 日間の履歴を返す (デフォルト 7)
+    """
+    conn = _get_conn()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT ran_at, duration_ms, drives_checked, drives_with_changes,
+                   added, updated, deleted, errors,
+                   retry_pending, dead_files_total,
+                   disk_full, aborted, reason
+            FROM sync_history
+            WHERE ran_at >= NOW() - INTERVAL '%s days'
+            ORDER BY ran_at DESC
+            LIMIT 200
+        """ % int(days))
+        rows = cur.fetchall()
+
+        # 集計
+        cur.execute("""
+            SELECT COUNT(*) AS runs,
+                   SUM(added) AS total_added,
+                   SUM(updated) AS total_updated,
+                   SUM(deleted) AS total_deleted,
+                   SUM(errors) AS total_errors,
+                   COUNT(*) FILTER (WHERE disk_full) AS disk_full_runs,
+                   COUNT(*) FILTER (WHERE aborted) AS aborted_runs,
+                   MAX(retry_pending) AS max_retry_pending,
+                   MAX(dead_files_total) AS max_dead
+            FROM sync_history
+            WHERE ran_at >= NOW() - INTERVAL '%s days'
+        """ % int(days))
+        agg = cur.fetchone()
+    finally:
+        cur.close()
+
+    if not rows:
+        return f"直近 {days} 日間の sync_history がありません。"
+
+    lines = [
+        f"## sync_history (直近 {days} 日, {len(rows)}実行)",
+        "",
+        f"- 総実行数: {agg[0]}",
+        f"- 追加: {agg[1] or 0} / 更新: {agg[2] or 0} / 削除: {agg[3] or 0}",
+        f"- エラー: {agg[4] or 0}",
+        f"- disk_full: {agg[5]}回 / aborted: {agg[6]}回",
+        f"- 最大 retry_pending: {agg[7] or 0}",
+        f"- 最大 dead_files: {agg[8] or 0}",
+        "",
+        "### 最近の実行 (最新 20 件)",
+    ]
+    for r in rows[:20]:
+        ran_at, dur, chk, with_changes, a, u, d, e, rp, df, disk, ab, reason = r
+        flags = []
+        if disk:
+            flags.append("disk_full")
+        if ab:
+            flags.append("aborted")
+        flag_str = f" [{','.join(flags)}]" if flags else ""
+        dur_str = f"{dur}ms" if dur else "?"
+        lines.append(
+            f"- {ran_at.strftime('%m-%d %H:%M')} "
+            f"drives:{chk}/{with_changes} +{a}/~{u}/-{d} err:{e} "
+            f"retry:{rp} dead:{df} ({dur_str}){flag_str}"
+        )
+        if reason:
+            lines.append(f"    reason: {reason}")
 
     return "\n".join(lines)
 

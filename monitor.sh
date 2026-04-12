@@ -16,6 +16,22 @@ else
     START_EPOCH=$(date +%s)
 fi
 
+# Enter キー等のキー入力で画面がスクロールしヘッダ行が重複する問題 (issue #3) の対策:
+# - stty -echo で入力を画面に反映しない
+# - stty -icanon で 1 文字ずつ受け取り改行を溜めない
+# - stty echo で元に戻すのは trap と exit 時
+_saved_stty=""
+if tty -s 2>/dev/null; then
+    _saved_stty=$(stty -g 2>/dev/null || true)
+    stty -echo -icanon 2>/dev/null || true
+fi
+_restore_stty() {
+    if [ -n "$_saved_stty" ]; then
+        stty "$_saved_stty" 2>/dev/null || true
+    fi
+}
+trap _restore_stty EXIT INT TERM
+
 # 表示領域を確保してカーソル位置を保存
 TOTAL_LINES=$((WORKER_COUNT + 4))
 printf '\n%.0s' $(seq 1 $TOTAL_LINES)

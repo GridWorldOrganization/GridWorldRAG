@@ -28,8 +28,10 @@ from pathlib import Path
 import psycopg2
 
 from src.config import (
-    EMBEDDING_MODEL, CHUNK_SIZE, CHUNK_OVERLAP,
+    EMBEDDING_MODEL, EMBEDDING_DEVICE, CHUNK_SIZE, CHUNK_OVERLAP,
     load_shared_drives_whitelist,
+    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+    TELEGRAM_RETRY_PENDING_THRESHOLD, TELEGRAM_NOTIFY_COOLDOWN_SEC,
 )
 from src.drive_client import (
     authenticate,
@@ -135,10 +137,36 @@ CREATE TABLE IF NOT EXISTS sync_state (
     value      TEXT NOT NULL,
     updated_at TIMESTAMP DEFAULT NOW()
 );
+CREATE TABLE IF NOT EXISTS sync_history (
+    id                  SERIAL PRIMARY KEY,
+    ran_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    duration_ms         INTEGER,
+    drives_checked      INTEGER,
+    drives_with_changes INTEGER,
+    added               INTEGER,
+    updated             INTEGER,
+    deleted             INTEGER,
+    skipped             INTEGER,
+    errors              INTEGER,
+    retry_recovered     INTEGER,
+    retry_pending       INTEGER,
+    dead_files_total    INTEGER,
+    disk_full           BOOLEAN DEFAULT FALSE,
+    aborted             BOOLEAN DEFAULT FALSE,
+    reason              TEXT,
+    free_bytes          BIGINT
+);
+CREATE INDEX IF NOT EXISTS idx_sync_history_ran_at ON sync_history (ran_at DESC);
 """
 _TOKEN_PREFIX = "rotate_token_"
 _RESULT_KEY = "last_sync_result"
 _FAILED_FILES_KEY = "failed_files"
+_DEAD_FILES_KEY = "dead_files"
+
+# issue #9: 再試行キューの諦めロジック
+# attempts >= MAX_ATTEMPTS または age >= MAX_AGE_SEC になったら dead_files に移動
+MAX_RETRY_ATTEMPTS = int(os.environ.get("RETRY_MAX_ATTEMPTS", "5"))
+MAX_RETRY_AGE_SEC = int(os.environ.get("RETRY_MAX_AGE_SEC", str(24 * 3600)))  # 24h
 
 
 def _ensure_sync_state_table(conn):
@@ -199,6 +227,46 @@ def _save_sync_result(conn, result):
         conn.commit()
     finally:
         cur.close()
+    # sync_history append (issue #8)
+    _save_sync_history(conn, result)
+
+
+def _save_sync_history(conn, result):
+    """sync_history テーブルに 1 実行 1 行を追記する (append-only)。"""
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            INSERT INTO sync_history (
+                duration_ms, drives_checked, drives_with_changes,
+                added, updated, deleted, skipped, errors,
+                retry_recovered, retry_pending, dead_files_total,
+                disk_full, aborted, reason, free_bytes
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                result.get("duration_ms"),
+                result.get("drives_checked", 0),
+                result.get("drives_with_changes", 0),
+                len(result.get("added", [])) if isinstance(result.get("added"), list) else result.get("added", 0),
+                len(result.get("updated", [])) if isinstance(result.get("updated"), list) else result.get("updated", 0),
+                len(result.get("deleted", [])) if isinstance(result.get("deleted"), list) else result.get("deleted", 0),
+                result.get("skipped", 0),
+                result.get("errors", 0),
+                result.get("retry_recovered", 0),
+                result.get("retry_pending", 0),
+                result.get("dead_files_total", 0),
+                bool(result.get("disk_full")),
+                bool(result.get("aborted")),
+                result.get("reason"),
+                result.get("free_bytes"),
+            ),
+        )
+        conn.commit()
+    except Exception as e:
+        log.warning("sync_history 追記失敗: %s", e)
+    finally:
+        cur.close()
 
 
 def _load_failed_files(conn):
@@ -234,6 +302,177 @@ def _save_failed_files(conn, failed):
         conn.commit()
     finally:
         cur.close()
+
+
+def _load_dead_files(conn):
+    """永続失敗ファイル (再試行しない) の一覧を取得する。"""
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT value FROM sync_state WHERE key = %s", (_DEAD_FILES_KEY,))
+        row = cur.fetchone()
+    finally:
+        cur.close()
+    if not row:
+        return []
+    try:
+        return json.loads(row[0])
+    except (ValueError, TypeError):
+        return []
+
+
+def _save_dead_files(conn, dead):
+    """永続失敗ファイルの一覧を保存する。"""
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            INSERT INTO sync_state (key, value, updated_at)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (key) DO UPDATE SET
+                value = EXCLUDED.value,
+                updated_at = NOW()
+            """,
+            (_DEAD_FILES_KEY, json.dumps(dead, ensure_ascii=False)),
+        )
+        conn.commit()
+    finally:
+        cur.close()
+
+
+def _promote_to_dead(conn, entry, reason):
+    """失敗エントリを dead_files に昇格させる (永続失敗扱い)。"""
+    dead = _load_dead_files(conn)
+    entry_with_reason = dict(entry)
+    entry_with_reason["dead_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    entry_with_reason["dead_reason"] = reason
+    dead.append(entry_with_reason)
+    # dead_files のサイズが肥大化しないよう上限を設ける (最新 500 件)
+    if len(dead) > 500:
+        dead = dead[-500:]
+    _save_dead_files(conn, dead)
+    log.warning("dead file (永続失敗): file_id=%s reason=%s", entry.get("file_id", ""), reason)
+
+
+# ---------------------------------------------------------------------------
+# Telegram 通知 (issue #7)
+# ---------------------------------------------------------------------------
+
+_TELEGRAM_NOTIFY_STATE_KEY = "telegram_last_notify"
+
+
+def _telegram_notify(conn, message):
+    """Telegram bot API に直接 HTTPS リクエストを送る。
+
+    config.env の TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID が設定されていない場合はスキップ。
+    バッチ過程から呼ばれるため、失敗しても sync を妨げない (best effort)。
+    """
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    try:
+        import urllib.request
+        import urllib.parse
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        data = urllib.parse.urlencode({
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message[:4000],  # Telegram の msg 上限は 4096
+            "parse_mode": "Markdown",
+        }).encode("utf-8")
+        req = urllib.request.Request(url, data=data, method="POST")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status == 200
+    except Exception as e:
+        log.warning("Telegram 通知失敗: %s", e)
+        return False
+
+
+def _maybe_notify_retry_pending(conn, retry_pending, dead_count):
+    """retry_pending 数がしきい値を超えたら Telegram 通知を送る。
+
+    クールダウン期間内は重複通知しない。
+    """
+    if retry_pending < TELEGRAM_RETRY_PENDING_THRESHOLD:
+        return
+    if not TELEGRAM_BOT_TOKEN:
+        return
+
+    # 前回通知時刻をチェック
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT value FROM sync_state WHERE key = %s",
+            (_TELEGRAM_NOTIFY_STATE_KEY,),
+        )
+        row = cur.fetchone()
+    finally:
+        cur.close()
+
+    now = time.time()
+    if row:
+        try:
+            last = float(row[0])
+            if now - last < TELEGRAM_NOTIFY_COOLDOWN_SEC:
+                log.info("Telegram 通知スキップ (クールダウン中)")
+                return
+        except (ValueError, TypeError):
+            pass
+
+    # 失敗上位ファイル情報
+    failed = _load_failed_files(conn)[:5]
+    failed_lines = []
+    for e in failed:
+        fid = e.get("file_id", "?")[:16]
+        attempts = e.get("attempts", 0)
+        err = (e.get("last_error") or "")[:80]
+        failed_lines.append(f"  • `{fid}` (attempts={attempts})")
+        if err:
+            failed_lines.append(f"    {err}")
+
+    msg = (
+        f"⚠️ *GridWorldRAG sync_rotate*\n"
+        f"retry\\_pending: {retry_pending} (threshold {TELEGRAM_RETRY_PENDING_THRESHOLD})\n"
+        f"dead\\_files: {dead_count}\n"
+        f"\n"
+        f"failed files (top {len(failed)}):\n"
+        + "\n".join(failed_lines)
+    )
+    ok = _telegram_notify(conn, msg)
+    if ok:
+        # 通知成功 → クールダウン開始
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO sync_state (key, value, updated_at)
+                VALUES (%s, %s, NOW())
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+                """,
+                (_TELEGRAM_NOTIFY_STATE_KEY, str(now)),
+            )
+            conn.commit()
+        finally:
+            cur.close()
+        log.info("Telegram 通知送信完了")
+
+
+def _entry_should_be_dead(entry):
+    """エントリが dead_files に移動すべきかを判定する。
+
+    Returns:
+        (should_die: bool, reason: str)
+    """
+    attempts = entry.get("attempts", 0)
+    if attempts >= MAX_RETRY_ATTEMPTS:
+        return True, f"attempts exceeded ({attempts} >= {MAX_RETRY_ATTEMPTS})"
+    first_failed_at = entry.get("first_failed_at")
+    if first_failed_at:
+        try:
+            first_ts = time.mktime(time.strptime(first_failed_at, "%Y-%m-%dT%H:%M:%S"))
+            age = time.time() - first_ts
+            if age >= MAX_RETRY_AGE_SEC:
+                return True, f"age exceeded ({int(age)}s >= {MAX_RETRY_AGE_SEC}s)"
+        except (ValueError, TypeError):
+            pass
+    return False, ""
 
 
 # ---------------------------------------------------------------------------
@@ -393,7 +632,13 @@ def _process_drive_changes(service, conn, model, splitter, drive_id, changes):
         except Exception as e:
             log.error("chunk生成エラー: %s (%s)", fname, e)
             errors += 1
-            failed_ids.append({"drive_id": drive_id, "file_id": file_id})
+            failed_ids.append({
+                "drive_id": drive_id,
+                "file_id": file_id,
+                "attempts": 1,
+                "first_failed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "last_failed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            })
             continue
 
         if not chunks:
@@ -407,7 +652,13 @@ def _process_drive_changes(service, conn, model, splitter, drive_id, changes):
                 raise DiskFullHalt(f"DB ディスク満杯 [{fname}]: {e}") from e
             log.warning("DB書込失敗 [%s]: %s", fname, e)
             errors += 1
-            failed_ids.append({"drive_id": drive_id, "file_id": file_id})
+            failed_ids.append({
+                "drive_id": drive_id,
+                "file_id": file_id,
+                "attempts": 1,
+                "first_failed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "last_failed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            })
             continue
 
         entry = {"name": fname, "url": furl, "id": file_id}
@@ -430,7 +681,7 @@ def _get_model_and_splitter():
     from sentence_transformers import SentenceTransformer
     from langchain_text_splitters import RecursiveCharacterTextSplitter
     log.info("モデルロード中...")
-    model = SentenceTransformer(EMBEDDING_MODEL)
+    model = SentenceTransformer(EMBEDDING_MODEL, device=(None if EMBEDDING_DEVICE == "auto" else EMBEDDING_DEVICE))
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP,
     )
@@ -458,7 +709,24 @@ def _retry_failed_files(service, conn, model_getter):
     still_failed = []
     recovered = []
     errors = 0
+    dead_count = 0
     model = splitter = None
+
+    def _fail_entry(entry, err_msg):
+        """エントリを失敗扱いにし、しきい値を超えたら dead_files に移動する"""
+        nonlocal dead_count
+        e2 = dict(entry)
+        e2["attempts"] = e2.get("attempts", 0) + 1
+        e2["last_failed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        e2["last_error"] = (err_msg or "")[:500]
+        if "first_failed_at" not in e2:
+            e2["first_failed_at"] = e2["last_failed_at"]
+        should_die, reason = _entry_should_be_dead(e2)
+        if should_die:
+            _promote_to_dead(conn, e2, reason)
+            dead_count += 1
+        else:
+            still_failed.append(e2)
 
     for entry in queue:
         drive_id = entry.get("drive_id", "")
@@ -477,8 +745,13 @@ def _retry_failed_files(service, conn, model_getter):
                 supportsAllDrives=True,
             ).execute())
         except Exception as e:
+            # files().get() で 404 が返ったら即 dead (ファイルが削除された)
+            if "404" in str(e):
+                _promote_to_dead(conn, entry, "404 not found")
+                dead_count += 1
+                continue
             log.warning("再取得失敗 [%s]: %s", file_id, e)
-            still_failed.append(entry)
+            _fail_entry(entry, str(e))
             errors += 1
             continue
 
@@ -498,7 +771,7 @@ def _retry_failed_files(service, conn, model_getter):
                     _save_failed_files(conn, still_failed)
                     return recovered, still_failed, errors, True
                 log.warning("再試行削除失敗 [%s]: %s", file_id, e)
-                still_failed.append(entry)
+                _fail_entry(entry, str(e))
                 errors += 1
             continue
 
@@ -510,7 +783,7 @@ def _retry_failed_files(service, conn, model_getter):
             chunks = _build_chunks(file_info, service, model, splitter)
         except Exception as e:
             log.warning("再試行 chunk 生成失敗 [%s]: %s", file_id, e)
-            still_failed.append(entry)
+            _fail_entry(entry, str(e))
             errors += 1
             continue
 
@@ -534,10 +807,12 @@ def _retry_failed_files(service, conn, model_getter):
                 _save_failed_files(conn, still_failed)
                 return recovered, still_failed, errors, True
             log.warning("再試行 upsert 失敗 [%s]: %s", file_id, e)
-            still_failed.append(entry)
+            _fail_entry(entry, str(e))
             errors += 1
 
     _save_failed_files(conn, still_failed)
+    if dead_count > 0:
+        log.warning("dead files に移動: %d件", dead_count)
     return recovered, still_failed, errors, False
 
 
@@ -691,6 +966,9 @@ def _run(args):
     combined_failed = list(retry_still_failed) + list(new_failed_files)
     _save_failed_files(conn, combined_failed)
 
+    # dead_files の現在数 (sync_history / 通知用)
+    dead_count = len(_load_dead_files(conn))
+
     _save_sync_result(conn, {
         "synced_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "added": all_added,
@@ -702,8 +980,12 @@ def _run(args):
         "drives_with_changes": drives_with_changes,
         "retry_recovered": len(retry_recovered),
         "retry_pending": len(combined_failed),
+        "dead_files_total": dead_count,
         "disk_full": disk_full,
     })
+
+    # issue #7: retry_pending しきい値超えで Telegram 通知
+    _maybe_notify_retry_pending(conn, len(combined_failed), dead_count)
 
     total_changes = len(all_added) + len(all_updated) + len(all_deleted)
     if disk_full:

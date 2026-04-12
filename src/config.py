@@ -85,6 +85,27 @@ EMBEDDING_MODEL = "multi-qa-mpnet-base-dot-v1"
 CHUNK_SIZE = 600
 CHUNK_OVERLAP = 120
 BATCH_SIZE = 100
+# PyTorch デバイス: auto (デフォルト、MPS/CUDA 優先), cpu (強制 CPU, MPS クラッシュ回避), mps, cuda
+# Apple Silicon + PyTorch MPS backend のメモリ破壊バグに遭遇した場合は cpu に設定:
+#   EMBEDDING_DEVICE=cpu   # config.env
+# 参考: https://github.com/pytorch/pytorch/issues?q=MPS+softmax
+EMBEDDING_DEVICE = os.environ.get("EMBEDDING_DEVICE", "auto")
+
+# Google API リトライ設定 (issue #5)
+# _api_call_with_retry のデフォルト挙動を config.env から制御可能にする。
+API_MAX_RETRIES = int(os.environ.get("API_MAX_RETRIES", "6"))
+API_BASE_DELAY_SEC = float(os.environ.get("API_BASE_DELAY_SEC", "5"))
+# シート値取得専用の retry 上限 (メタデータ取得より厳しく設定可能)
+API_SHEET_MAX_RETRIES = int(os.environ.get("API_SHEET_MAX_RETRIES", "6"))
+
+# Telegram 通知設定 (issue #7)
+# retry_pending 数が閾値を超えたら Telegram に直接 HTTPS API で送信する
+# 空文字なら通知無効
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_RETRY_PENDING_THRESHOLD = int(os.environ.get("TELEGRAM_RETRY_PENDING_THRESHOLD", "10"))
+# 同じ閾値で連続通知しないためのクールダウン (秒)
+TELEGRAM_NOTIFY_COOLDOWN_SEC = int(os.environ.get("TELEGRAM_NOTIFY_COOLDOWN_SEC", "3600"))
 
 # パス
 TOKEN_PATH = PROJECT_ROOT / os.environ.get("GOOGLE_TOKEN_PATH", "token.pickle")
