@@ -702,6 +702,17 @@ def collect_file_lists(service):
             fetch_list.append((done_drives, drive_id, drive_name))
 
         def _fetch_drive(idx, drive_id, drive_name):
+            """1ドライブのファイル一覧を取得する (外側 retry 付き)。
+
+            内側の list_files_in_drive は _api_call_with_retry 経由で個別リクエストを
+            レート制限・5xx 再試行するが、list_files_in_drive 自体が最終的に raise
+            された場合の外側フォールバックとしてここで 3 回まで再試行する。
+            過去事例: 2026-04-12 db4 ビルドで HTTP 500 で GW_PJ 10,769 ファイルが
+            silently 欠落した。内側 retry が 5xx を網羅しておらず、外側も 429 のみ
+            だったため二重の取りこぼしが発生した。
+            """
+            from src.drive_client import _is_retriable_error
+
             _fetch_start(idx)
             # レート制限バックオフ中なら待つ
             while True:
@@ -711,37 +722,45 @@ def collect_file_lists(service):
                 if remaining <= 0:
                     break
                 time.sleep(remaining)
-            try:
-                svc = authenticate()
-                files = list_files_in_drive(svc, drive_id=drive_id)
-                attach_folder_paths(files, drive_name)
-                _fetch_complete(idx)
-                _log(f"取得完了 #{idx} {drive_name}: {len(files)}件")
-                return idx, drive_name, files, None
-            except Exception as e:
-                error_str = str(e)
-                if "rate limit" in error_str.lower() or "429" in error_str:
-                    _log(f"レート制限 #{idx} {drive_name}: 10秒後リトライ")
+
+            last_error = None
+            max_attempts = 3
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    svc = authenticate()
+                    files = list_files_in_drive(svc, drive_id=drive_id)
+                    attach_folder_paths(files, drive_name)
+                    _fetch_complete(idx)
+                    if attempt == 1:
+                        _log(f"取得完了 #{idx} {drive_name}: {len(files)}件")
+                    else:
+                        _log(f"リトライ成功 #{idx} {drive_name} (attempt {attempt}): {len(files)}件")
+                    return idx, drive_name, files, None
+                except Exception as e:
+                    last_error = e
+                    error_str = str(e)
+                    if not _is_retriable_error(error_str):
+                        _log(f"取得失敗 #{idx} {drive_name} (非リトライ): {e}")
+                        _fetch_complete(idx)
+                        return idx, drive_name, None, e
+                    if attempt >= max_attempts:
+                        _log(f"取得失敗 #{idx} {drive_name} (リトライ上限 {max_attempts} 到達): {e}")
+                        _fetch_complete(idx)
+                        return idx, drive_name, None, e
+                    # リトライ対象エラー: 待機して再試行
+                    wait_sec = min(10 * attempt, 60)
+                    _log(f"リトライ対象エラー #{idx} {drive_name} (attempt {attempt}/{max_attempts}, {wait_sec}s 後再試行): {error_str[:200]}")
                     with rate_lock:
-                        rate_backoff[0] = time.time() + 10
-                    time.sleep(10)
-                    try:
-                        svc = authenticate()
-                        files = list_files_in_drive(svc, drive_id=drive_id)
-                        attach_folder_paths(files, drive_name)
-                        _fetch_complete(idx)
-                        _log(f"リトライ成功 #{idx} {drive_name}: {len(files)}件")
-                        return idx, drive_name, files, None
-                    except Exception as e2:
-                        _log(f"リトライ失敗 #{idx} {drive_name}: {e2}")
-                        _fetch_complete(idx)
-                        return idx, drive_name, None, e2
-                _log(f"取得失敗 #{idx} {drive_name}: {e}")
-                _fetch_complete(idx)
-                return idx, drive_name, None, e
+                        rate_backoff[0] = max(rate_backoff[0], time.time() + wait_sec)
+                    time.sleep(wait_sec)
+
+            # 理論上到達しない (ループ内で必ず return する)
+            _fetch_complete(idx)
+            return idx, drive_name, None, last_error
 
         # nスレッドで並列取得
         executor = ThreadPoolExecutor(max_workers=FETCH_THREADS)
+        failed_drives = []  # 取得失敗ドライブ (最終サマリで警告するため)
         try:
             futures = [
                 executor.submit(_fetch_drive, idx, did, dname)
@@ -753,18 +772,47 @@ def collect_file_lists(service):
                 try:
                     idx, drive_name, files, error = future.result()
                 except Exception as _fut_ex:
-                    print(f"ERROR: ファイル一覧取得スレッド例外: {_fut_ex}", file=sys.stderr)
+                    _log(f"ERROR: ファイル一覧取得スレッド例外: {_fut_ex}")
+                    failed_drives.append(("?", "unknown", str(_fut_ex)))
                     continue
                 if error:
-                    print(f"ERROR: {drive_name}: {error}", file=sys.stderr)
+                    _log(f"ERROR: ドライブ取得失敗 {drive_name}: {error}")
+                    failed_drives.append((idx, drive_name, str(error)))
                 elif files:
                     results.append((idx, drive_name, files))
+                else:
+                    # files が空 (未初期化) なのに error も None: 想定外だが安全側に倒す
+                    _log(f"ERROR: ドライブ取得結果不整合 {drive_name}")
+                    failed_drives.append((idx, drive_name, "empty result"))
         except KeyboardInterrupt:
             executor.shutdown(wait=False, cancel_futures=True)
             _fetch_stop.set()
             raise
         finally:
             executor.shutdown(wait=False)
+
+        # フェッチ漏れ検出: 期待ドライブ数と実際の取得件数が一致するか確認
+        expected_drive_count = len(fetch_list)
+        actual_drive_count = len(results)
+        if actual_drive_count < expected_drive_count:
+            missing_count = expected_drive_count - actual_drive_count
+            print("", flush=True)
+            print("=" * 60, flush=True)
+            print(f"🔴 フェッチ漏れ検出: {missing_count}/{expected_drive_count} ドライブが取得失敗", flush=True)
+            for idx, dname, err in failed_drives:
+                print(f"  ❌ #{idx} {dname}", flush=True)
+                print(f"     └─ {str(err)[:300]}", flush=True)
+            print("=" * 60, flush=True)
+            print("", flush=True)
+            print("❗ 取得失敗ドライブがあるとビルドは silently 不完全になります。", flush=True)
+            print("❗ 推奨: Ctrl+C で中断 → しばらく待ってから ./run_build.sh で再実行", flush=True)
+            print("❗ 続行する場合: 取得成功したドライブだけで build_parallel が走ります", flush=True)
+            print("", flush=True)
+            # デフォルトは「続行」だが、abort モードもサポート:
+            #   GRIDWORLDRAG_ABORT_ON_FETCH_FAIL=1 で即 exit する
+            if os.environ.get("GRIDWORLDRAG_ABORT_ON_FETCH_FAIL") == "1":
+                print("GRIDWORLDRAG_ABORT_ON_FETCH_FAIL=1 指定のため中断します。", flush=True)
+                sys.exit(2)
 
         # 番号順にソートして追加
         for idx, drive_name, files in sorted(results):

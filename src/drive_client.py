@@ -35,8 +35,43 @@ def set_rate_limit_callback(callback):
     global _rate_limit_callback
     _rate_limit_callback = callback
 
+def _is_retriable_error(error_str):
+    """Google API エラーが一時的で再試行すべきかを判定する。
+
+    - Rate limit / quota: 429 相当
+    - Server errors: 500/502/503/504 (Internal Error / Bad Gateway /
+      Service Unavailable / Gateway Timeout)
+    - Connection errors: 接続リセット、タイムアウトなど
+
+    db4 ビルド時に HTTP 500 (Internal Error) で GW_PJ 10,769 ファイルが
+    silently 欠落する事故があり、5xx もリトライ対象に追加した。
+    """
+    s = error_str.lower()
+    if "rate limit" in s or "429" in s or "quota" in s:
+        return True
+    # HTTP 5xx server errors
+    for code in ("500", "502", "503", "504"):
+        if code in error_str:
+            return True
+    if "internal error" in s or "bad gateway" in s or "service unavailable" in s:
+        return True
+    if "gateway timeout" in s or "backenderror" in s:
+        return True
+    # Connection level
+    if "connection reset" in s or "connection aborted" in s:
+        return True
+    return False
+
+
 def _api_call_with_retry(func, max_retries=6, base_delay=5):
-    """Google API 呼び出しをレート制限対応のリトライ付きで実行する。
+    """Google API 呼び出しをレート制限・一時的サーバエラー対応のリトライ付きで実行する。
+
+    リトライ対象:
+    - 429 Rate Limit / Quota Exceeded
+    - HTTP 5xx (500 Internal Error, 502 Bad Gateway, 503 Service Unavailable,
+      504 Gateway Timeout)
+    - Connection reset / aborted
+    _is_retriable_error() を参照。
 
     Sheets API の per-minute クォータ (60req/min) 回復には最大 60 秒かかるため、
     バックオフの累計待ち時間が 60 秒を超えるように設計する:
@@ -53,7 +88,7 @@ def _api_call_with_retry(func, max_retries=6, base_delay=5):
             return func()
         except Exception as e:
             error_str = str(e)
-            if "rate limit" in error_str.lower() or "429" in error_str or "quota" in error_str.lower():
+            if _is_retriable_error(error_str):
                 if _rate_limit_callback:
                     _rate_limit_callback(True)
                 # 指数バックオフ + ジッター: base_delay * 2^attempt + [0, base_delay) ランダム
