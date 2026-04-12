@@ -29,7 +29,7 @@ from src.config import (
     EMBEDDING_MODEL, EMBEDDING_DEVICE, CHUNK_SIZE, CHUNK_OVERLAP, BATCH_SIZE,
     GOOGLE_EMAIL, INDEX_MY_DRIVE, INDEX_SHARED_DRIVES, INDEX_IMAGE_OCR,
     PARALLEL_WORKERS, TASK_SPLIT_THRESHOLD, MONITOR_INTERVAL_MS,
-    WORKER_START_INTERVAL_SEC, FETCH_THREADS,
+    WORKER_START_INTERVAL_SEC, FETCH_THREADS, BUILD_MIN_TMP_FREE_BYTES,
     load_shared_drives_whitelist, WorkerStatus,
 )
 from src.drive_client import (
@@ -44,6 +44,33 @@ PROGRESS_DIR = "/tmp/gridworldrag_progress"
 FILELIST_PKL = "/tmp/gridworldrag_filelist.pkl"
 TASK_DATA_PKL = "/tmp/gridworldrag_taskdata.pkl"
 FOLDER_MIME = "application/vnd.google-apps.folder"
+
+
+def _preflight_tmp_disk_space(min_free_bytes=None):
+    """/tmp の空き容量が taskdata.pkl 書き込みに足りるかチェックする (issue #12)。
+
+    ENOSPC で pickle.dump が失敗すると Queue に空タスクが流れ、検知が難しい silent
+    data loss になる。起動時に shutil.disk_usage で /tmp をチェックして不足時は
+    即 abort する。
+    """
+    import shutil
+    if min_free_bytes is None:
+        min_free_bytes = BUILD_MIN_TMP_FREE_BYTES
+    try:
+        usage = shutil.disk_usage("/tmp")
+    except OSError as e:
+        print(f"警告: /tmp の空き容量チェック失敗 ({e})、処理を続行します", flush=True)
+        return
+    if usage.free < min_free_bytes:
+        free_mb = usage.free / (1024 * 1024)
+        need_mb = min_free_bytes / (1024 * 1024)
+        print(
+            f"エラー: /tmp 空き容量不足 (free={free_mb:.0f}MB < 必要={need_mb:.0f}MB)\n"
+            f"  taskdata.pkl / filelist.pkl 書き込みが ENOSPC で失敗する可能性があるため中止します。\n"
+            f"  BUILD_MIN_TMP_FREE_BYTES で閾値変更可能。",
+            file=sys.stderr, flush=True,
+        )
+        sys.exit(2)
 
 
 # ---------------------------------------------------------------------------
@@ -1026,6 +1053,10 @@ def main():
         import src.db as _db
         _db.DB_NAME = f"gridworldrag_{args.db}"
         print(f"DB: gridworldrag_{args.db} を使用")
+
+    # /tmp 空き容量プリフライト (issue #12)
+    # dry-run でも書き込みがあるわけではないがコスト極小なので常に実行
+    _preflight_tmp_disk_space()
 
     if args.work_only:
         # pickle からファイル一覧を読み込み

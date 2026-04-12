@@ -183,7 +183,10 @@ def authenticate():
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+            # OAuth token refresh は oauth2.googleapis.com に依存しており、
+            # 5xx / connection reset で瞬断することがある。
+            # _api_call_with_retry を使って一時エラーを吸収する。
+            _api_call_with_retry(lambda: creds.refresh(Request()))
         else:
             client_config = {
                 "installed": {

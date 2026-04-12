@@ -57,31 +57,63 @@ def test_release_is_idempotent():
 
 
 @_with_temp_lockfile
-def test_acquire_exits_on_fresh_lock():
-    sync_rotate.LOCK_FILE.write_text("99999")  # 別プロセスっぽいPID
+def test_acquire_exits_on_live_pid():
+    """現在実行中のプロセス PID が書かれていたら exit(0)。"""
+    sync_rotate.LOCK_FILE.write_text(str(os.getpid()))
     try:
         sync_rotate._acquire_lock()
     except SystemExit as e:
         assert e.code == 0
         return
-    assert False, "should have exited"
+    assert False, "should have exited on live PID"
 
 
 @_with_temp_lockfile
-def test_acquire_takes_over_stale_lock():
-    sync_rotate.LOCK_FILE.write_text("99999")
-    # 30分前に戻す (stale = >20分)
-    old_time = time.time() - 1800
+def test_acquire_takes_over_dead_pid():
+    """死んだ PID が書かれていたら mtime に関わらず takeover。"""
+    # PID 99999 は普通存在しない（kernel PID_MAX を超える環境は稀）
+    # 念のため使用中でないことを確認してから書く
+    dead_pid = 99999
+    try:
+        os.kill(dead_pid, 0)
+        dead_pid = 99998  # 別の候補
+    except (ProcessLookupError, PermissionError):
+        pass
+    sync_rotate.LOCK_FILE.write_text(str(dead_pid))
+    # わざと fresh mtime (今) のまま
+    sync_rotate._acquire_lock()
+    assert sync_rotate.LOCK_FILE.read_text() == str(os.getpid())
+
+
+@_with_temp_lockfile
+def test_acquire_takes_over_stale_lock_unreadable_pid():
+    """PID が読めない破損 lockfile は mtime fallback で stale 扱い。"""
+    sync_rotate.LOCK_FILE.write_text("garbage-not-an-int")
+    old_time = time.time() - 1800  # 30分前 (>_STALE_LOCK_SEC=1200)
     os.utime(sync_rotate.LOCK_FILE, (old_time, old_time))
 
     sync_rotate._acquire_lock()
     assert sync_rotate.LOCK_FILE.read_text() == str(os.getpid())
 
 
+@_with_temp_lockfile
+def test_acquire_fresh_unreadable_pid_exits():
+    """PID 読めない + 新しい mtime → fallback で exit(0)。"""
+    sync_rotate.LOCK_FILE.write_text("")  # 空ファイル
+    try:
+        sync_rotate._acquire_lock()
+    except SystemExit as e:
+        assert e.code == 0
+        return
+    assert False, "should have exited on fresh unreadable lock"
+
+
 if __name__ == "__main__":
     test_acquire_when_no_lock()
     test_release_removes_lock()
     test_release_is_idempotent()
-    test_acquire_exits_on_fresh_lock()
-    test_acquire_takes_over_stale_lock()
-    print("All 5 tests passed.")
+    test_acquire_exits_on_live_pid()
+    test_acquire_takes_over_dead_pid()
+    test_acquire_takes_over_stale_lock_unreadable_pid()
+    test_acquire_fresh_unreadable_pid_exits()
+    print("All 7 tests passed.")

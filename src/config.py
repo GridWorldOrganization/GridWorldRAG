@@ -80,6 +80,12 @@ WORKER_START_INTERVAL_SEC = float(os.environ.get("WORKER_START_INTERVAL_SEC", "5
 DRIVE_DOWNLOAD_TIMEOUT_SEC = int(os.environ.get("DRIVE_DOWNLOAD_TIMEOUT_SEC", "30"))
 FETCH_THREADS = int(os.environ.get("FETCH_THREADS", "3"))
 
+# build_parallel の /tmp 空き容量プリフライト閾値 (issue #12)
+# taskdata.pkl / filelist.pkl の書き込みが ENOSPC で失敗すると silent data loss を起こすため、
+# 起動時に /tmp の空き容量をチェックして不足時は即 abort する。
+# デフォルト 500MB (大規模ビルドでも taskdata.pkl は数百MB 程度)
+BUILD_MIN_TMP_FREE_BYTES = int(os.environ.get("BUILD_MIN_TMP_FREE_BYTES", str(500 * 1024 * 1024)))
+
 # 埋め込み
 EMBEDDING_MODEL = "multi-qa-mpnet-base-dot-v1"
 CHUNK_SIZE = 600

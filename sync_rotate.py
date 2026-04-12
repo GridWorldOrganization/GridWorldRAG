@@ -105,18 +105,51 @@ def _setup_logging():
 
 
 def _acquire_lock():
+    """多重起動防止。PID liveness probe で死んだロックを即 takeover する。
+
+    判定順:
+    1. lockfile に書かれた PID を os.kill(pid, 0) で probe
+       - ProcessLookupError → 前回プロセスは終了済み、takeover
+       - PermissionError    → 他ユーザーのプロセスが生きている可能性、exit(0)
+       - 成功               → 生存中、exit(0)
+    2. PID が読めない (破損/空) → mtime ベースの fallback (20分 stale)
+    """
     if LOCK_FILE.exists():
         try:
-            age = time.time() - LOCK_FILE.stat().st_mtime
-        except FileNotFoundError:
-            age = _STALE_LOCK_SEC + 1
-        if age <= _STALE_LOCK_SEC:
-            log.info("前回実行中 (age=%ds) スキップ", int(age))
-            sys.exit(0)
-        try:
-            LOCK_FILE.unlink()
-        except FileNotFoundError:
-            pass
+            content = LOCK_FILE.read_text().strip()
+            prev_pid = int(content) if content else None
+        except (OSError, ValueError):
+            prev_pid = None
+
+        if prev_pid is not None:
+            try:
+                os.kill(prev_pid, 0)
+            except ProcessLookupError:
+                log.info("stale lock (pid=%d は終了済み) を引き継ぎ", prev_pid)
+                try:
+                    LOCK_FILE.unlink()
+                except FileNotFoundError:
+                    pass
+            except PermissionError:
+                log.info("前回実行中 (pid=%d, 他ユーザー) スキップ", prev_pid)
+                sys.exit(0)
+            else:
+                log.info("前回実行中 (pid=%d) スキップ", prev_pid)
+                sys.exit(0)
+        else:
+            # PID 不明: mtime fallback
+            try:
+                age = time.time() - LOCK_FILE.stat().st_mtime
+            except FileNotFoundError:
+                age = _STALE_LOCK_SEC + 1
+            if age <= _STALE_LOCK_SEC:
+                log.info("前回実行中 (pid不明, age=%ds) スキップ", int(age))
+                sys.exit(0)
+            log.info("stale lock (pid不明, age=%ds) を引き継ぎ", int(age))
+            try:
+                LOCK_FILE.unlink()
+            except FileNotFoundError:
+                pass
     LOCK_FILE.write_text(str(os.getpid()))
 
 
