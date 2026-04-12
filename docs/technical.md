@@ -5,16 +5,16 @@
 ```
 Google Drive ──→ build_parallel.py ──→ PostgreSQL + pgvector
                  (build_single.py)              ↑
-                 watcher.py ───────────────────┘ (差分更新・予定)
+                 sync_rotate.py ──────────────┘ (ローテーション差分同期)
                                                 ↑
-Claude Code ←→ mcp_server.py ─────────────────┘ (検索・予定)
+Claude Code ←→ gridworld-rag-mcp/server.py ───┘ (MCP 検索)
 ```
 
 ## 処理フロー全体像
 
 `./run_build.sh` 実行時の全処理を順序立てて記述する。
 
-### Phase 1: 初期化（run_build.sh）
+### Phase 0: 初期化（run_build.sh）
 
 1. 前回の進捗ファイル (`/tmp/gridworldrag_progress/`) をクリア、ログファイルを初期化
 2. venv を有効化
@@ -22,21 +22,21 @@ Claude Code ←→ mcp_server.py ───────────────�
 4. `shared_drives_whitelist.txt` からドライブ総数を算出
 5. ヘッダ表示（ドライブ数、ワーカー数）
 6. 開始時刻を `/tmp/gridworldrag_start_time` に記録
-7. `build_parallel.py --fetch-only` をフォアグラウンド実行（stdout に直接表示）
-8. `build_parallel.py --work-only` をバックグラウンド起動（stdout+stderr → ログファイル）
+7. **Resume 判定**: `filelist.pkl` が存在すれば `[Y/n]` プロンプト。Y（デフォルト）で Phase 1 スキップ、N で再取得
+8. Phase 1 → Phase 2 → Phase 3 を順次実行
 9. Ctrl+C トラップを設定
 10. モニター起動
 
-### Phase 2: Google Drive 認証（build_parallel.py）
+### Phase 1-a: Google Drive 認証（build_parallel.py）
 
 1. `token.pickle` が存在すれば読み込み
 2. トークンが有効ならそのまま使用
-3. 期限切れならリフレッシュ
+3. 期限切れなら `_api_call_with_retry` 付きでリフレッシュ（5xx / connection reset をリトライ）
 4. トークンがなければブラウザで OAuth 認証（初回のみ）
 5. 認証情報を `_credentials` に保持（Sheets API でも再利用）
 6. Drive API v3 のサービスオブジェクトを返す
 
-### Phase 3: ファイル一覧取得（collect_file_lists）
+### Phase 1-b: ファイル一覧取得（collect_file_lists, `--fetch-only`）
 
 1. `config.env` の `INDEX_MY_DRIVE` / `INDEX_SHARED_DRIVES` を確認
 2. `shared_drives_whitelist.txt` からホワイトリストを読み込み
@@ -64,7 +64,7 @@ Claude Code ←→ mcp_server.py ───────────────�
 - ファイル一覧取得完了後、結果を `/tmp/gridworldrag_filelist.pkl` に pickle 保存
 - `--work-only` でワーカーフェーズに遷移
 
-### Phase 4: タスク分割（_split_into_tasks）
+### Phase 2: タスク分割（`--split-only`、_split_into_tasks）
 
 1. 各ドライブのファイル数を `TASK_SPLIT_THRESHOLD`（config.env、デフォルト 5000）と比較
 2. 閾値以下 → 1 タスク（`part: "1/1"`）
@@ -95,9 +95,9 @@ Claude Code ←→ mcp_server.py ───────────────�
 | レート制限待ち | Google API のレート制限（429）に到達、バックオフ中 |
 | done | 全タスク完了 |
 
-### Phase 5: ワーカー起動（--work-only モード）
+### Phase 3: ワーカー起動（`--work-only` モード）
 
-1. pickle からファイル一覧を読み込み
+1. `taskdata.pkl` からタスクメタ + ファイルデータを読み込み（旧フォーマットの場合は filelist.pkl から再分割）
 2. `authenticate()` で認証（`_credentials` をセット、ワーカー内の Sheets API で必要）
 3. `min(PARALLEL_WORKERS, タスク数)` 個のワーカープロセスを生成
 4. 各ワーカーは `daemon=True`（親プロセス終了時に自動停止）
@@ -113,7 +113,7 @@ Claude Code ←→ mcp_server.py ───────────────�
    - Google Drive API に認証（`httplib2.Http(timeout=N)` でソケットタイムアウト付き）
    - 起動時に PID をログ記録
 
-### Phase 6: ファイル処理（_worker_main）
+### Phase 3-b: ファイル処理（_worker_main）
 
 各ワーカーはキューからタスクを `get(timeout=5)` で取得（ポーリング待機）し、完了したら次のタスクを取る。sentinel (`None`) を受け取ると終了。
 
@@ -240,7 +240,7 @@ if file_exists(conn, file_info["id"]):
 1. DB から全ファイル ID を一括取得（`split_part` で `drive_file_id` から抽出）
 2. タスクごとに、対象ファイル ID が DB に存在するか集合演算で確認
 3. `SKIP_MIME_TYPES`（ショートカット等）は対象外として除外
-4. 10% 以上の欠落がある場合は警告表示
+4. 1 件でも欠落があれば警告表示（10% 許容ウィンドウは v0.1.2 で撤廃）
 5. DB 全体のレコード数を表示
 
 #### 7-3. 最終サマリ出力
@@ -373,8 +373,8 @@ Google Drive 認証中... 完了
 
 - ワーカーごとの累積値（処理/スキップ/エラー/チャンク）
 - 整合性チェック: タスクごとに DB 内のファイル数を確認
-  - `OK DB found/expected` — 10% 未満の欠落は OK
-  - `警告 DB found/expected (n 件不足)` — 10% 以上の欠落
+  - `OK DB found/expected` — 欠落なし
+  - `警告 DB found/expected (n 件不足)` — 1 件以上の欠落
 
 #### シャットダウン時
 
@@ -394,13 +394,13 @@ Google Drive 認証中... 完了
 
 ### パス
 
-`/tmp/gridworldrag_progress/worker_{n}.json`（n は 0 始まり）
+`/tmp/gridworldrag_progress/worker_{n}.json`（n は 1 始まり）
 
 ### JSON フィールド
 
 | フィールド | 型 | 説明 |
 |-----------|-----|------|
-| `worker_id` | int | ワーカー ID（0 始まり） |
+| `worker_id` | int | ワーカー ID（1 始まり） |
 | `drive` | str | 現在処理中のドライブ名 |
 | `drive_type` | str | `"共有"` or `"マイ"` |
 | `current` | int | タスク内の処理済みファイル数 |
@@ -427,18 +427,18 @@ ready → running → (rate_limited → running)* → ready → running → ... 
 
 ### モニターの画面制御方式
 
-`tput sc/rc`（カーソル位置の保存/復元）方式を採用。macOS Terminal.app / iTerm2 で動作確認済み。
+相対カーソルアップ方式（`\033[NA]` + 前回印刷行数追跡）を採用。macOS Terminal.app / iTerm2 で動作確認済み。
 
-- 初回: `TOTAL_LINES` 行分の空行で表示領域を確保 → カーソルを先頭に戻して `tput sc` で位置保存
-- 更新: `tput rc` で保存位置に戻り → 各行を `\033[K`（行クリア）付きで上書き
-- ちらつきなし、カーソル位置ずれなし
+- 初回: そのまま出力（`LAST_LINE_COUNT=0`）
+- 更新: 前回印刷した行数分だけ `\033[NA]` でカーソルを上に戻し → 各行を `\033[K`（行クリア）付きで上書き
+- 前回より行数が減った場合は余剰行もクリア
 
 以下の方式は不採用:
 
 | 方式 | 不採用理由 |
 |------|-----------|
 | `clear` + `echo` | ファイル一覧表示が消える。画面が毎回全クリアされて目障り |
-| `\033[nA`（相対カーソル移動） | ファイル一覧（20行超）の後にモニターが開始すると、カーソル上移動がファイル一覧領域に突入し表示が壊れる |
+| `tput sc/rc` | Python サブプロセスが ESC 7 を発行すると保存位置が上書きされ、20-30% の確率で表示崩壊 |
 | `\033[H`（カーソル先頭移動） | 画面最上部に移動してしまい、ファイル一覧の上にモニターを上書きする |
 
 ## タスク分割ロジック
@@ -450,8 +450,8 @@ ready → running → (rate_limited → running)* → ready → running → ... 
    - 全ドライブの `(1/n)` → 全ドライブの `(2/n)` → ... の順
    - これにより各ドライブの最初の分割が優先処理され、全ドライブに均等に着手する
    - 手が空いたワーカーから `(2/n)` 以降に着手
-5. キュー末尾にワーカー数分の `None`（センチネル）を追加
-6. ワーカーはキューからタスクを1つずつ取得（ブロッキング `get()`）、`None` で終了
+5. **センチネルは即時投入しない**: 全ワーカー idle + `pending_tasks` アトミックカウンタ == 0 を sentinel 監視スレッドが検知してから `None` を投入
+6. ワーカーはキューからタスクを `get(timeout=5)` でポーリング取得、`None` で終了
 
 ### タスクキューのデータ分離
 
@@ -468,9 +468,9 @@ ready → running → (rate_limited → running)* → ready → running → ... 
 
 Google Drive API / Sheets API の呼び出しには `_api_call_with_retry()` でリトライを適用。
 
-- 対象エラー: `429`, `rate limit`, `quota`
-- リトライ: 最大 5 回
-- 待機時間: `2^attempt + random(0,1)` 秒（エクスポネンシャルバックオフ）
+- 対象エラー: `429`, `rate limit`, `quota`, HTTP 5xx (`500`/`502`/`503`/`504`), `connection reset`/`aborted`
+- リトライ: 最大 `API_MAX_RETRIES` 回（config.env、デフォルト 6）
+- 待機時間: `API_BASE_DELAY_SEC * 2^attempt + random(0, API_BASE_DELAY_SEC)` 秒（エクスポネンシャルバックオフ）
 - レート制限中はワーカーのステータスが `rate_limited`（レート制限待ち）に変わる
 
 ### Sheets API セマフォ
@@ -498,6 +498,8 @@ Sheets API は `ReadRequestsPerMinutePerUser: 60` の制限がある。8ワー�
 | `sheet_gid` | TEXT | スプレッドシートのシート ID |
 | `sheet_name` | TEXT | スプレッドシートのシート名 |
 | `permissions` | JSONB | アクセス権限 |
+| `partial_content` | BOOLEAN | テキスト抽出が部分的な場合 TRUE（PDF タイムアウト等） |
+| `folder_path` | TEXT | ドライブ内のフォルダパス（`Drive / Folder / Sub`） |
 | `created_at` | TIMESTAMPTZ | DB 投入日時 |
 
 ### permissions JSONB 構造

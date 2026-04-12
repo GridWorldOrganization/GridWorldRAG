@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.1.3] - 2026-04-12
+
+### Fixed
+
+- **Monitor display corruption (20-30%)** — `tput sc/rc` replaced with relative cursor-up (`\033[NA]` + line count tracking). Python subprocesses could emit ESC 7, overwriting the terminal's saved cursor position.
+- **Lockfile stale detection** — `_acquire_lock()` now uses `os.kill(pid, 0)` PID liveness probe before falling back to mtime-based 20-minute stale check. Dead PIDs are taken over immediately instead of waiting.
+- **OAuth token refresh fragility** — `creds.refresh(Request())` wrapped in `_api_call_with_retry()` to survive transient 5xx / connection reset from oauth2.googleapis.com.
+
+### Added
+
+- **3-phase build** — `build_parallel.py` restructured into `--fetch-only` (Phase 1), `--split-only` (Phase 2, new), `--work-only` (Phase 3). Phase 2 splits tasks from filelist.pkl into taskdata.pkl, enabling Phase 1 skip on resume.
+- **Resume prompt** — `run_build.sh` now prompts `[Y/n]` when filelist.pkl exists. Y (default) skips Phase 1, N re-fetches (needed after whitelist changes).
+- **`/tmp` disk space preflight** — `_preflight_tmp_disk_space()` checks `shutil.disk_usage("/tmp")` against `BUILD_MIN_TMP_FREE_BYTES` (default 500MB) before pickle writes. Insufficient space exits with code 2.
+- **`sync_history` MCP tool** — returns sync_rotate execution history with aggregated stats for the past N days.
+- **11 new tests** — OAuth refresh retry (4), /tmp preflight (5), lockfile PID probe (2 updated). Total: 82 tests across 11 files.
+
+### Changed
+
+- **`TASK_SPLIT_THRESHOLD`** default remains 5000 in code but can be tuned in config.env (user tested with 200-500 for better parallelism with 6 workers).
+- **GitHub Issues #10-12** created and closed — PID probe, OAuth retry, /tmp preflight.
+
 ## [0.1.2] - 2026-04-11
 
 ### Fixed

@@ -82,7 +82,7 @@ vi config.env
 ビルド中に他の作業もしたい場合はワーカー数を減らす（例: 8）。
 PC をフル活用する場合は `./run_calc_workers.sh` で最適値を自動設定。
 
-`FETCH_THREADS`（デフォルト: 20）はファイル一覧取得フェーズのスレッド数。共有ドライブごとに並列でメタデータを取得する。ワーカー数とは独立した設定で、フェッチフェーズ完了後に並列ワーカーが起動する。
+`FETCH_THREADS`（デフォルト: 3）はファイル一覧取得フェーズのスレッド数。共有ドライブごとに並列でメタデータを取得する。ワーカー数とは独立した設定で、フェッチフェーズ完了後に並列ワーカーが起動する。
 
 `TASK_SPLIT_THRESHOLD`（デフォルト: 5000）を超えるファイル数の共有ドライブは自動分割され、複数ワーカーで並列処理される。ワーカーはタスクキュー方式で、手が空いたら次のタスクを取る。
 
@@ -99,9 +99,13 @@ PC をフル活用する場合は `./run_calc_workers.sh` で最適値を自動�
 初回実行時にブラウザが開き、Google アカウントでの認証が求められます。
 
 実行の流れ:
-1. **ファイル一覧取得**（2〜3分）: 全共有ドライブからファイルメタデータを収集
-2. **並列処理開始**: ワーカーごとにドライブを分担し、テキスト抽出→埋め込み→DB投入を並列実行
-3. **モニター表示**（`run_build.sh` の場合）: 2秒ごとに各ワーカーの進捗率・チャンク数を表示
+1. **Phase 1: ファイル一覧取得**（2〜5分）: 全共有ドライブからファイルメタデータを収集
+2. **Phase 2: タスク分解**（即完了）: ドライブを `TASK_SPLIT_THRESHOLD` 単位でタスクに分割
+3. **Phase 3: VectorDB 作成**: ワーカーがタスクを分担し、テキスト抽出→埋め込み→DB投入を並列実行 + リアルタイムモニター
+
+前回のファイル一覧（filelist.pkl）が残っている場合、起動時に resume プロンプトが表示される:
+- **Y**（デフォルト、Enter のみ）: Phase 1 スキップ、前回の一覧を再利用
+- **N**: ホワイトリスト更新時はこちら。最初から取得し直す
 
 #### 中断と再開（resume）
 
@@ -156,12 +160,17 @@ GridWorldRAG/
 ├── launchd/
 │   └── co.gridworld.gridworldrag.sync.plist  ← LaunchAgent テンプレート
 ├── tests/
-│   ├── test_db_escape.py          ← LIKE エスケープ
-│   ├── test_sync_rotate_lock.py   ← lockfile 挙動
-│   ├── test_drive_fields.py       ← Drive API fields 文字列検証
-│   ├── test_disk_check.py         ← 空き容量チェック
-│   ├── test_log_rotation.py       ← RotatingFileHandler
-│   └── test_retry_queue.py        ← 再試行キュー + DiskFull検出
+│   ├── test_db_escape.py              ← LIKE エスケープ (6)
+│   ├── test_sync_rotate_lock.py       ← lockfile PID probe (7)
+│   ├── test_drive_fields.py           ← Drive API fields (5)
+│   ├── test_disk_check.py             ← 空き容量チェック (4)
+│   ├── test_log_rotation.py           ← RotatingFileHandler (3)
+│   ├── test_retry_queue.py            ← 再試行キュー (7)
+│   ├── test_extract_text_fallback.py  ← 未対応 MIME fallback (12)
+│   ├── test_retry_classification.py   ← HTTP 5xx リトライ分類 (16)
+│   ├── test_resilience_hardening.py   ← prefix collision + partial (13)
+│   ├── test_oauth_refresh_retry.py    ← OAuth refresh retry (4)
+│   └── test_build_preflight.py        ← /tmp preflight (5)
 └── docs/
     ├── technical.md               ← 技術リファレンス
     └── vectordb.md                ← ベクトルDB設計メモ
@@ -215,7 +224,7 @@ PostgreSQL LIKE のメタ文字から守るためのエスケープ関数。`del
 
 ### `gridworld-rag-mcp/server.py`
 
-Claude Code 用の MCP サーバー。FastMCP ベースで 5 ツールを提供する。
+Claude Code 用の MCP サーバー。FastMCP ベースで 6 ツールを提供する。
 
 | ツール | 用途 |
 |---|---|
@@ -224,6 +233,7 @@ Claude Code 用の MCP サーバー。FastMCP ベースで 5 ツールを提供�
 | `stats` | インデックス DB の統計（総件数・ファイルタイプ・オーナー別集計） |
 | `folder_tree` | DB からフォルダ構成ツリーを再構築して表示 |
 | `recent_changes` | 直近の差分同期（`sync_rotate.py`）で追加・更新・削除されたファイル一覧 |
+| `sync_history` | sync_rotate 実行履歴の一覧・集計（直近 N 日間） |
 
 ```bash
 # Claude Code への登録
@@ -433,13 +443,13 @@ tail -f /tmp/gridworldrag_sync.err
 | スリープ中 | 発火せず（復帰後に `RunAtLoad` で1回走る） |
 | CPU優先度 | Nice=5（低優先、他作業の邪魔をしない） |
 | 前回終了後の最短間隔 | 10秒（ThrottleInterval） |
-| 多重起動 | lockfile で防止（20分stale） |
+| 多重起動 | lockfile + PID liveness probe で防止（PID 死亡なら即 takeover、PID 不明時は 20 分 stale） |
 | 接続先DB | `--db 3`（plist内で固定） |
 | 絶対パス | plist 内にハードコード（マシン固有） |
 
 ### トラブルシュート
 
-- **「前回実行中 skip」と毎回出る**: `/tmp/gridworldrag_rotate.lock` を確認。20分以上古ければ自動解除されるが、即時復旧したいなら手動で `rm`
+- **「前回実行中 skip」と毎回出る**: lockfile に書かれた PID が生存中の可能性。プロセスが死んでいれば自動 takeover されるが、即時復旧したいなら手動で `rm /tmp/gridworldrag_rotate.lock`
 - **変更があるはずなのに反応しない**: Changes API はトークン発行時点以降の変更しか拾わない。過去の未反映ファイルは拾えない → フル再ビルドが必要
 - **PostgreSQL エラー**: `plist` の `EnvironmentVariables.PATH` に ARM 版 `/opt/homebrew/opt/postgresql@17/bin` が入っているか確認
 - **`exit 2` で毎回落ちる**: `shutil.disk_usage` がしきい値 (1GB) 未満を検出している可能性。`df -h /opt/homebrew/var/postgresql@17` で確認
@@ -451,18 +461,10 @@ tail -f /tmp/gridworldrag_sync.err
 
 ```bash
 # 全テスト実行
-for t in tests/test_*.py; do .venv/bin/python "$t"; done
-
-# 個別実行
-.venv/bin/python tests/test_db_escape.py       # LIKE エスケープ helper
-.venv/bin/python tests/test_sync_rotate_lock.py  # lockfile 挙動
-.venv/bin/python tests/test_drive_fields.py   # Drive API fields 文字列検証
-.venv/bin/python tests/test_disk_check.py     # 空き容量チェック
-.venv/bin/python tests/test_log_rotation.py   # RotatingFileHandler
-.venv/bin/python tests/test_retry_queue.py    # 再試行キュー + DiskFull検出
+for t in tests/test_*.py; do GRIDWORLDRAG_SKIP_CONFIG=1 .venv/bin/python "$t"; done
 ```
 
-テスト総数: 30 件 (6 ファイル)。外部依存なしで ~1 秒で全件通る。
+テスト総数: 82 件 (11 ファイル)。外部依存なしで ~2 秒で全件通る。
 
 ## 内部運用: secrets の管理（GridWorldOrganization メンバー向け）
 

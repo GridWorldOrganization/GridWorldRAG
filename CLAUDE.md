@@ -47,13 +47,18 @@ GridWorldRAG/
 │   └── run_mcp.sh          # MCP 起動スクリプト
 ├── launchd/
 │   └── co.gridworld.gridworldrag.sync.plist  # LaunchAgent 定義（5分間隔）
-├── tests/                  # 単体テスト（DB・Drive API モックなし、全30件）
-│   ├── test_db_escape.py
-│   ├── test_sync_rotate_lock.py
-│   ├── test_drive_fields.py
-│   ├── test_disk_check.py
-│   ├── test_log_rotation.py
-│   └── test_retry_queue.py
+├── tests/                  # 単体テスト（82件、11ファイル）
+│   ├── test_db_escape.py           # LIKE エスケープ (6)
+│   ├── test_sync_rotate_lock.py    # lockfile PID probe (7)
+│   ├── test_drive_fields.py        # Drive API fields (5)
+│   ├── test_disk_check.py          # 空き容量チェック (4)
+│   ├── test_log_rotation.py        # RotatingFileHandler (3)
+│   ├── test_retry_queue.py         # 再試行キュー (7)
+│   ├── test_extract_text_fallback.py  # 未対応 MIME フォールバック (12)
+│   ├── test_retry_classification.py   # HTTP 5xx リトライ分類 (16)
+│   ├── test_resilience_hardening.py   # prefix collision + partial (13)
+│   ├── test_oauth_refresh_retry.py    # OAuth token refresh retry (4)
+│   └── test_build_preflight.py        # /tmp 空き容量プリフライト (5)
 ├── run_build.sh            # 2フェーズ実行ランチャー
 ├── run_build_single.sh     # シングルプロセス版ランチャー
 ├── run_sync_rotate.sh      # sync_rotate 起動スクリプト
@@ -76,7 +81,9 @@ GridWorldRAG/
 
 ### 並列インデックスビルド（build_parallel.py）
 
-- **2フェーズ実行**: `--fetch-only`（フォアグラウンド、ファイル一覧取得）→ `--work-only`（バックグラウンド、インデックス構築）
+- **3フェーズ実行**: `--fetch-only`（Phase 1、ファイル一覧取得）→ `--split-only`（Phase 2、タスク分解、即完了）→ `--work-only`（Phase 3、VectorDB 作成）
+- **resume プロンプト**: run_build.sh 起動時に filelist.pkl が残っていれば「resume しますか？ [Y/n]」を表示、Y（デフォルト）で Phase 1 スキップ、N でホワイトリスト更新後の再取得
+- **/tmp 空き容量プリフライト**: `BUILD_MIN_TMP_FREE_BYTES`（デフォルト 500MB）未満で exit(2)
 - **タスクキュー方式**: `multiprocessing.Queue` + sentinel `None` でワーカー終了制御
 - **Pickle IPC**: 大きなタスクデータは `/tmp/gridworldrag_taskdata.pkl` に分離（Queue のパイプブロッキング回避）
 - **ラウンドロビン順序**: 全ドライブの (1/n) → (2/n) → ... の順でキューに投入（公平分散）
@@ -119,7 +126,7 @@ GridWorldRAG/
 
 ### MCP サーバー（gridworld-rag-mcp/server.py）
 
-- FastMCP ベース、5ツール: `search`（セマンティック検索）, `lookup`（URL直接取得）, `stats`（統計）, `folder_tree`（DB からフォルダツリー再構築）, `recent_changes`（直近の差分同期結果）
+- FastMCP ベース、6ツール: `search`（セマンティック検索）, `lookup`（URL直接取得）, `stats`（統計）, `folder_tree`（DB からフォルダツリー再構築）, `recent_changes`（直近の差分同期結果）, `sync_history`（sync_rotate 実行履歴・集計）
 - `search` はクエリ内の URL を自動検出し、URL lookup + セマンティック検索を併用
 - 埋め込みモデルは遅延ロード（初回 search 時にロード、FastMCP tool 呼び出しは serialize されるためスレッド安全性は問題なし）
 - プロジェクトスコープで登録済み: `claude mcp add gridworld-rag-mcp --scope project`
@@ -130,7 +137,7 @@ GridWorldRAG/
 - 1実行 = 全ドライブを一巡チェック。変更ゼロのドライブは Changes API 1コールで即スキップ
 - 22ドライブ×変更ゼロで実測 **約7秒**/実行
 - 埋め込みモデルは変更発生時のみ遅延ロード
-- `/tmp/gridworldrag_rotate.lock` で多重起動防止（20分 stale）
+- `/tmp/gridworldrag_rotate.lock` で多重起動防止（PID liveness probe → mtime fallback 20分 stale）
 - launchd の LaunchAgent（`launchd/co.gridworld.gridworldrag.sync.plist`）から5分間隔実行
 - sync.py（旧実装）は削除済み。`drive_client.list_changes(service, token, drive_id=None)` に統合
 
@@ -181,14 +188,9 @@ GridWorldRAG/
 - workspace-mcp は開発中の確認・検証用途でのみ使用する
 - 完成コード（Python）には MCP を使わない。`google-api-python-client` で直接 Google API を呼ぶ
 
-## GitHub Issues（既知の課題）
+## GitHub Issues（全て closed）
 
-- #1: ファイル一覧取得後に DB 容量の推計を表示
-- #2: 巨大ファイル処理中のファイル内進捗表示
-- #3: モニター表示中に Enter を押すとヘッダ行が重複する
-- #4: PDF 処理タイムアウト：壊れた PDF が長時間ブロックする問題
-- #5: Sheets API リトライ設定を config.env で変更可能にする
-- #6: PyTorch MPS backend crash during model.encode() on Apple Silicon
-- #7: sync_rotate: retry_pending 閾値超えで Telegram 通知
-- #8: sync_rotate: disk_full 履歴の集計とトレンド分析
-- #9: sync_rotate: failed_files の TTL と諦めロジック
+- #1〜#9: v0.1.2 で対応済み（DB 容量推計、ファイル内進捗、Enter キー問題、PDF タイムアウト、Sheets retry 設定、MPS workaround、Telegram 通知、sync_history、failed_files TTL）
+- #10: lockfile PID liveness probe（v0.1.3）
+- #11: OAuth token refresh retry（v0.1.3）
+- #12: build_parallel /tmp 空き容量プリフライト（v0.1.3）
