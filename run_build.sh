@@ -1,5 +1,10 @@
 #!/bin/bash
-# GridWorldRAG - インデックス構築 起動スクリプト
+# GridWorldRAG - インデックス構築 起動スクリプト (3フェーズ)
+#
+# Phase 1: ファイル一覧取得 (Google Drive API)
+# Phase 2: タスク分解 (即完了)
+# Phase 3: VectorDB 作成 (並列ワーカー + モニター)
+#
 # 使い方: ./run_build.sh [--db N]   例: ./run_build.sh --db 1 → gridworldrag_1 に構築
 set -e
 
@@ -18,11 +23,8 @@ done
 
 PROGRESS_DIR="/tmp/gridworldrag_progress"
 LOG_FILE="/tmp/gridworldrag_build.log"
-
-# クリーンアップ
-rm -rf "$PROGRESS_DIR"
-mkdir -p "$PROGRESS_DIR"
-: > "$LOG_FILE"
+FILELIST_PKL="/tmp/gridworldrag_filelist.pkl"
+TASK_DATA_PKL="/tmp/gridworldrag_taskdata.pkl"
 
 # venv
 PYTHON="$SCRIPT_DIR/.venv/bin/python"
@@ -61,10 +63,47 @@ cleanup() {
 }
 trap cleanup INT TERM
 
-# Phase 1: ファイル一覧取得（stdout は画面に直接表示される）
-$PYTHON build_parallel.py --fetch-only $DB_OPT 2>>"$LOG_FILE"
+# --- Resume 判定 ---
+SKIP_PHASE1=false
+if [ -f "$FILELIST_PKL" ]; then
+    # stty を一時的に復元して read を使えるようにする
+    echo ""
+    echo "前回のファイル一覧 (filelist.pkl) が残っています。"
+    echo "  Y: resume (Phase 1 スキップ、前回の一覧を再利用)"
+    echo "  N: 最初から取得 (ホワイトリスト更新した場合はこちら)"
+    echo ""
+    read -r -p "resume しますか？ [Y/n]: " REPLY
+    case "$REPLY" in
+        [nN])
+            echo "→ Phase 1 からやり直します"
+            rm -f "$FILELIST_PKL" "$TASK_DATA_PKL"
+            ;;
+        *)
+            echo "→ resume: Phase 1 をスキップします"
+            SKIP_PHASE1=true
+            ;;
+    esac
+fi
 
-# Phase 2: ワーカー処理（バックグラウンド）
+# クリーンアップ
+rm -rf "$PROGRESS_DIR"
+mkdir -p "$PROGRESS_DIR"
+: > "$LOG_FILE"
+
+# --- Phase 1: ファイル一覧取得 ---
+if [ "$SKIP_PHASE1" = false ]; then
+    $PYTHON build_parallel.py --fetch-only $DB_OPT 2>>"$LOG_FILE"
+fi
+
+# --- Phase 2: タスク分解 ---
+$PYTHON build_parallel.py --split-only $DB_OPT 2>>"$LOG_FILE"
+
+# --- Phase 3: VectorDB 作成 (バックグラウンド + モニター) ---
+echo ""
+echo "=========================================="
+echo " Phase 3: VectorDB 作成"
+echo "=========================================="
+
 # resource_tracker のセマフォリーク偽陽性警告を抑制
 PYTHONWARNINGS="ignore::UserWarning:multiprocessing.resource_tracker" \
   $PYTHON build_parallel.py --work-only $DB_OPT >> "$LOG_FILE" 2>&1 &

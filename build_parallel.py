@@ -1038,9 +1038,11 @@ def main():
                         help="使用するDB番号 (例: --db 1 → gridworldrag_1。未指定は GRIDWORLDRAG_DB_INDEX または 0)")
     parser.add_argument("--dry-run", action="store_true", help="処理対象の確認のみ")
     parser.add_argument("--fetch-only", action="store_true",
-                        help="ファイル一覧取得のみ（結果を /tmp/gridworldrag_filelist.pkl に保存）")
+                        help="Phase1: ファイル一覧取得のみ（結果を filelist.pkl に保存）")
+    parser.add_argument("--split-only", action="store_true",
+                        help="Phase2: タスク分解のみ（filelist.pkl → taskdata.pkl）")
     parser.add_argument("--work-only", action="store_true",
-                        help="ワーカー処理のみ（/tmp/gridworldrag_filelist.pkl を読み込み）")
+                        help="Phase3: VectorDB作成のみ（taskdata.pkl を読み込み）")
     args = parser.parse_args()
 
     if args.db is not None:
@@ -1059,68 +1061,120 @@ def main():
     _preflight_tmp_disk_space()
 
     if args.work_only:
-        # pickle からファイル一覧を読み込み
-        with open(FILELIST_PKL, "rb") as f:
-            drive_file_lists = pickle.load(f)
+        # Phase 3: taskdata.pkl から直接ワーカー起動
+        if not os.path.exists(TASK_DATA_PKL):
+            print("エラー: taskdata.pkl がありません。--split-only を先に実行してください。",
+                  file=sys.stderr, flush=True)
+            sys.exit(1)
+        with open(TASK_DATA_PKL, "rb") as f:
+            bundle = pickle.load(f)
+        task_file_data = bundle["files"]
+        total_items = bundle["total_items"]
+
+        if "task_meta" in bundle:
+            # 新フォーマット (Phase 2 で保存済み)
+            task_meta = bundle["task_meta"]
+        else:
+            # 旧フォーマット互換: filelist.pkl から再分割
+            print("taskdata.pkl に task_meta がありません。filelist.pkl から再分割します...",
+                  flush=True)
+            with open(FILELIST_PKL, "rb") as f:
+                drive_file_lists = pickle.load(f)
+            tasks_tmp = _split_into_tasks(drive_file_lists)
+            task_meta = []
+            for i, t in enumerate(tasks_tmp):
+                task_meta.append({
+                    "task_id": i,
+                    "label": t["label"],
+                    "drive_type": t["drive_type"],
+                    "part": t["part"],
+                    "drive_total": t["drive_total"],
+                })
+
+        tasks = [{"label": tm["label"], "drive_type": tm["drive_type"],
+                  "part": tm["part"], "drive_total": tm["drive_total"],
+                  "files": task_file_data[tm["task_id"]]}
+                 for tm in task_meta]
+        n_workers = min(args.workers, len(tasks))
         # 認証（ワーカー内の get_sheets_service() 等で _credentials が必要）
         authenticate()
     else:
-        # 1. 認証
-        print("Google Drive 認証中...", end="", flush=True)
-        service = authenticate()
-        print(" 完了", flush=True)
+        if not args.split_only:
+            # Phase 1: ファイル一覧取得
+            print("=" * 40)
+            print(" Phase 1: ファイル一覧取得")
+            print("=" * 40)
+            print("Google Drive 認証中...", end="", flush=True)
+            service = authenticate()
+            print(" 完了", flush=True)
 
-        # 2. ファイル一覧取得
-        try:
-            drive_file_lists = collect_file_lists(service)
-        except KeyboardInterrupt:
-            print(f"\r{FETCH_THREADS}スレッドでファイル一覧を取得中... 中断\033[K")
-            sys.exit(1)
-        print(f"\r{FETCH_THREADS}スレッドでファイル一覧を取得中... 完了\033[K")
-        print_file_list_summary(drive_file_lists)
+            try:
+                drive_file_lists = collect_file_lists(service)
+            except KeyboardInterrupt:
+                print(f"\r{FETCH_THREADS}スレッドでファイル一覧を取得中... 中断\033[K")
+                sys.exit(1)
+            print(f"\r{FETCH_THREADS}スレッドでファイル一覧を取得中... 完了\033[K")
+            print_file_list_summary(drive_file_lists)
 
-        if args.fetch_only:
-            # pickle に保存して終了
             with open(FILELIST_PKL, "wb") as f:
                 pickle.dump(drive_file_lists, f)
+
+            if args.fetch_only:
+                return
+        else:
+            # --split-only: filelist.pkl を読み込む
+            if not os.path.exists(FILELIST_PKL):
+                print("エラー: filelist.pkl がありません。--fetch-only を先に実行してください。",
+                      file=sys.stderr, flush=True)
+                sys.exit(1)
+            with open(FILELIST_PKL, "rb") as f:
+                drive_file_lists = pickle.load(f)
+
+        # Phase 2: タスク分解
+        print("")
+        print("=" * 40)
+        print(" Phase 2: タスク分解")
+        print("=" * 40)
+        tasks = _split_into_tasks(drive_file_lists)
+        n_workers = min(args.workers, len(tasks))
+
+        print(f"タスク分割: {len(drive_file_lists)} ドライブ → {len(tasks)} タスク "
+              f"(閾値: {TASK_SPLIT_THRESHOLD})")
+        for t in tasks:
+            print(f"  {t['label']}({t['part']}): {len(t['files'])} ファイル")
+
+        if args.dry_run:
             return
 
-    # 3. タスク分割
-    tasks = _split_into_tasks(drive_file_lists)
-    n_workers = min(args.workers, len(tasks))
+        # タスクデータを pickle に保存
+        task_file_data = {}
+        task_meta = []
+        for i, t in enumerate(tasks):
+            task_file_data[i] = t["files"]
+            task_meta.append({
+                "task_id": i,
+                "label": t["label"],
+                "drive_type": t["drive_type"],
+                "part": t["part"],
+                "drive_total": t["drive_total"],
+            })
 
-    print(f"\nタスク分割: {len(drive_file_lists)} ドライブ → {len(tasks)} タスク "
-          f"(閾値: {TASK_SPLIT_THRESHOLD})")
-    for t in tasks:
-        print(f"  {t['label']}({t['part']}): {len(t['files'])} ファイル")
+        total_items = sum(len(t["files"]) for t in tasks)
+        with open(TASK_DATA_PKL, "wb") as f:
+            pickle.dump({
+                "files": task_file_data,
+                "task_meta": task_meta,
+                "total_items": total_items,
+                "total_drives": len(drive_file_lists),
+                "total_tasks": len(tasks),
+            }, f)
 
-    if args.dry_run:
-        return
+        if args.split_only:
+            print(f"\ntaskdata.pkl 保存完了 ({len(tasks)} タスク, {total_items} アイテム)")
+            return
 
-    # 4. タスクキュー（センチネル方式）
-    # タスクにファイルデータを入れると Queue のパイプが詰まるため、
-    # ファイルデータは pickle ファイルに保存し、キューにはインデックスのみ入れる
-    task_file_data = {}  # task_id → files
-    task_meta = []  # キューに入れる軽量タスク情報
-    for i, t in enumerate(tasks):
-        task_file_data[i] = t["files"]
-        task_meta.append({
-            "task_id": i,
-            "label": t["label"],
-            "drive_type": t["drive_type"],
-            "part": t["part"],
-            "drive_total": t["drive_total"],
-        })
-
-    # ファイルデータと全アイテム数を pickle に保存（ワーカー・モニターが読み込む）
-    total_items = sum(len(t["files"]) for t in tasks)
-    with open(TASK_DATA_PKL, "wb") as f:
-        pickle.dump({
-            "files": task_file_data,
-            "total_items": total_items,
-            "total_drives": len(drive_file_lists),
-            "total_tasks": len(tasks),
-        }, f)
+        # 連続実行: Phase 3 へ
+        authenticate()
 
     # 各ドライブの 1/n → 全ドライブの 2/n → ... の順でキューに入れる
     max_parts = max((int(t["part"].split("/")[1]) for t in tasks), default=1)
