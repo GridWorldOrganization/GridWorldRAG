@@ -86,11 +86,15 @@ def _write_progress(worker_id, *, task_label="", task_current=0, task_size=0,
 # ---------------------------------------------------------------------------
 
 def _error_fallback(file_info, file_name, model, batch):
-    """エラー時にファイル名だけでもDBに記録する。"""
+    """エラー時にファイル名だけでもDBに記録する。
+
+    partial_content=True を立てることで、MCP 等から
+    `WHERE partial_content=true` で再取得対象として識別可能にする。
+    """
     try:
         text = f"[エラー] {file_name}"
         emb = model.encode([text])[0]
-        batch.append(make_chunk_entry(file_info, text, emb, 0))
+        batch.append(make_chunk_entry(file_info, text, emb, 0, partial_content=True))
         return 0, 0, 1, 1  # error=1, chunk=1（メタデータのみ）
     except Exception:
         return 0, 0, 1, 0  # 埋め込み生成も失敗した場合
@@ -251,6 +255,22 @@ def _worker(worker_id, task_queue, tasks_total, results_queue, sheets_semaphore,
     except Exception as ex:
         print(f"[FATAL] W{worker_id} ワーカー異常終了: {ex}", flush=True)
         import traceback; traceback.print_exc()
+        # ワーカーが握っていたタスクを pending_tasks から除外する。
+        # _worker_main が task_queue.get() した直後にクラッシュした場合、そのタスクは
+        # もう誰も処理しない (キューから消えている) が pending_tasks にはまだ残っている。
+        # sentinel は pending_tasks<=0 を待つので、この調整がないとビルド全体が hang する。
+        # 保守的な推定: 「ワーカーがキューから引き取ったタスク数」が不明なので、
+        # 残タスクを全て自分で引き取ったと仮定して大きく減らすのは危険。
+        # 代わりに「少なくとも現在処理中のタスクは完了扱いにする」= -1 だけ減らす。
+        # 他のワーカーが本来取るべきだったタスクは他ワーカーが引き取る。
+        try:
+            with pending_tasks.get_lock():
+                if pending_tasks.value > 0:
+                    pending_tasks.value -= 1
+                    print(f"[FATAL] W{worker_id} クラッシュ回復: pending_tasks -= 1 "
+                          f"(残 {pending_tasks.value})", flush=True)
+        except Exception:
+            pass
         # 異常終了時のみ結果を送信（正常終了時は _worker_main 内で送信済み）
         results_queue.put({
             "worker_id": worker_id,
@@ -388,8 +408,31 @@ def _worker_main(worker_id, task_queue, tasks_total, results_queue, sheets_semap
                 try:
                     insert_chunks(conn, batch)
                 except Exception as _db_ex:
-                    print(f"[{time.strftime('%H:%M:%S')}] W{worker_id} DB挿入エラー（{len(batch)}件ロスト）: {_db_ex}", flush=True)
-                    total_errors += 1
+                    # 失敗したバッチの file_id を列挙してログに残す
+                    # (以前は "N件ロスト" と件数しか出なかったため、どのファイルが
+                    # ロストしたか追跡できなかった)
+                    _lost_file_ids = set()
+                    for _chunk in batch:
+                        _dfid = _chunk.get("drive_file_id", "")
+                        # drive_file_id = "{file_id}_chunk_N" or "{file_id}_sheet_..._chunk_N"
+                        # file_id までを切り出す
+                        if "_sheet_" in _dfid:
+                            _lost_file_ids.add(_dfid.split("_sheet_", 1)[0])
+                        elif "_chunk_" in _dfid:
+                            _lost_file_ids.add(_dfid.split("_chunk_", 1)[0])
+                    _unique_files_lost = len(_lost_file_ids)
+                    print(
+                        f"[{time.strftime('%H:%M:%S')}] W{worker_id} DB挿入エラー: "
+                        f"{len(batch)}チャンク / {_unique_files_lost}ファイル がロスト: {_db_ex}",
+                        flush=True,
+                    )
+                    # 失敗したファイル ID を列挙 (先頭 10 件)
+                    for _fid in sorted(_lost_file_ids)[:10]:
+                        print(f"  ロスト: {_fid}", flush=True)
+                    if len(_lost_file_ids) > 10:
+                        print(f"  ... 他 {len(_lost_file_ids) - 10} 件", flush=True)
+                    # errors カウンタはファイル単位で加算 (以前はバッチ単位=1 だった)
+                    total_errors += _unique_files_lost
                     try:
                         conn.close()
                     except Exception:
@@ -452,8 +495,25 @@ def _worker_main(worker_id, task_queue, tasks_total, results_queue, sheets_semap
             try:
                 insert_chunks(conn, batch)
             except Exception as _db_ex:
-                print(f"[{time.strftime('%H:%M:%S')}] W{worker_id} DB挿入エラー（残{len(batch)}件ロスト）: {_db_ex}", flush=True)
-                total_errors += 1
+                # タスク末尾バッチの失敗: 通常パスと同様にファイル単位で追跡
+                _lost_file_ids = set()
+                for _chunk in batch:
+                    _dfid = _chunk.get("drive_file_id", "")
+                    if "_sheet_" in _dfid:
+                        _lost_file_ids.add(_dfid.split("_sheet_", 1)[0])
+                    elif "_chunk_" in _dfid:
+                        _lost_file_ids.add(_dfid.split("_chunk_", 1)[0])
+                _unique_files_lost = len(_lost_file_ids)
+                print(
+                    f"[{time.strftime('%H:%M:%S')}] W{worker_id} DB挿入エラー (タスク末尾): "
+                    f"残{len(batch)}チャンク / {_unique_files_lost}ファイル がロスト: {_db_ex}",
+                    flush=True,
+                )
+                for _fid in sorted(_lost_file_ids)[:10]:
+                    print(f"  ロスト: {_fid}", flush=True)
+                if len(_lost_file_ids) > 10:
+                    print(f"  ... 他 {len(_lost_file_ids) - 10} 件", flush=True)
+                total_errors += _unique_files_lost
                 try:
                     conn.close()
                 except Exception:
@@ -637,12 +697,16 @@ def collect_file_lists(service):
     if INDEX_SHARED_DRIVES and whitelist:
         # 共有ドライブ名を取得（100超対応のページネーション）
         drive_names = {}
+        # drives().list() も _api_call_with_retry で包む (5xx リトライ対応)
+        from src.drive_client import _api_call_with_retry as _retry
         _drives_page_token = None
         while True:
             _drives_kwargs = {"pageSize": 100}
             if _drives_page_token:
                 _drives_kwargs["pageToken"] = _drives_page_token
-            drives_response = service.drives().list(**_drives_kwargs).execute()
+            drives_response = _retry(
+                lambda kw=_drives_kwargs: service.drives().list(**kw).execute()
+            )
             for d in drives_response.get("drives", []):
                 drive_names[d["id"]] = d["name"]
             _drives_page_token = drives_response.get("nextPageToken")
@@ -759,31 +823,37 @@ def collect_file_lists(service):
             return idx, drive_name, None, last_error
 
         # nスレッドで並列取得
+        # future から drive 情報を逆引きできるよう dict にマップする
+        # (以前は future.result() が例外を投げた場合、どのドライブが失敗したか
+        # 分からず "?" / "unknown" と記録していた)
         executor = ThreadPoolExecutor(max_workers=FETCH_THREADS)
         failed_drives = []  # 取得失敗ドライブ (最終サマリで警告するため)
         try:
-            futures = [
-                executor.submit(_fetch_drive, idx, did, dname)
+            future_to_drive = {
+                executor.submit(_fetch_drive, idx, did, dname): (idx, did, dname)
                 for idx, did, dname in fetch_list
-            ]
+            }
 
             results = []
-            for future in as_completed(futures):
+            for future in as_completed(future_to_drive):
+                idx, did, dname = future_to_drive[future]
                 try:
-                    idx, drive_name, files, error = future.result()
+                    returned_idx, returned_name, files, error = future.result()
                 except Exception as _fut_ex:
-                    _log(f"ERROR: ファイル一覧取得スレッド例外: {_fut_ex}")
-                    failed_drives.append(("?", "unknown", str(_fut_ex)))
+                    _log(f"ERROR: ファイル一覧取得スレッド例外 {dname}: {_fut_ex}")
+                    failed_drives.append((idx, dname, str(_fut_ex)))
                     continue
+                # 返り値の idx/name と submit 時の値が一致することを期待するが
+                # 安全のため submit 時のほうを信用する
                 if error:
-                    _log(f"ERROR: ドライブ取得失敗 {drive_name}: {error}")
-                    failed_drives.append((idx, drive_name, str(error)))
+                    _log(f"ERROR: ドライブ取得失敗 {dname}: {error}")
+                    failed_drives.append((idx, dname, str(error)))
                 elif files:
-                    results.append((idx, drive_name, files))
+                    results.append((idx, dname, files))
                 else:
                     # files が空 (未初期化) なのに error も None: 想定外だが安全側に倒す
-                    _log(f"ERROR: ドライブ取得結果不整合 {drive_name}")
-                    failed_drives.append((idx, drive_name, "empty result"))
+                    _log(f"ERROR: ドライブ取得結果不整合 {dname}")
+                    failed_drives.append((idx, dname, "empty result"))
         except KeyboardInterrupt:
             executor.shutdown(wait=False, cancel_futures=True)
             _fetch_stop.set()
@@ -1009,6 +1079,10 @@ def main():
         代わりに pending_tasks アトミックカウンタ (0 で完了) を信用する。
 
         レース回避: 2回連続で確認してから終了判定。
+
+        堅牢性: ループ全体を try/except で包み、一過性の OS エラー (PROGRESS_DIR
+        読み取り失敗、JSON 破損等) では死なない。連続でエラーが続く場合のみ
+        sentinel は abort する (さもなくばビルド全体が hang する)。
         """
         import time as _t
         # 起動直後は全員 ready なので待つ（1秒刻みで shutdown チェック）
@@ -1017,6 +1091,8 @@ def main():
                 return
             _t.sleep(1)
         consecutive_idle = 0
+        consecutive_errors = 0
+        max_consecutive_errors = 30  # 10秒 × 30 = 5分連続エラーで諦め
         while True:
             for _ in range(10):
                 if shutdown_requested:
@@ -1025,32 +1101,58 @@ def main():
             if shutdown_requested:
                 return
             # 全ワーカーの状態を確認
-            all_idle = True
-            worker_count = 0
-            for fname in os.listdir(PROGRESS_DIR):
-                if not fname.startswith("worker_") or not fname.endswith(".json"):
-                    continue
+            try:
+                all_idle = True
+                worker_count = 0
                 try:
-                    with open(os.path.join(PROGRESS_DIR, fname)) as f:
-                        data = json.load(f)
-                    status = data.get("status", "")
-                    worker_count += 1
-                    if status not in (WorkerStatus.READY, WorkerStatus.DONE):
-                        all_idle = False
-                        break
-                except Exception:
-                    all_idle = False
-                    break
-            pending = pending_tasks.value
-            if all_idle and worker_count >= n_workers and pending <= 0:
-                consecutive_idle += 1
-                if consecutive_idle >= 2:
-                    print(f"\n全ワーカー idle + 未完了タスク 0 → 終了シグナル送信", flush=True)
+                    progress_files = os.listdir(PROGRESS_DIR)
+                except OSError as _ls_err:
+                    # PROGRESS_DIR 読み取り失敗 (tmp cleaner 等)
+                    # リトライする: 破壊的判断はしない
+                    print(f"[sentinel] PROGRESS_DIR 読み取り失敗: {_ls_err}", flush=True)
+                    consecutive_errors += 1
+                    if consecutive_errors >= max_consecutive_errors:
+                        print("[sentinel] 連続エラー上限到達、終了シグナルを強制投入", flush=True)
+                        for _ in range(n_workers):
+                            task_queue.put(None)
+                        return
+                    continue
+                for fname in progress_files:
+                    if not fname.startswith("worker_") or not fname.endswith(".json"):
+                        continue
+                    try:
+                        with open(os.path.join(PROGRESS_DIR, fname)) as f:
+                            data = json.load(f)
+                        status = data.get("status", "")
+                        worker_count += 1
+                        if status not in (WorkerStatus.READY, WorkerStatus.DONE):
+                            all_idle = False
+                            break
+                    except (json.JSONDecodeError, IOError, OSError):
+                        # worker が書き込み途中の可能性 → 無視してカウントしない
+                        # 旧実装は all_idle=False で break していたが、これだと
+                        # 永続的な JSON 破損があると sentinel が永遠に発動しない
+                        continue
+                pending = pending_tasks.value
+                if all_idle and worker_count >= n_workers and pending <= 0:
+                    consecutive_idle += 1
+                    if consecutive_idle >= 2:
+                        print("\n全ワーカー idle + 未完了タスク 0 → 終了シグナル送信", flush=True)
+                        for _ in range(n_workers):
+                            task_queue.put(None)
+                        return
+                else:
+                    consecutive_idle = 0
+                consecutive_errors = 0  # 成功したらリセット
+            except Exception as _sentinel_ex:
+                # 想定外の例外: ログだけ出してループ継続 (sentinel 死亡でハングを防ぐ)
+                print(f"[sentinel] 想定外エラー: {_sentinel_ex}", flush=True)
+                consecutive_errors += 1
+                if consecutive_errors >= max_consecutive_errors:
+                    print("[sentinel] 連続エラー上限到達、終了シグナルを強制投入", flush=True)
                     for _ in range(n_workers):
                         task_queue.put(None)
                     return
-            else:
-                consecutive_idle = 0
 
     _sentinel_thread = threading.Thread(target=_sentinel_monitor, daemon=True)
     _sentinel_thread.start()
@@ -1138,11 +1240,16 @@ def main():
         print("\n整合性チェック中...")
         from src.db import connect as db_connect
 
+        # db4 事故の教訓:
+        # - 旧: "missing > expected * 0.1" という 10% 許容ウィンドウがあった
+        #   → 842 件欠落でも「10% 未満なら OK」と誤報告
+        # - 旧: 旧 DB 行 (前回ビルド分) が残っていると intersection で "found" と
+        #   カウントされるため、今回のビルドで再取得できなかった行も OK に見える
+        # 新: 許容ウィンドウを撤廃、どんな欠落でも警告する
         check_conn = db_connect()
         try:
             check_cur = check_conn.cursor()
             try:
-                # DB 内の全ファイルIDを一括取得（drive_file_id の先頭部分）
                 check_cur.execute(
                     "SELECT DISTINCT split_part(drive_file_id, '_chunk_', 1) FROM documents"
                     " UNION "
@@ -1151,6 +1258,9 @@ def main():
                 db_file_ids = {row[0] for row in check_cur.fetchall()}
 
                 all_ok = True
+                total_expected = 0
+                total_found = 0
+                warn_tasks = []
                 for i, t in enumerate(tasks, 1):
                     label = f"{t['label']}({t['part']})"
                     indexable_ids = {
@@ -1160,10 +1270,15 @@ def main():
                     found = len(indexable_ids & db_file_ids)
                     expected = len(indexable_ids)
                     missing = expected - found
+                    total_expected += expected
+                    total_found += found
 
-                    if missing > 0 and missing > expected * 0.1:
-                        print(f"  ({i}/{len(tasks)}) {label}: 警告 DB {found}/{expected}"
-                              f" ({missing} 件不足)")
+                    if missing > 0:
+                        missing_pct = (missing / expected * 100) if expected else 0
+                        severity = "警告" if missing_pct < 10 else "🔴 重大"
+                        print(f"  ({i}/{len(tasks)}) {label}: {severity} DB {found}/{expected}"
+                              f" ({missing} 件不足 {missing_pct:.1f}%)")
+                        warn_tasks.append((label, missing, expected))
                         all_ok = False
                     else:
                         print(f"  ({i}/{len(tasks)}) {label}: OK DB {found}/{expected}")
@@ -1175,11 +1290,16 @@ def main():
         finally:
             check_conn.close()
 
-        print(f"\n  DB 合計: {total_db_rows} レコード")
+        print(f"\n  DB 合計: {total_db_rows} レコード (expected={total_expected}, found={total_found})")
         if all_ok:
             print("  整合性チェック: OK")
         else:
-            print("  整合性チェック: 一部警告あり（ログを確認してください）")
+            total_missing = total_expected - total_found
+            total_missing_pct = (total_missing / total_expected * 100) if total_expected else 0
+            print(f"  整合性チェック: 警告 — {total_missing} 件不足 ({total_missing_pct:.1f}%)")
+            print(f"  影響タスク数: {len(warn_tasks)}")
+            for label, m, e in warn_tasks:
+                print(f"    - {label}: {m}/{e} 不足")
 
     print("\n" + "=" * 60)
     print("中断されました" if shutdown_requested else "完了")

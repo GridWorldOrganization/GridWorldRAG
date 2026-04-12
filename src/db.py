@@ -99,15 +99,33 @@ def insert_chunks(conn, chunks_data, commit=True):
         cur.close()
 
 
-def delete_by_file_id(conn, drive_file_id_prefix, commit=True):
-    """指定した drive_file_id プレフィックスに一致するチャンクを削除する。
+def _file_id_like_pattern(file_id):
+    r"""file_id が drive_file_id の prefix にマッチするLIKE パターンを生成する。
 
-    Drive file ID は '_' を含みうるため LIKE メタ文字をエスケープする。
+    drive_file_id の形式 (src/indexer.py:make_chunk_entry 参照):
+      - 通常:       {file_id}_chunk_{N}
+      - シート:     {file_id}_sheet_{gid}_chunk_{N}
+
+    単純な prefix + '%' だと、file_id="ABCDE" のクエリが
+    "ABCDEF_chunk_0" (別ファイル) にも誤ヒットする (prefix 衝突)。
+    それを防ぐため、file_id の直後に必ず literal underscore があることを要求する:
+        {escaped_file_id}\_%
+    ESCAPE '\' で \_ を literal underscore として解釈させる。
+    """
+    return _escape_like_literal(file_id) + r"\_%"
+
+
+def delete_by_file_id(conn, drive_file_id_prefix, commit=True):
+    """指定した file_id に紐づく全チャンクを削除する。
+
+    drive_file_id の形式は `{file_id}_chunk_N` または `{file_id}_sheet_gid_chunk_N`。
+    prefix 衝突 (file_id="ABC" が "ABCD_chunk_0" に誤ヒット) を避けるため、
+    _file_id_like_pattern() で literal underscore 境界を強制する。
     commit=False の場合は呼び出し側でトランザクションを管理する。
     """
     cur = conn.cursor()
     try:
-        pattern = _escape_like_literal(drive_file_id_prefix) + "%"
+        pattern = _file_id_like_pattern(drive_file_id_prefix)
         cur.execute(
             r"DELETE FROM documents WHERE drive_file_id LIKE %s ESCAPE '\'",
             (pattern,),
@@ -137,7 +155,7 @@ def upsert_file_chunks(conn, file_id, chunks):
     # 既存チェック（読み取りのみ、commit 不要）
     cur = conn.cursor()
     try:
-        pattern = _escape_like_literal(file_id) + "%"
+        pattern = _file_id_like_pattern(file_id)
         cur.execute(
             r"SELECT 1 FROM documents WHERE drive_file_id LIKE %s ESCAPE '\' LIMIT 1",
             (pattern,),
@@ -158,10 +176,13 @@ def upsert_file_chunks(conn, file_id, chunks):
 
 
 def file_exists(conn, file_id):
-    """file_id のチャンクが DB に 1 件でも存在するかを返す。"""
+    """file_id のチャンクが DB に 1 件でも存在するかを返す。
+
+    prefix 衝突を避けるため literal underscore 境界を要求する。
+    """
     cur = conn.cursor()
     try:
-        pattern = _escape_like_literal(file_id) + "%"
+        pattern = _file_id_like_pattern(file_id)
         cur.execute(
             r"SELECT 1 FROM documents WHERE drive_file_id LIKE %s ESCAPE '\' LIMIT 1",
             (pattern,),

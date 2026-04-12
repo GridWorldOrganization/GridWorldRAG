@@ -153,31 +153,32 @@ def folder_tree(drive_filter: str = None) -> str:
     """
     conn = _get_conn()
     cur = conn.cursor()
-
-    if drive_filter:
-        cur.execute(
-            """
-            SELECT folder_path, file_type, COUNT(DISTINCT title) AS cnt
-            FROM documents
-            WHERE folder_path IS NOT NULL AND folder_path != ''
-              AND folder_path LIKE %s
-            GROUP BY folder_path, file_type
-            ORDER BY folder_path, file_type
-            """,
-            (f"{drive_filter}%",),
-        )
-    else:
-        cur.execute(
-            """
-            SELECT folder_path, file_type, COUNT(DISTINCT title) AS cnt
-            FROM documents
-            WHERE folder_path IS NOT NULL AND folder_path != ''
-            GROUP BY folder_path, file_type
-            ORDER BY folder_path, file_type
-            """
-        )
-    rows = cur.fetchall()
-    cur.close()
+    try:
+        if drive_filter:
+            cur.execute(
+                """
+                SELECT folder_path, file_type, COUNT(DISTINCT title) AS cnt
+                FROM documents
+                WHERE folder_path IS NOT NULL AND folder_path != ''
+                  AND folder_path LIKE %s
+                GROUP BY folder_path, file_type
+                ORDER BY folder_path, file_type
+                """,
+                (f"{drive_filter}%",),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT folder_path, file_type, COUNT(DISTINCT title) AS cnt
+                FROM documents
+                WHERE folder_path IS NOT NULL AND folder_path != ''
+                GROUP BY folder_path, file_type
+                ORDER BY folder_path, file_type
+                """
+            )
+        rows = cur.fetchall()
+    finally:
+        cur.close()
 
     if not rows:
         return "folder_path データがありません。次回ビルド後に有効になります。"
@@ -215,11 +216,13 @@ def recent_changes() -> str:
     import json
     conn = _get_conn()
     cur = conn.cursor()
-    cur.execute(
-        "SELECT value, updated_at FROM sync_state WHERE key = 'last_sync_result'"
-    )
-    row = cur.fetchone()
-    cur.close()
+    try:
+        cur.execute(
+            "SELECT value, updated_at FROM sync_state WHERE key = 'last_sync_result'"
+        )
+        row = cur.fetchone()
+    finally:
+        cur.close()
 
     if not row:
         return "差分同期はまだ実行されていません。`./run_sync.sh` を実行してください。"
@@ -275,33 +278,33 @@ def stats() -> str:
     """
     conn = _get_conn()
     cur = conn.cursor()
+    try:
+        cur.execute("SELECT COUNT(*) FROM documents")
+        total_rows = cur.fetchone()[0]
 
-    cur.execute("SELECT COUNT(*) FROM documents")
-    total_rows = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(DISTINCT title) FROM documents")
+        total_files = cur.fetchone()[0]
 
-    cur.execute("SELECT COUNT(DISTINCT title) FROM documents")
-    total_files = cur.fetchone()[0]
+        cur.execute("""
+            SELECT file_type, COUNT(DISTINCT title)
+            FROM documents
+            GROUP BY file_type
+            ORDER BY COUNT(DISTINCT title) DESC
+            LIMIT 10
+        """)
+        type_counts = cur.fetchall()
 
-    cur.execute("""
-        SELECT file_type, COUNT(DISTINCT title)
-        FROM documents
-        GROUP BY file_type
-        ORDER BY COUNT(DISTINCT title) DESC
-        LIMIT 10
-    """)
-    type_counts = cur.fetchall()
-
-    cur.execute("""
-        SELECT owner, COUNT(DISTINCT title)
-        FROM documents
-        WHERE owner != ''
-        GROUP BY owner
-        ORDER BY COUNT(DISTINCT title) DESC
-        LIMIT 10
-    """)
-    owner_counts = cur.fetchall()
-
-    cur.close()
+        cur.execute("""
+            SELECT owner, COUNT(DISTINCT title)
+            FROM documents
+            WHERE owner != ''
+            GROUP BY owner
+            ORDER BY COUNT(DISTINCT title) DESC
+            LIMIT 10
+        """)
+        owner_counts = cur.fetchall()
+    finally:
+        cur.close()
 
     lines = [
         "## インデックスDB統計",

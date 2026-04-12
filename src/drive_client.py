@@ -314,22 +314,52 @@ def list_all_files(service):
     config.env の INDEX_MY_DRIVE / INDEX_SHARED_DRIVES と
     shared_drives_whitelist.txt に基づきスコープを制御する。
     「共有アイテム」（他人から共有されたファイル）は常に対象外。
+
+    Returns:
+        files: list of file_info dicts
+        ※ 以前はエラーを print だけで silent drop していたが、
+          呼び出し側が fail-loud できるよう list_all_files_with_failures()
+          も提供する。この関数は後方互換のため同じシグネチャを保つが、
+          失敗があれば raise ではなく末尾に警告を出す。
+    """
+    files, failed = list_all_files_with_failures(service)
+    if failed:
+        print("", flush=True)
+        print("=" * 60, flush=True)
+        print(f"🔴 ドライブフェッチ漏れ検出: {len(failed)} ドライブが失敗", flush=True)
+        for dname, err in failed:
+            print(f"  ❌ {dname}: {str(err)[:200]}", flush=True)
+        print("=" * 60, flush=True)
+    return files
+
+
+def list_all_files_with_failures(service):
+    """list_all_files() の新版: ファイル一覧と失敗リストを両方返す。
+
+    Returns:
+        (all_files: list, failed_drives: list[(name, error_str)])
     """
     all_files = []
+    failed_drives = []
 
     # マイドライブ（自分が所有するファイルのみ、共有アイテムは除外）
     if INDEX_MY_DRIVE:
         print("  [マイドライブ] 取得中...")
-        my_files = list_files_in_drive(service, corpora="user")
-        # 共有アイテム除外: 自分がオーナーかつ共有ドライブ外のファイルのみ
-        my_files = [
-            f for f in my_files
-            if not f.get("driveId")
-            and f.get("owners")
-            and any(o.get("emailAddress") == GOOGLE_EMAIL for o in f["owners"])
-        ]
-        print(f"  [マイドライブ] {len(my_files)} ファイル")
-        all_files.extend(my_files)
+        try:
+            my_files = list_files_in_drive(service, corpora="user")
+        except Exception as e:
+            print(f"  [マイドライブ] エラー: {e}")
+            failed_drives.append(("マイドライブ", str(e)))
+        else:
+            # 共有アイテム除外: 自分がオーナーかつ共有ドライブ外のファイルのみ
+            my_files = [
+                f for f in my_files
+                if not f.get("driveId")
+                and f.get("owners")
+                and any(o.get("emailAddress") == GOOGLE_EMAIL for o in f["owners"])
+            ]
+            print(f"  [マイドライブ] {len(my_files)} ファイル")
+            all_files.extend(my_files)
 
     # 共有ドライブ
     if INDEX_SHARED_DRIVES:
@@ -337,9 +367,16 @@ def list_all_files(service):
         if not whitelist:
             print("  [共有ドライブ] ホワイトリストが空のためスキップ")
         else:
-            # 共有ドライブの名前を取得
-            drives_response = service.drives().list(pageSize=100).execute()
-            drive_names = {d["id"]: d["name"] for d in drives_response.get("drives", [])}
+            # 共有ドライブの名前を取得 (retry 付き)
+            try:
+                drives_response = _api_call_with_retry(
+                    lambda: service.drives().list(pageSize=100).execute()
+                )
+                drive_names = {d["id"]: d["name"] for d in drives_response.get("drives", [])}
+            except Exception as e:
+                print(f"  [共有ドライブ] drives().list() 失敗: {e}")
+                failed_drives.append(("drives().list (metadata)", str(e)))
+                drive_names = {}
 
             for drive_id in whitelist:
                 drive_name = drive_names.get(drive_id, drive_id)
@@ -350,20 +387,40 @@ def list_all_files(service):
                     all_files.extend(drive_files)
                 except Exception as e:
                     print(f" エラー: {e}")
+                    failed_drives.append((drive_name, str(e)))
 
-    print(f"  合計: {len(all_files)} ファイル")
-    return all_files
+    print(f"  合計: {len(all_files)} ファイル"
+          + (f" (失敗 {len(failed_drives)} ドライブ)" if failed_drives else ""))
+    return all_files, failed_drives
 
 
 def _download_content(service, file_id):
     """ファイルをバイナリでダウンロードする。
-    タイムアウトは httplib2 のソケットタイムアウトで制御。"""
+
+    タイムアウトは httplib2 のソケットタイムアウトで制御。
+    各チャンクダウンロード (next_chunk) も _is_retriable_error による
+    リトライ対応に包む (以前は初回 get_media のみリトライで、中間チャンクの
+    5xx や connection reset で download が失敗し、ファイル全体が落ちていた)。
+    """
     request = _api_call_with_retry(lambda: service.files().get_media(fileId=file_id))
     content = io.BytesIO()
     downloader = MediaIoBaseDownload(content, request)
     done = False
+    chunk_retries = 0
+    max_chunk_retries = 3
     while not done:
-        _, done = downloader.next_chunk()
+        try:
+            _, done = downloader.next_chunk()
+            chunk_retries = 0  # 成功したらリセット
+        except Exception as e:
+            if not _is_retriable_error(str(e)):
+                raise  # 404/403/auth 系は即諦め
+            chunk_retries += 1
+            if chunk_retries > max_chunk_retries:
+                raise  # 3回連続失敗なら諦め
+            wait = 5 * (2 ** (chunk_retries - 1))  # 5s, 10s, 20s
+            print(f"  警告: チャンクダウンロード失敗 (retry {chunk_retries}/{max_chunk_retries}, {wait}s 後): {str(e)[:120]}", flush=True)
+            _time.sleep(wait)
     return content
 
 
