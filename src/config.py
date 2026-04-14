@@ -87,7 +87,7 @@ FETCH_THREADS = int(os.environ.get("FETCH_THREADS", "3"))
 BUILD_MIN_TMP_FREE_BYTES = int(os.environ.get("BUILD_MIN_TMP_FREE_BYTES", str(500 * 1024 * 1024)))
 
 # 埋め込み
-EMBEDDING_MODEL = "multi-qa-mpnet-base-dot-v1"
+EMBEDDING_MODEL = "paraphrase-multilingual-mpnet-base-v2"
 CHUNK_SIZE = 600
 CHUNK_OVERLAP = 120
 BATCH_SIZE = 100
