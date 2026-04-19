@@ -55,7 +55,7 @@ def count_shared_drives():
     if not whitelist_path.exists():
         return 0
     count = 0
-    with open(whitelist_path) as f:
+    with open(whitelist_path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith("#"):

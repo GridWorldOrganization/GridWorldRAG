@@ -36,7 +36,7 @@ def load_config():
         print(f"エラー: {config_path} が見つかりません。")
         print("config.env.example をコピーして config.env を作成してください。")
         sys.exit(1)
-    with open(config_path) as f:
+    with open(config_path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
@@ -126,7 +126,7 @@ def load_shared_drives_whitelist():
     if not SHARED_DRIVES_WHITELIST_PATH.exists():
         return set()
     ids = set()
-    with open(SHARED_DRIVES_WHITELIST_PATH) as f:
+    with open(SHARED_DRIVES_WHITELIST_PATH, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
