@@ -10,7 +10,7 @@ rem Customize the three variables below if needed.
 setlocal
 set WSL_DISTRO=Ubuntu
 set WSL_USER=tobi
-set DB_NUM=4
+set DB_NUM=1
 
 wsl.exe -d %WSL_DISTRO% -u %WSL_USER% -- bash -lc "cd ~/claude_code/GridWorldRAG && ./run_sync_rotate.sh --db %DB_NUM% >> /tmp/gridworldrag_sync.log 2>> /tmp/gridworldrag_sync.err"
 exit /b %ERRORLEVEL%

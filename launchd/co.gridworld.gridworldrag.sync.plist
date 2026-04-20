@@ -10,7 +10,7 @@
         <string>/bin/bash</string>
         <string>/Users/tobisako/dev/claude_code/dev/GridWorldRAG/run_sync_rotate.sh</string>
         <string>--db</string>
-        <string>3</string>
+        <string>1</string>
     </array>
 
     <key>WorkingDirectory</key>
