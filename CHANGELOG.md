@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.2.1] - 2026-04-21
+
+> ⚠️ **BREAKING (DB rebuild required)** — embedding モデル切替により、既存の
+> `embedding` 列は旧モデルで生成された値のため検索結果が不整合になる。
+> このバージョンに上げたら DB を TRUNCATE して再ビルド必須。
+> SemVer 的には 0.3.0 相当だが、0.3.0+ は別の破壊的変更枠として予約済みのため
+> 0.2.1 として発行。
+
+### Fixed
+
+- **Embedding モデル切替（致命バグ修正）** — `multi-qa-mpnet-base-dot-v1` は英語 tokenizer のみで、日本語の熟語漢字を全て `[UNK]` (id=104) に潰していた。結果「採用計画」「税務申告」等の短い日本語クエリが同一 embedding になり、cosine=1.00 で誤ヒット。`paraphrase-multilingual-mpnet-base-v2`（768次元維持、SentencePiece 多言語 tokenizer）に切替。検証: 「採用計画 vs 税務申告」cosine 1.00 → 0.36、100クエリ中 dist=0.000 が 17件 → 0件。prefix 不要、schema 変更不要。
+- **Windows での config/whitelist 文字化け** — `open()` のデフォルトが cp932 で日本語パス/コメントが壊れる問題を修正。UTF-8 強制読み込みに変更。Mac/Linux に影響なし。
+
+### Added
+
+- **Windows Task Scheduler 連携** (`scheduler/windows/`) — Mac の launchd と対になる Windows 定期実行セット。WSL 内の `run_sync_rotate.sh` を薄い bat 経由で呼ぶ。`register_sync_rotate_task.bat` で PowerShell `Register-ScheduledTask` によるタスク登録、`unregister_sync_rotate_task.bat` で削除。Hidden / IgnoreNew / StartWhenAvailable / RunLevel Limited / ExecutionTimeLimit 10 分、管理者権限不要。多重起動は Windows 側 IgnoreNew + WSL 側 `/tmp` lockfile の二段ガード。README に 1 分間隔はテスト用・本番 5 分推奨、Mac launchd との同時運用は Changes API トークン競合で NG 等の運用ノート。
+
+### Changed
+
+- **デフォルト DB 名** を `gridworldrag_4` → `gridworldrag_1` にリネーム（`src/config.py`, `calc_workers.py`, `launchd/co.gridworld.gridworldrag.sync.plist`）。
+
 ## [0.2.0] - 2026-04-12
 
 ### Fixed
