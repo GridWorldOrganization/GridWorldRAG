@@ -23,6 +23,9 @@ websockets
 jinja2
 python-multipart
 
+# MCP (Model Context Protocol) — remote server for Claude Cowork
+mcp>=1.0
+
 # Util
 python-dotenv
 pydantic>=2

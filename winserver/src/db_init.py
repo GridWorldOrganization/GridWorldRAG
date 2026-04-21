@@ -18,6 +18,9 @@ def main() -> int:
     conn = db.connect()
     try:
         db.apply_global_schema(conn)
+        created = db.seed_default_mcp_users(conn)
+        if created:
+            print(f"[db_init] seeded MCP users: {', '.join(created)} (pw=admin)")
     finally:
         conn.close()
     print("[db_init] done")

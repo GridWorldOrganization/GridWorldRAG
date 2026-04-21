@@ -21,7 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-import time
+import time as _time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -110,28 +110,54 @@ async def require_token(request: Request):
 
 
 # ---------------------------------------------------------------------
-# App
+# App — lifespan that also drives the FastMCP session manager
 # ---------------------------------------------------------------------
-app = FastAPI(title="WinServerRAG Control API", version="0.1.0")
+from contextlib import asynccontextmanager
+from src.mcp_server import mcp as _mcp_instance, build_mcp_app as _build_mcp_app
+
+
+@asynccontextmanager
+async def _lifespan(_app):
+    # FastMCP's streamable HTTP requires its session_manager to be "running"
+    # across the lifetime of the app. Sub-app lifespans aren't always
+    # propagated through Mount, so we open it explicitly here.
+    async with _mcp_instance.session_manager.run():
+        # Seed MCP default users (idempotent, fast)
+        try:
+            db.ensure_database()
+            conn = db.connect()
+            try:
+                created = db.seed_default_mcp_users(conn)
+                if created:
+                    log.info("seeded default MCP users: %s", ", ".join(created))
+            finally:
+                conn.close()
+        except Exception as e:
+            log.error("startup mcp-user seed failed (non-fatal): %s", e)
+        # Background pumps
+        asyncio.create_task(_event_pump())
+        asyncio.create_task(_stats_pump())
+        yield
+
+
+app = FastAPI(title="WinServerRAG Control API", version="0.2.0", lifespan=_lifespan)
 
 _web_root = config.PROJECT_ROOT / "web"
 if _web_root.exists():
     app.mount("/static", StaticFiles(directory=str(_web_root / "static")), name="static")
 
+# Mount the MCP Streamable-HTTP server under /mcp, gated by Basic Auth
+# against public.mcp_users. The FastMCP session manager is started by the
+# lifespan context above.
+try:
+    app.mount("/mcp", _build_mcp_app())
+    log.info("MCP endpoint mounted at /mcp")
+except Exception as _e:
+    log.error("MCP mount failed (non-fatal): %s", _e)
 
-@app.on_event("startup")
-async def _startup():
-    # ensure DB / schema
-    try:
-        db.ensure_database()
-        conn = db.connect()
-        db.apply_global_schema(conn)
-        conn.close()
-    except Exception as e:
-        log.error("startup db init failed: %s", e)
 
-    # background: tail events and fan out to subscribers
-    asyncio.create_task(_event_pump())
+# NOTE: startup/shutdown is handled by the `lifespan` function above so the
+# FastMCP session manager gets a proper run-context.
 
 
 @app.get("/")
@@ -149,6 +175,7 @@ class FDView(BaseModel):
     drive_id: str
     name: str
     enabled: bool
+    search_enabled: bool
     state: str
     last_sync_at: Optional[datetime]
     last_build_at: Optional[datetime]
@@ -212,6 +239,32 @@ def api_disable(drive_id: str):
     return {"ok": True, "drive_id": drive_id, "enabled": False}
 
 
+@app.post("/api/fds/{drive_id}/search-enable", dependencies=[Depends(require_token)])
+def api_search_enable(drive_id: str):
+    conn = db.connect()
+    try:
+        row = db.get_fd(conn, drive_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="unknown drive_id")
+        db.set_search_enabled(conn, drive_id, True)
+    finally:
+        conn.close()
+    return {"ok": True, "drive_id": drive_id, "search_enabled": True}
+
+
+@app.post("/api/fds/{drive_id}/search-disable", dependencies=[Depends(require_token)])
+def api_search_disable(drive_id: str):
+    conn = db.connect()
+    try:
+        row = db.get_fd(conn, drive_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="unknown drive_id")
+        db.set_search_enabled(conn, drive_id, False)
+    finally:
+        conn.close()
+    return {"ok": True, "drive_id": drive_id, "search_enabled": False}
+
+
 @app.post("/api/fds/{drive_id}/sync-now", dependencies=[Depends(require_token)])
 def api_sync_now(drive_id: str):
     conn = db.connect()
@@ -271,28 +324,161 @@ def api_available_drives():
     return list(rows.values())
 
 
+@app.get("/api/workers", dependencies=[Depends(require_token)])
+def api_workers():
+    """Live worker state + target count."""
+    conn = db.connect()
+    try:
+        workers = db.list_workers(conn)
+        try:
+            target_s = db.get_config(conn, "worker_count",
+                                     str(config.DAEMON_WORKER_THREADS))
+            target = int(target_s) if target_s else config.DAEMON_WORKER_THREADS
+        except Exception:
+            target = config.DAEMON_WORKER_THREADS
+    finally:
+        conn.close()
+    return {
+        "target": target,
+        "min": 1,
+        "max": 10,
+        "live": len(workers),
+        "workers": workers,
+    }
+
+
+class ScalePayload(BaseModel):
+    n: int
+
+
+class UserCreatePayload(BaseModel):
+    username: str
+    password: str
+
+
+class PasswordPayload(BaseModel):
+    password: str
+
+
+@app.post("/api/workers/scale", dependencies=[Depends(require_token)])
+def api_workers_scale(payload: ScalePayload):
+    n = max(1, min(10, int(payload.n)))
+    conn = db.connect()
+    try:
+        db.set_config(conn, "worker_count", str(n))
+    finally:
+        conn.close()
+    return {"ok": True, "target": n}
+
+
+# -------- MCP users (login credentials for Claude Cowork access) --------
+import re as _re
+_USERNAME_RE = _re.compile(r"^[A-Za-z0-9._\-]{1,64}$")
+
+
+def _validate_username(username: str) -> None:
+    if not _USERNAME_RE.match(username or ""):
+        raise HTTPException(status_code=400,
+                            detail="username must match [A-Za-z0-9._-], 1..64 chars")
+
+
+def _validate_password(password: str) -> None:
+    if not password or len(password) < 4:
+        raise HTTPException(status_code=400, detail="password must be at least 4 chars")
+    if len(password) > 256:
+        raise HTTPException(status_code=400, detail="password too long")
+
+
+@app.get("/api/mcp/users", dependencies=[Depends(require_token)])
+def api_list_mcp_users():
+    conn = db.connect()
+    try:
+        return db.list_mcp_users(conn)
+    finally:
+        conn.close()
+
+
+@app.post("/api/mcp/users", dependencies=[Depends(require_token)])
+def api_create_mcp_user(payload: UserCreatePayload):
+    """Create a new user OR update the password of an existing one (upsert)."""
+    _validate_username(payload.username)
+    _validate_password(payload.password)
+    from src.mcp_auth import hash_password
+    conn = db.connect()
+    try:
+        db.upsert_mcp_user(conn, payload.username, hash_password(payload.password))
+    finally:
+        conn.close()
+    return {"ok": True, "username": payload.username}
+
+
+@app.put("/api/mcp/users/{username}/password", dependencies=[Depends(require_token)])
+def api_change_mcp_password(username: str, payload: PasswordPayload):
+    _validate_username(username)
+    _validate_password(payload.password)
+    from src.mcp_auth import hash_password
+    conn = db.connect()
+    try:
+        if db.get_mcp_user_hash(conn, username) is None:
+            raise HTTPException(status_code=404, detail="unknown user")
+        db.upsert_mcp_user(conn, username, hash_password(payload.password))
+    finally:
+        conn.close()
+    return {"ok": True, "username": username}
+
+
+@app.delete("/api/mcp/users/{username}", dependencies=[Depends(require_token)])
+def api_delete_mcp_user(username: str):
+    _validate_username(username)
+    conn = db.connect()
+    try:
+        n = db.delete_mcp_user(conn, username)
+    finally:
+        conn.close()
+    if n == 0:
+        raise HTTPException(status_code=404, detail="unknown user")
+    return {"ok": True, "username": username}
+
+
+# --- stats cache: refreshed asynchronously in the background so /api/stats
+# --- is a pure in-memory read. Under heavy daemon load PG can take seconds
+# --- for even SELECT 1, so we must never block request handlers on it.
+_stats_cache: dict = {
+    "total_fds": 0, "enabled_fds": 0, "total_files": 0, "total_chunks": 0,
+    "db_size_bytes": None, "pg_ok": False, "drive_ok": True,
+    "last_updated": None,
+}
+_stats_lock = threading.Lock()
+
+
+async def _stats_pump():
+    """Background task: refresh _stats_cache every 5s from DB."""
+    import asyncio as _a
+    while True:
+        await _a.sleep(5.0)
+        try:
+            # Run blocking DB work in a thread
+            def _fetch():
+                conn = db.connect()
+                try:
+                    return db.global_stats(conn)
+                finally:
+                    conn.close()
+            row = await _a.to_thread(_fetch)
+            with _stats_lock:
+                _stats_cache.update(row)
+                _stats_cache["pg_ok"] = True
+                _stats_cache["last_updated"] = _time.time()
+        except Exception:
+            with _stats_lock:
+                _stats_cache["pg_ok"] = False
+                _stats_cache["last_updated"] = _time.time()
+
+
 @app.get("/api/stats", dependencies=[Depends(require_token)])
 def api_stats():
-    pg_ok = True
-    stats_src: dict = {}
-    try:
-        conn = db.connect()
-        try:
-            stats_src = db.global_stats(conn)
-        finally:
-            conn.close()
-    except Exception:
-        pg_ok = False
-    drive_ok = True
-    try:
-        _ = _get_service()
-    except Exception:
-        drive_ok = False
-    return {
-        **stats_src,
-        "pg_ok": pg_ok,
-        "drive_ok": drive_ok,
-    }
+    with _stats_lock:
+        return dict(_stats_cache)
 
 
 @app.get("/api/events", dependencies=[Depends(require_token)])

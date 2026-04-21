@@ -30,6 +30,10 @@ _credentials = None
 _rate_limit_callback = None
 _sheets_service_cache = None
 
+# Thread-local services (one Drive/Sheets pair per worker thread).
+import threading as _threading
+_thread_local = _threading.local()
+
 
 def set_rate_limit_callback(cb):
     global _rate_limit_callback
@@ -122,17 +126,45 @@ def authenticate():
     return build("drive", "v3", http=http)
 
 
-def get_sheets_service():
-    global _sheets_service_cache
-    if _sheets_service_cache is not None:
-        return _sheets_service_cache
-    if _credentials is None:
-        raise RuntimeError("call authenticate() first")
+def _build_drive_service_for_creds(creds):
     import httplib2, google_auth_httplib2
     http = google_auth_httplib2.AuthorizedHttp(
-        _credentials, http=httplib2.Http(timeout=DRIVE_DOWNLOAD_TIMEOUT_SEC))
-    _sheets_service_cache = build("sheets", "v4", http=http)
-    return _sheets_service_cache
+        creds, http=httplib2.Http(timeout=DRIVE_DOWNLOAD_TIMEOUT_SEC))
+    return build("drive", "v3", http=http)
+
+
+def _build_sheets_service_for_creds(creds):
+    import httplib2, google_auth_httplib2
+    http = google_auth_httplib2.AuthorizedHttp(
+        creds, http=httplib2.Http(timeout=DRIVE_DOWNLOAD_TIMEOUT_SEC))
+    return build("sheets", "v4", http=http)
+
+
+def get_sheets_service():
+    """Return a thread-local Sheets v4 service.
+
+    googleapiclient service objects share an internal httplib2.Http which is
+    not thread-safe. Each worker thread gets its own instance.
+    """
+    if _credentials is None:
+        raise RuntimeError("call authenticate() first")
+    svc = getattr(_thread_local, "sheets", None)
+    if svc is None:
+        svc = _build_sheets_service_for_creds(_credentials)
+        _thread_local.sheets = svc
+    return svc
+
+
+def get_drive_service():
+    """Return a thread-local Drive v3 service. Workers call this instead of
+    reusing the main-thread service returned by authenticate()."""
+    if _credentials is None:
+        raise RuntimeError("call authenticate() first")
+    svc = getattr(_thread_local, "drive", None)
+    if svc is None:
+        svc = _build_drive_service_for_creds(_credentials)
+        _thread_local.drive = svc
+    return svc
 
 
 # ---------------------------------------------------------------------

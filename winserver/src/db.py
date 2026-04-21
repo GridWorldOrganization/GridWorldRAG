@@ -29,9 +29,17 @@ _DRIVE_ID_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
 
 
 def schema_for_drive(drive_id: str) -> str:
+    """Derive a safe PostgreSQL identifier from a Google Drive ID.
+
+    Google drive_ids are base64url (contains '-'), which is not valid in
+    unquoted identifiers. We map '-' -> '_' so the schema name can appear
+    unquoted inside composed identifiers like 'idx_<schema>_documents_*'.
+    Collision risk is astronomically low in practice (drive_ids are 19+ chars).
+    """
     if not _DRIVE_ID_RE.match(drive_id):
         raise ValueError(f"unsafe drive_id: {drive_id!r}")
-    return f"fd_{drive_id}"
+    safe = drive_id.replace("-", "_")
+    return f"fd_{safe}"
 
 
 def _quote_ident(name: str) -> str:
@@ -113,10 +121,15 @@ def apply_global_schema(conn: psycopg.Connection) -> None:
 # ---------------------------------------------------------------------
 # Per-FD schema
 # ---------------------------------------------------------------------
+# Two placeholders here on purpose:
+#   {schema_q}   -> quoted identifier for use as a schema reference ("fd_xxx")
+#   {schema_raw} -> raw identifier for composition inside other identifier
+#                   names (idx_<schema_raw>_documents_*) where quotes would
+#                   be invalid SQL syntax.
 _FD_SCHEMA_SQL = """
-CREATE SCHEMA IF NOT EXISTS {schema};
+CREATE SCHEMA IF NOT EXISTS {schema_q};
 
-CREATE TABLE IF NOT EXISTS {schema}.documents (
+CREATE TABLE IF NOT EXISTS {schema_q}.documents (
     id                BIGSERIAL PRIMARY KEY,
     drive_file_id     TEXT UNIQUE NOT NULL,
     title             TEXT,
@@ -135,22 +148,26 @@ CREATE TABLE IF NOT EXISTS {schema}.documents (
     created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_{schema}_documents_embedding
-    ON {schema}.documents USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
-CREATE INDEX IF NOT EXISTS idx_{schema}_documents_drive_file_id
-    ON {schema}.documents (drive_file_id);
-CREATE INDEX IF NOT EXISTS idx_{schema}_documents_owner
-    ON {schema}.documents (owner);
-CREATE INDEX IF NOT EXISTS idx_{schema}_documents_modified
-    ON {schema}.documents (drive_modified_at);
-CREATE INDEX IF NOT EXISTS idx_{schema}_documents_sheet_gid
-    ON {schema}.documents (sheet_gid);
+CREATE INDEX IF NOT EXISTS idx_{schema_raw}_documents_embedding
+    ON {schema_q}.documents USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+CREATE INDEX IF NOT EXISTS idx_{schema_raw}_documents_drive_file_id
+    ON {schema_q}.documents (drive_file_id);
+CREATE INDEX IF NOT EXISTS idx_{schema_raw}_documents_owner
+    ON {schema_q}.documents (owner);
+CREATE INDEX IF NOT EXISTS idx_{schema_raw}_documents_modified
+    ON {schema_q}.documents (drive_modified_at);
+CREATE INDEX IF NOT EXISTS idx_{schema_raw}_documents_sheet_gid
+    ON {schema_q}.documents (sheet_gid);
 """
 
 
 def ensure_fd_schema(conn: psycopg.Connection, drive_id: str) -> str:
     schema = schema_for_drive(drive_id)
-    sql = _FD_SCHEMA_SQL.format(schema=_quote_ident(schema), dim=EMBEDDING_DIM)
+    sql = _FD_SCHEMA_SQL.format(
+        schema_q=_quote_ident(schema),
+        schema_raw=schema,
+        dim=EMBEDDING_DIM,
+    )
     with conn.cursor() as cur:
         cur.execute(sql)
     conn.commit()
@@ -171,7 +188,7 @@ def list_fds(conn: psycopg.Connection) -> list[dict]:
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT drive_id, name, enabled, state,
+            SELECT drive_id, name, enabled, search_enabled, state,
                    last_sync_at, last_build_at,
                    file_count, chunk_count,
                    last_error, created_at, updated_at
@@ -231,6 +248,16 @@ def set_enabled(conn: psycopg.Connection, drive_id: str, enabled: bool) -> None:
              WHERE drive_id=%s
             """,
             (enabled, enabled, drive_id),
+        )
+    conn.commit()
+
+
+def set_search_enabled(conn: psycopg.Connection, drive_id: str, enabled: bool) -> None:
+    """Flip the MCP-search-scope flag for a drive. Independent of build enabled."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE public.fd_registry SET search_enabled=%s, updated_at=NOW() WHERE drive_id=%s",
+            (enabled, drive_id),
         )
     conn.commit()
 
@@ -305,6 +332,224 @@ def delete_fd(conn: psycopg.Connection, drive_id: str) -> None:
     with conn.cursor() as cur:
         cur.execute("DELETE FROM public.fd_registry WHERE drive_id=%s", (drive_id,))
     conn.commit()
+
+
+# ---------------------------------------------------------------------
+# Worker state (live multi-thread progress)
+# ---------------------------------------------------------------------
+def heartbeat_worker(conn: psycopg.Connection, worker_id: int, **fields) -> None:
+    """UPSERT worker state. heartbeat_at is always set to NOW().
+
+    Accepted fields: state, phase, drive_id, drive_name, current_file,
+    files_done, total_files, started_at, last_error.
+    """
+    allowed = {
+        "state", "phase", "drive_id", "drive_name", "current_file",
+        "files_done", "total_files", "started_at", "last_error",
+    }
+    use = {k: v for k, v in fields.items() if k in allowed}
+    cols = ["worker_id", "heartbeat_at"] + list(use.keys())
+    vals: list = [worker_id]
+    placeholders: list[str] = ["%s", "NOW()"]
+    for k in use:
+        placeholders.append("%s")
+        vals.append(use[k])
+    update_parts = [f"{k}=EXCLUDED.{k}" for k in use]
+    update_parts.append("heartbeat_at=NOW()")
+    sql = (
+        f"INSERT INTO public.daemon_workers ({', '.join(cols)}) "
+        f"VALUES ({', '.join(placeholders)}) "
+        f"ON CONFLICT (worker_id) DO UPDATE SET "
+        f"{', '.join(update_parts)}"
+    )
+    with conn.cursor() as cur:
+        cur.execute(sql, vals)
+    conn.commit()
+
+
+def list_workers(conn: psycopg.Connection) -> list[dict]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT worker_id, drive_id, drive_name, state, phase, current_file,
+                   files_done, total_files, started_at, heartbeat_at, last_error
+            FROM public.daemon_workers
+            ORDER BY worker_id
+            """
+        )
+        return cur.fetchall()
+
+
+def clear_workers(conn: psycopg.Connection) -> None:
+    """Truncate worker state — use at daemon startup."""
+    with conn.cursor() as cur:
+        cur.execute("TRUNCATE public.daemon_workers")
+    conn.commit()
+
+
+def cleanup_zombies(conn: psycopg.Connection, stale_after_sec: int = 90) -> dict:
+    """Garbage-collect stale daemon state.
+
+    1) daemon_workers rows with no heartbeat in `stale_after_sec` are deleted
+       — they represent workers whose process/thread died without cleanup.
+    2) fd_registry rows stuck in 'building' or 'syncing' with no live worker
+       currently working on them are reset to 'idle', so the next sweep
+       re-enqueues them and the work actually restarts.
+
+    Returns: {"workers_removed": [...], "drives_reset": [...]}
+    """
+    removed_workers: list[int] = []
+    reset_drives: list[str] = []
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM public.daemon_workers
+            WHERE heartbeat_at < NOW() - make_interval(secs => %s)
+            RETURNING worker_id
+            """,
+            (stale_after_sec,),
+        )
+        removed_workers = [r["worker_id"] for r in cur.fetchall()]
+
+        cur.execute(
+            """
+            UPDATE public.fd_registry f
+               SET state='idle',
+                   updated_at=NOW()
+             WHERE state IN ('building','syncing')
+               AND NOT EXISTS (
+                 SELECT 1 FROM public.daemon_workers w
+                  WHERE w.drive_id = f.drive_id
+                    AND w.heartbeat_at > NOW() - INTERVAL '60 seconds'
+                    AND w.state IN ('claiming','listing','building','syncing')
+               )
+            RETURNING drive_id
+            """
+        )
+        reset_drives = [r["drive_id"] for r in cur.fetchall()]
+    conn.commit()
+    return {"workers_removed": removed_workers, "drives_reset": reset_drives}
+
+
+def active_drive_ids(conn: psycopg.Connection) -> set[str]:
+    """Return drive_ids currently being worked on (for de-dup in the enqueue step)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT drive_id FROM public.daemon_workers
+            WHERE drive_id IS NOT NULL
+              AND state IN ('claiming','listing','building','syncing')
+              AND heartbeat_at > NOW() - INTERVAL '60 seconds'
+            """
+        )
+        return {r["drive_id"] for r in cur.fetchall() if r.get("drive_id")}
+
+
+# ---------------------------------------------------------------------
+# MCP login users
+# ---------------------------------------------------------------------
+def list_mcp_users(conn: psycopg.Connection) -> list[dict]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT username, created_at, updated_at FROM public.mcp_users ORDER BY username"
+        )
+        return cur.fetchall()
+
+
+def upsert_mcp_user(conn: psycopg.Connection, username: str, password_hash: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO public.mcp_users (username, password_hash)
+            VALUES (%s, %s)
+            ON CONFLICT (username) DO UPDATE SET
+                password_hash = EXCLUDED.password_hash,
+                updated_at = NOW()
+            """,
+            (username, password_hash),
+        )
+    conn.commit()
+
+
+def delete_mcp_user(conn: psycopg.Connection, username: str) -> int:
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM public.mcp_users WHERE username=%s", (username,))
+        n = cur.rowcount
+    conn.commit()
+    return n
+
+
+def get_mcp_user_hash(conn: psycopg.Connection, username: str) -> Optional[str]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT password_hash FROM public.mcp_users WHERE username=%s",
+            (username,),
+        )
+        r = cur.fetchone()
+        return r["password_hash"] if r else None
+
+
+def seed_default_mcp_users(conn: psycopg.Connection) -> list[str]:
+    """Create tobisako / izumi on first init (pw=admin) if they don't exist.
+    Returns the list of usernames that were newly created.
+    """
+    from src.mcp_auth import hash_password
+    created: list[str] = []
+    defaults = [("tobisako", "admin"), ("izumi", "admin")]
+    for username, pw in defaults:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM public.mcp_users WHERE username=%s", (username,))
+            if cur.fetchone() is None:
+                cur.execute(
+                    "INSERT INTO public.mcp_users (username, password_hash) VALUES (%s, %s)",
+                    (username, hash_password(pw)),
+                )
+                created.append(username)
+    conn.commit()
+    return created
+
+
+# ---------------------------------------------------------------------
+# Key-value config (daemon_config)
+# ---------------------------------------------------------------------
+def get_config(conn: psycopg.Connection, key: str,
+               default: Optional[str] = None) -> Optional[str]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT value FROM public.daemon_config WHERE key=%s", (key,))
+        r = cur.fetchone()
+        return r["value"] if r else default
+
+
+def set_config(conn: psycopg.Connection, key: str, value: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO public.daemon_config (key, value) VALUES (%s, %s)
+            ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
+            """,
+            (key, value),
+        )
+    conn.commit()
+
+
+# ---------------------------------------------------------------------
+# Per-drive advisory lock (cross-process exclusion for build/sync)
+# ---------------------------------------------------------------------
+def try_claim_drive(conn: psycopg.Connection, drive_id: str) -> bool:
+    """Acquire a pg_advisory_lock keyed on hashtext(drive_id).
+
+    Returns True if the caller now holds the lock, False if another session
+    holds it. Released by release_drive() or on conn close.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_try_advisory_lock(hashtext(%s)) AS got", (drive_id,))
+        r = cur.fetchone()
+        return bool(r and r.get("got"))
+
+
+def release_drive(conn: psycopg.Connection, drive_id: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_unlock(hashtext(%s))", (drive_id,))
 
 
 # ---------------------------------------------------------------------
@@ -533,6 +778,86 @@ def extract_gid_from_url(url: str) -> Optional[str]:
 # ---------------------------------------------------------------------
 # Stats
 # ---------------------------------------------------------------------
+def search_enabled_schemas(conn: psycopg.Connection) -> list[tuple[str, str]]:
+    """Return (drive_id, drive_name) pairs for drives with search_enabled=TRUE
+    AND an existing fd_<drive_id> schema. Used by MCP search to know which
+    schemas to query."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT drive_id, name
+              FROM public.fd_registry
+             WHERE search_enabled = TRUE
+             ORDER BY name
+            """
+        )
+        rows = cur.fetchall()
+        result: list[tuple[str, str]] = []
+        # Confirm the fd_<drive_id> schema actually exists (user may have
+        # toggled search-on a drive whose build was later removed).
+        for r in rows:
+            drive_id = r["drive_id"]
+            schema = schema_for_drive(drive_id)
+            cur.execute(
+                "SELECT 1 FROM information_schema.schemata WHERE schema_name=%s",
+                (schema,),
+            )
+            if cur.fetchone() is not None:
+                result.append((drive_id, r["name"]))
+        return result
+
+
+def search_across_schemas(conn: psycopg.Connection, embedding,
+                          schemas: list[tuple[str, str]],
+                          n_results: int = 10,
+                          owner: Optional[str] = None) -> list[dict]:
+    """Run a cosine-distance search UNION-ALL across the given fd_* schemas,
+    then take the top N. Each schema has its own documents table so we query
+    each then merge."""
+    if not schemas:
+        return []
+    import numpy as np
+    if isinstance(embedding, list):
+        embedding = np.array(embedding, dtype=np.float32)
+
+    where = ""
+    filter_params: list = []
+    if owner:
+        where = "WHERE owner = %s"
+        filter_params.append(owner)
+
+    # Build UNION ALL query referencing each schema.
+    parts: list[str] = []
+    for drive_id, _name in schemas:
+        schema = schema_for_drive(drive_id)
+        parts.append(
+            f"""
+            SELECT %s::text AS drive_id, title, content, owner, source_url,
+                   file_type, drive_modified_at, sheet_gid, sheet_name,
+                   folder_path, embedding <=> %s AS distance
+              FROM {_quote_ident(schema)}.documents
+              {where}
+            """
+        )
+
+    sql = (
+        "SELECT * FROM (\n"
+        + "\nUNION ALL\n".join(parts)
+        + "\n) sub ORDER BY distance ASC LIMIT %s"
+    )
+
+    params: list = []
+    for drive_id, _name in schemas:
+        params.append(drive_id)
+        params.append(embedding)
+        params.extend(filter_params)
+    params.append(n_results)
+
+    with conn.cursor() as cur:
+        cur.execute(sql, tuple(params))
+        return list(cur.fetchall())
+
+
 def global_stats(conn: psycopg.Connection) -> dict:
     with conn.cursor() as cur:
         cur.execute(
@@ -544,8 +869,15 @@ def global_stats(conn: psycopg.Connection) -> dict:
             FROM public.fd_registry
             """
         )
-        row = cur.fetchone()
-        # DB size
-        cur.execute("SELECT pg_database_size(current_database())::bigint AS bytes")
-        row["db_size_bytes"] = cur.fetchone()["bytes"]
-        return dict(row)
+        row = dict(cur.fetchone())
+        # pg_database_size() walks the on-disk DB directory; under heavy
+        # write load (many concurrent workers) this can take seconds.
+        # Use a tight statement_timeout and fall back to -1 on slow.
+        try:
+            cur.execute("SET LOCAL statement_timeout = '1500ms'")
+            cur.execute("SELECT pg_database_size(current_database())::bigint AS bytes")
+            row["db_size_bytes"] = cur.fetchone()["bytes"]
+        except Exception:
+            conn.rollback()
+            row["db_size_bytes"] = None
+        return row

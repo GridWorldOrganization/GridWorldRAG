@@ -9,17 +9,27 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-CONFIG_PATH = PROJECT_ROOT / "config" / "config.env"
+# Config path lookup: prefer the versioned v2 file, fall back to legacy.
+# Both are tried in order; the first that exists is loaded.
+CONFIG_PATH_CANDIDATES = [
+    PROJECT_ROOT / "config" / "config.v2.env",
+    PROJECT_ROOT / "config" / "config.env",
+]
+CONFIG_PATH: Path | None = None  # set by load_config()
 
 
 def load_config() -> None:
-    if not CONFIG_PATH.exists():
+    global CONFIG_PATH
+    path = next((p for p in CONFIG_PATH_CANDIDATES if p.exists()), None)
+    if path is None:
         if os.environ.get("WINSERVERRAG_SKIP_CONFIG") == "1":
             return
-        print(f"ERROR: {CONFIG_PATH} not found. Copy config/config.env.example and fill in.",
+        shown = " / ".join(str(p) for p in CONFIG_PATH_CANDIDATES)
+        print(f"ERROR: no config.env found (looked at: {shown}).",
               file=sys.stderr)
         sys.exit(1)
-    with open(CONFIG_PATH, encoding="utf-8") as f:
+    CONFIG_PATH = path
+    with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
@@ -93,6 +103,10 @@ API_SHEET_MAX_RETRIES = _env_int("API_SHEET_MAX_RETRIES", 6)
 # --- Daemon ---
 DAEMON_ROTATE_INTERVAL_SEC = _env_int("DAEMON_ROTATE_INTERVAL_SEC", 300)
 DAEMON_MIN_FREE_BYTES = _env_int("DAEMON_MIN_FREE_BYTES", 1_073_741_824)
+# Parallel worker threads (each builds/syncs one FD at a time).
+# 4 is a reasonable default on a laptop; increase to saturate CPU for CPU-bound
+# embedding, decrease if Google Drive / Sheets quota errors appear.
+DAEMON_WORKER_THREADS = _env_int("DAEMON_WORKER_THREADS", 4)
 
 # --- Control API ---
 API_HOST = _env("API_HOST", "127.0.0.1")

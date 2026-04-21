@@ -19,12 +19,34 @@
       <button id="btn-refresh">更新</button>
       <button id="btn-discover">共有ドライブを取得</button>
     </div>
+    <nav class="tabs">
+      <button class="tab-btn active" data-tab="build">ビルド</button>
+      <button class="tab-btn" data-tab="mcp">MCP 検索設定</button>
+    </nav>
   </header>
 
   <main>
-    <section>
-      <h2>共有フォルダ一覧</h2>
-      <table id="fds-table">
+    <!-- ============== BUILD TAB ============== -->
+    <section class="tab-pane active" data-tab="build">
+      <div class="workers-card">
+        <div class="workers-header">
+          <h2>ワーカー（マルチスレッドビルド）</h2>
+          <div class="workers-scale">
+            <span class="muted">スレッド数:</span>
+            <button id="btn-scale-down" title="減らす">−</button>
+            <span id="scale-target">-</span>
+            <button id="btn-scale-up" title="増やす">+</button>
+            <span class="muted">(ライブ <span id="scale-live">-</span> / MIN 1, MAX 10)</span>
+          </div>
+        </div>
+        <div id="workers-body" class="workers-grid">
+          <div class="worker-placeholder">読み込み中...</div>
+        </div>
+      </div>
+
+      <h2>共有フォルダ（ビルド ON/OFF）</h2>
+      <p class="muted">ドライブの行をクリックするとビルド ON/OFF を切り替え。</p>
+      <table id="fds-build-table">
         <thead>
           <tr>
             <th>ON</th>
@@ -37,15 +59,61 @@
             <th>操作</th>
           </tr>
         </thead>
-        <tbody id="fds-body">
+        <tbody id="fds-build-body">
           <tr><td colspan="8" class="empty">読み込み中...</td></tr>
         </tbody>
       </table>
-    </section>
 
-    <section>
       <h2>イベントログ (最新200件)</h2>
       <div id="events" class="events"></div>
+    </section>
+
+    <!-- ============== MCP TAB ============== -->
+    <section class="tab-pane" data-tab="mcp">
+      <h2>MCP ログインユーザー</h2>
+      <p class="muted">
+        Claude Cowork から MCP に接続する際の認証情報。初期値として
+        <code>tobisako</code> / <code>izumi</code> が作成されています（PW: <code>admin</code>）。
+        運用時は必ず PW を変更してください。
+      </p>
+      <table id="mcp-users-table">
+        <thead>
+          <tr>
+            <th>ユーザー名</th>
+            <th>作成</th>
+            <th>更新</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody id="mcp-users-body">
+          <tr><td colspan="4" class="empty">読み込み中...</td></tr>
+        </tbody>
+      </table>
+      <div class="mcp-users-add">
+        <button id="btn-add-mcp-user">+ ユーザー追加</button>
+      </div>
+
+      <h2 style="margin-top: 32px">MCP 検索スコープ</h2>
+      <p class="muted">
+        Claude Cowork からの RAG 検索で対象にするドライブを選択します。
+        ビルドが完了しているドライブだけが実際に検索可能です。
+        ここの ON/OFF はインデックス生成とは別系統で、いつでも切替可能。
+      </p>
+      <table id="fds-mcp-table">
+        <thead>
+          <tr>
+            <th>検索<br>対象</th>
+            <th>名前</th>
+            <th>ビルド状態</th>
+            <th>ファイル</th>
+            <th>チャンク</th>
+            <th>最終ビルド</th>
+          </tr>
+        </thead>
+        <tbody id="fds-mcp-body">
+          <tr><td colspan="6" class="empty">読み込み中...</td></tr>
+        </tbody>
+      </table>
     </section>
   </main>
 

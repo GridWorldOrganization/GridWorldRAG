@@ -1,37 +1,116 @@
 # WinServerRAG
 
 Windows 常駐の RAG サーバー。Google Drive 共有フォルダ単位で DB を持ち、
-Claude Cowork から MCP 経由で遠隔検索可能。既存 GridWorldRAG のロジックを
-Windows ネイティブ向けに移植したもの。
+Claude Cowork / Claude Desktop から **MCP (Model Context Protocol) 経由で遠隔検索可能**。
+既存 GridWorldRAG のロジックを Windows ネイティブ向けに移植したもの。
 
-## Phase 1 構成
+---
 
-- `src/rag_daemon.py` — 常駐デーモン。ON 状態の FD を巡回同期
-- `src/control_api.py` — FastAPI (+ WebSocket) 制御 API + Web モニター配信
-- `web/` — Win モニター Web UI (vanilla JS)
-- per-FD スキーマ方式: 共有フォルダごとに `fd_<drive_id>` スキーマを分離
+## できること
 
-## クイックスタート (開発)
+- Google Drive の共有フォルダ群を自動的に索引（チャンク + ベクトル）
+- **ビルドは自動**: 有効化されたドライブを 4 ワーカー並列で常時追跡（変更検知は Changes API）
+- **マルチスレッド** (1〜10 スレッド、UI からライブ変更可)
+- **2 画面**: 管理者用「ビルド画面」 + ユーザー用「MCP 検索設定画面」
+- **Electron ミニモニター** (always-on-top、500ms 更新、ビルド進捗アニメーション)
+- **MCP サーバー** (Streamable HTTP + Basic Auth) → [MCP 接続ガイドはこちら](./MCP.md)
 
-1. Python 3.12+ を用意
-2. 仮想環境: `python -m venv .venv && .venv\Scripts\activate`
-3. 依存: `pip install -r requirements.txt`
-4. PostgreSQL 17 + pgvector を起動 (Portable 手順 or winget)
+## アーキテクチャ
+
+```
+[Google Drive 共有フォルダ] → rag_daemon (N threads) → PostgreSQL + pgvector (per-FD schema)
+                                      │
+                                      ▼
+                             control_api (FastAPI)
+                              /            \
+                             /              \
+                   Web monitor              MCP server  ←── Claude Cowork (remote)
+                   (localhost)              /mcp        (Basic Auth + Streamable HTTP)
+                                            │
+                                         Electron mini-monitor (desktop)
+```
+
+## クイックスタート
+
+1. Python 3.12+ と PostgreSQL 17 + pgvector を用意 (Windows ネイティブ)
+2. `python -m venv .venv && .venv\Scripts\activate`
+3. `pip install -r requirements.txt`
+4. `config\config.v2.env.example` を `config\config.v2.env` にコピーして編集
 5. DB 初期化: `python -m src.db_init`
-6. `config\config.env.example` を `config\config.env` にコピーして編集
-7. API + モニター起動: `scripts\run_api.bat`
-8. デーモン起動 (別ターミナル): `scripts\run_daemon.bat`
-9. ブラウザで `http://127.0.0.1:17600/` を開く
+6. API 起動: `scripts\run_api.bat`
+7. デーモン起動 (別ターミナル): `scripts\run_daemon.bat`
+8. ブラウザで `http://127.0.0.1:17600/` → 管理画面
+9. Electron ミニモニター: `scripts\run_mini.bat`
+10. MCP 公開: [MCP.md](./MCP.md) 参照
 
-## 構成図
+## 画面
 
-```
-[Google Drive 共有フォルダ] --(whitelist)-->  rag_daemon  --(schema=fd_xxx)--> PostgreSQL + pgvector
-                                                  |                                   ^
-                                                  | status/progress                   |
-                                                  v                                   |
-                                            control_api (FastAPI)  <--- web monitor --/
-                                                  ^
-                                                  |
-                                            Claude Cowork (後続: MCP HTTP)
-```
+### ビルド画面 (`/` → ビルドタブ)
+
+- ワーカー N スレッドの現在状態（どのドライブ・どのファイル・進捗バー）
+- スレッド数スケーラ [−] [4] [+]、MIN 1 / MAX 10 でライブ変更
+- 共有フォルダ一覧: 行クリックで **ビルド ON/OFF** トグル
+- 各行に [再構築（初期化）] [削除] ボタン（destructive はダイアログ確認）
+
+### MCP 検索設定画面 (`/` → MCP タブ)
+
+- **MCP ログインユーザー** 管理 (初期値: `tobisako` / `izumi`、PW は `admin`)
+  - 追加・パスワード変更・削除
+- **MCP 検索スコープ**: どの共有ドライブを遠隔検索の対象にするか行クリックで ON/OFF
+
+### Electron ミニモニター
+
+- 小窓、always-on-top、500ms 更新
+- 稼働中はスピナー回転、ビルド進捗シマー、心拍ブリンク
+- デーモン死亡 (2 分無心拍) で赤表示
+- [Monitor を開く] ボタンで Web モニターをブラウザで開く
+
+## スキーマ (PostgreSQL)
+
+- `public.fd_registry` : ドライブ登録・ビルド ON/OFF・検索スコープ ON/OFF
+- `public.mcp_users`   : MCP ログインユーザー (PBKDF2-SHA256)
+- `public.daemon_workers` : スレッドのライブ状態 (心拍)
+- `public.daemon_config` : 動的設定 (worker_count 等)
+- `fd_<drive_id>.documents` : ドライブごとの chunks + VECTOR(768)
+
+## MCP (遠隔 RAG 検索)
+
+**別 PC から Claude Cowork で検索したい場合** → [MCP.md](./MCP.md) に詳細手順があります。
+
+提供される MCP ツール:
+
+| tool | 引数 | 説明 |
+|---|---|---|
+| `list_drives` | — | 検索スコープのドライブ一覧 |
+| `search` | `query, n_results=10, owner?` | セマンティック検索 |
+| `lookup` | `url` | 特定 Drive URL の全文取得 |
+| `stats` | — | インデックス統計 |
+
+## 設定ファイル
+
+優先順位: `config/config.v2.env` → `config/config.env` (legacy fallback)
+
+| キー | 既定 | 説明 |
+|---|---|---|
+| `DAEMON_WORKER_THREADS` | `4` | 初期スレッド数 (UI で 1..10 変更可) |
+| `DAEMON_ROTATE_INTERVAL_SEC` | `300` | ビルド sweep 間隔 |
+| `API_HOST` / `API_PORT` | `127.0.0.1` / `17600` | 管理 API |
+| `API_BEARER_TOKEN` | 空 | LAN 公開時は必須 (空だと localhost のみ) |
+| `EMBEDDING_MODEL` | `paraphrase-multilingual-mpnet-base-v2` | 768 次元 |
+| `GOOGLE_OAUTH_CLIENT_ID/SECRET` | — | Google OAuth 認証情報 |
+
+## 運用 (Windows サービス化)
+
+NSSM で常駐サービス化: [scripts/install_service.md](./scripts/install_service.md)
+
+## 耐障害性
+
+- `lockfile` で多重起動防止 (PID 生存確認、stale 検知)
+- `pg_try_advisory_lock` でプロセス跨ぎの FD 排他制御
+- デーモン `zombie_cleanup` で stale worker 行を 30 秒ごとに GC
+- UI は worker heartbeat 120 秒超で stale 判定しアニメ停止
+- stats エンドポイントは in-memory キャッシュで重書き込み中も即レス
+
+## ライセンス
+
+MIT（本リポジトリ上の内容）。Google API・pgvector 等の依存は各自のライセンスに従う。
