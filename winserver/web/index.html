@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>WinServerRAG Monitor</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <h1>WinServerRAG Monitor</h1>
+    <div class="stats-bar">
+      <span id="stat-pg" class="badge">PG ?</span>
+      <span id="stat-drive" class="badge">Drive ?</span>
+      <span id="stat-fds">FDs: -/-</span>
+      <span id="stat-files">Files: -</span>
+      <span id="stat-chunks">Chunks: -</span>
+      <span id="stat-dbsize">DB: -</span>
+      <button id="btn-refresh">更新</button>
+      <button id="btn-discover">共有ドライブを取得</button>
+    </div>
+  </header>
+
+  <main>
+    <section>
+      <h2>共有フォルダ一覧</h2>
+      <table id="fds-table">
+        <thead>
+          <tr>
+            <th>ON</th>
+            <th>名前</th>
+            <th>状態</th>
+            <th>ファイル</th>
+            <th>チャンク</th>
+            <th>最終同期</th>
+            <th>最終ビルド</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody id="fds-body">
+          <tr><td colspan="8" class="empty">読み込み中...</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>イベントログ (最新200件)</h2>
+      <div id="events" class="events"></div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

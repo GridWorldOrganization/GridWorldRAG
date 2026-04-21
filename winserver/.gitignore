@@ -1,0 +1,40 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Secrets and tokens
+config.env
+token.pickle
+*.key
+*.pem
+
+# Runtime
+logs/
+*.log
+*.pid
+*.lock
+
+# Data
+pg_data/
+pg17/
+models/
+data/
+
+# Build artifacts (pgvector source clone, compile outputs, one-off admin scripts)
+build/
+
+# Memory / context caches
+.gstack/
+.claude/local/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
