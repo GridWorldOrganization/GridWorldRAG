@@ -562,7 +562,7 @@ def clear_workers(conn: psycopg.Connection) -> None:
     conn.commit()
 
 
-def cleanup_zombies(conn: psycopg.Connection, stale_after_sec: int = 90) -> dict:
+def cleanup_zombies(conn: psycopg.Connection, stale_after_sec: int = 300) -> dict:
     """Garbage-collect stale daemon state.
 
     1) daemon_workers rows with no heartbeat in `stale_after_sec` are deleted
@@ -597,6 +597,11 @@ def cleanup_zombies(conn: psycopg.Connection, stale_after_sec: int = 90) -> dict
 
         # Phase 1: find candidate drives — state=building/syncing with no
         # matching worker heartbeat. These are the "might be stuck" set.
+        # The heartbeat window uses the same stale_after_sec the caller
+        # gave us for worker deletion, so the two scales stay in sync.
+        # With huge-file downloads (Drive API pulling 100MB+ exports)
+        # workers can legitimately stay on a single file for minutes
+        # without writing a new heartbeat; 60 sec was far too tight.
         cur.execute(
             """
             SELECT f.drive_id
@@ -605,10 +610,11 @@ def cleanup_zombies(conn: psycopg.Connection, stale_after_sec: int = 90) -> dict
                AND NOT EXISTS (
                  SELECT 1 FROM public.daemon_workers w
                   WHERE w.drive_id = f.drive_id
-                    AND w.heartbeat_at > NOW() - INTERVAL '60 seconds'
+                    AND w.heartbeat_at > NOW() - make_interval(secs => %s)
                     AND w.state IN ('claiming','listing','building','syncing')
                )
-            """
+            """,
+            (stale_after_sec,),
         )
         candidates = [r["drive_id"] for r in cur.fetchall()]
 
