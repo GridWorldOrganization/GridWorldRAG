@@ -1,0 +1,14 @@
+{
+  "name": "winserverrag-mini-monitor",
+  "version": "0.1.0",
+  "description": "Small always-on-top desktop monitor for WinServerRAG. Shows daemon health + a button to open the full web UI.",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^33.0.0"
+  }
+}

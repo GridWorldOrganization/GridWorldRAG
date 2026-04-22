@@ -1,0 +1,64 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Secrets and tokens
+config.env
+config/config.env
+config/config.v2.env
+config/token.pickle
+config/*.json
+token.pickle
+*.key
+*.pem
+
+# Runtime
+logs/
+*.log
+*.pid
+*.lock
+
+# Data
+pg_data/
+pg17/
+models/
+data/
+
+# Build artifacts (pgvector source clone, compile outputs, one-off admin scripts)
+build/
+
+# Node / Electron
+node_modules/
+desktop/node_modules/
+
+# Memory / context caches
+.gstack/
+.claude/local/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Terraform
+infra/aws/.terraform/
+infra/aws/.terraform.lock.hcl
+infra/aws/terraform.tfstate
+infra/aws/terraform.tfstate.*
+infra/aws/build/
+infra/aws/bin/
+infra/aws/.bridge_key.tmp
+infra/aws/.bridge_secret.tmp
+*.tfvars
+!*.tfvars.example
+
+# Vendored tool binaries
+tools/nssm.exe
+tools/terraform.exe

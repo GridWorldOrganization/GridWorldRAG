@@ -1,0 +1,31 @@
+# Core
+psycopg[binary]>=3.2
+pgvector>=0.3.6
+numpy
+
+# Google APIs
+google-api-python-client
+google-auth-oauthlib
+google-auth-httplib2
+httplib2
+
+# Embedding
+sentence-transformers>=3.0
+torch
+
+# Text extraction
+pypdf
+
+# API & Web
+fastapi
+uvicorn[standard]
+websockets
+jinja2
+python-multipart
+
+# MCP (Model Context Protocol) — remote server for Claude Cowork
+mcp>=1.0
+
+# Util
+python-dotenv
+pydantic>=2
