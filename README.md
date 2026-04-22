@@ -21,9 +21,7 @@ Claude Cowork / Claude Desktop / 任意の MCP クライアントから **MCP (M
 社内 Google Drive の資料（数万件）を横断的に検索し、
 Claude Cowork から遠隔で呼び出すために構築しました。
 
-姉妹プロジェクトとして [Mac 版 GridWorldRAG](../../tree/master) (master branch) もあります。
-
-> 📖 **このシステムが 1 台の PC のバッチから GPU 駆動の AWS サーバーレスに変わるまでの進化記録は** [docs/EVOLUTION.md](./docs/EVOLUTION.md) **にあります**。
+> 📖 **1 台の PC のバッチから GPU 駆動の AWS サーバーレスに変わるまでの進化記録**: [docs/EVOLUTION.md](./docs/EVOLUTION.md)
 
 ### 開発案件のご相談
 
@@ -55,20 +53,6 @@ The code in this branch is the real production copy we use day-to-day.
 
 We are a small engineering shop based in Japan. If your team wants something
 like this built for your business, reach out: **tobisako@gridworld.co**.
-
----
-
-## 既存 GridWorldRAG との違い
-
-| 観点 | GridWorldRAG (Mac, master) | WinServerRAG (このブランチ) |
-|---|---|---|
-| OS | macOS (M2 Max) | Windows 11 |
-| デーモン | launchd | 手動起動 or NSSM (Task Scheduler 禁止) |
-| DB | Homebrew pgvector | Windows native PG17 + 自ビルド pgvector |
-| UI | Web モニターのみ | Web モニター + Electron ミニモニター |
-| 並列化 | ビルドだけ 4 並列 | ビルド + MCP + AWS bridge が独立 |
-| MCP | ローカル MCP server | AWS (API GW + Lambda + SQS) 経由で世界中から接続可能 |
-| 埋め込み | CPU (MPS) | GPU (RTX 4070 SUPER CUDA) |
 
 ---
 
@@ -115,7 +99,7 @@ like this built for your business, reach out: **tobisako@gridworld.co**.
 
 ## 廃案（設計書にあるが採用しない）
 
-- **Mac リモートモニター** (旧 Phase 3): Web モニターをトンネルで公開すれば十分。Tauri 別アプリを作る価値無し
+- **リモートモニター別アプリ** (旧 Phase 3 案): Web モニターをトンネルで公開 + Electron ミニモニターで十分。別プロセスの Tauri を作る価値無し
 - **スレッド数の動的変更 UI**: 1 ユーザー運用では固定で十分。`DAEMON_WORKER_THREADS` で初期値のみ
 - **per-user MCP 検索スコープ**: 複雑度に見合う価値無し。`fd_registry.search_enabled` でグローバル管理
 

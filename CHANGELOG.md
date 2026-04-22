@@ -4,6 +4,33 @@ All notable changes to WinServerRAG. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.6.1] — 2026-04-22
+
+**Theme: 一本化 — Mac 側との二重構造を廃止、Windows 単線に**
+
+v0.6.0 まで「Mac 版 GridWorldRAG (`master`) + Windows 版 WinServerRAG
+(`winserver-phase2`)」の二系統で運用していたが、開発リソースを
+Windows 側に集約することを決定。Mac 側は以後メンテナンスせず、
+このリポジトリ・ブランチが **唯一の運用ライン** となる。
+
+### Changed
+- **README.md**: 「姉妹プロジェクト Mac 版」「既存 GridWorldRAG との違い」
+  テーブルを削除。Windows 環境前提で書き直した。
+- **drive_client.py**: "Ported from GridWorldRAG" のモジュール docstring を
+  書き換え（現状の責務と呼び出し元を明記）。
+- **廃案セクション**: "Mac リモートモニター" 表記を「リモートモニター別アプリ」
+  に修正 (OS 中立化)。
+- **control_api.py**: FastAPI app version を `0.6.0` → `0.6.1`。
+
+### Removed
+- **docs/PUSH_PLAN.md**: 初回公開時の意思決定ログ。v0.6.0 リリースで役目を
+  終えたので削除（必要なら git 履歴に残存）。
+
+### Meta
+- **Mac 側コードベース (`master` branch)** の扱い: 以後 WinServerRAG 側では
+  参照しない。Mac 側が生きているかどうかは今後別 org/repo へ移すか否かの
+  判断に委ねる。今日時点では `master` を触らない (abandon-in-place)。
+
 ## [v0.6.0] — 2026-04-22
 
 **Theme: GPU 加速 + UI 磨き + 公開準備**

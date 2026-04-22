@@ -1,7 +1,9 @@
 """Google Drive API client.
 
-Ported from GridWorldRAG. Adjusted for Windows-native (UTF-8 paths via
-pathlib, no POSIX-only bits).
+Handles authentication, per-drive enumeration, Changes-API deltas, and
+content extraction (Docs export, Sheets, PDF, OCR). Windows-native
+paths via pathlib throughout. Called from `rag_daemon` workers and
+the `control_api` discovery endpoints.
 """
 from __future__ import annotations
 
