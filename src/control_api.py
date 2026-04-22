@@ -134,6 +134,7 @@ async def _lifespan(_app):
         # Background pumps
         asyncio.create_task(_event_pump())
         asyncio.create_task(_stats_pump())
+        asyncio.create_task(_count_estimate_pump())
         yield
 
 
@@ -194,6 +195,8 @@ class FDView(BaseModel):
     last_build_at: Optional[datetime]
     file_count: int
     chunk_count: int
+    file_count_estimate: Optional[int] = None
+    file_count_estimate_at: Optional[datetime] = None
     last_error: Optional[str]
     running: bool = False
 
@@ -571,6 +574,79 @@ async def _stats_pump():
 def api_stats():
     with _stats_lock:
         return dict(_stats_cache)
+
+
+# --- file_count_estimate pump --------------------------------------------
+# Refreshes fd_registry.file_count_estimate for EVERY known drive (enabled
+# or not) so the UI can preview "~N files" before the user turns indexing
+# on. This uses the cheap id-only Drive API query — not a full list. Runs
+# at startup (staggered so we don't hammer the API) and then every 30 min.
+COUNT_REFRESH_INTERVAL_SEC = 1800   # 30 min
+COUNT_REFRESH_STAGGER_SEC  = 2      # one drive every N seconds initially
+
+
+async def _count_estimate_pump():
+    """Background: count files in every registered drive periodically."""
+    import asyncio as _a
+    # Let the lifespan finish priming Drive auth first
+    await _a.sleep(10)
+
+    async def _count_one(drive_id: str, name: str):
+        def _work():
+            conn = db.connect()
+            try:
+                service = dc.get_drive_service()
+                n = dc.count_files_in_drive(service, drive_id)
+                db.set_file_count_estimate(conn, drive_id, n)
+                return n
+            finally:
+                conn.close()
+        try:
+            n = await _a.to_thread(_work)
+            log.info(f"file_count_estimate: {name!s:30} = {n}")
+        except Exception as e:
+            log.warning(f"file_count_estimate failed for {name!s}: {e}")
+
+    while True:
+        try:
+            def _fetch_drives():
+                conn = db.connect()
+                try:
+                    return [(r["drive_id"], r["name"]) for r in db.list_fds(conn)]
+                finally:
+                    conn.close()
+            drives = await _a.to_thread(_fetch_drives)
+        except Exception as e:
+            log.warning(f"count pump: list_fds failed: {e}")
+            drives = []
+
+        log.info(f"file_count_estimate: sweeping {len(drives)} drives")
+        for drive_id, name in drives:
+            await _count_one(drive_id, name)
+            await _a.sleep(COUNT_REFRESH_STAGGER_SEC)
+
+        await _a.sleep(COUNT_REFRESH_INTERVAL_SEC)
+
+
+@app.post("/api/fds/{drive_id}/refresh-count",
+          dependencies=[Depends(require_token)])
+async def api_refresh_count(drive_id: str):
+    """Manually re-count files for one drive. Returns the new estimate."""
+    import asyncio as _a
+    def _work():
+        conn = db.connect()
+        try:
+            service = dc.get_drive_service()
+            n = dc.count_files_in_drive(service, drive_id)
+            db.set_file_count_estimate(conn, drive_id, n)
+            return n
+        finally:
+            conn.close()
+    try:
+        n = await _a.to_thread(_work)
+        return {"drive_id": drive_id, "file_count_estimate": n}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/events", dependencies=[Depends(require_token)])

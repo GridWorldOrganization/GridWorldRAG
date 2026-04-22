@@ -203,6 +203,37 @@ _FIELDS = ("nextPageToken, files(id, name, mimeType, modifiedTime, "
            "parents, permissions(emailAddress, role, type, displayName))")
 
 
+def count_files_in_drive(service, drive_id: str) -> int:
+    """Cheap file count: only requests `id` field, no folder paths or
+    permissions, no body. Used by the control API's pre-enable preview
+    so the UI can show "this drive has ~N files" before the user enables
+    indexing. Uses the same `trashed=false` filter as list_files_in_drive
+    so the number matches what an actual build would enumerate.
+    """
+    total = 0
+    page_token = None
+    kwargs_base = {
+        "q": "trashed = false",
+        "spaces": "drive",
+        "fields": "files(id), nextPageToken",
+        "pageSize": 1000,
+        "supportsAllDrives": True,
+        "includeItemsFromAllDrives": True,
+        "driveId": drive_id,
+        "corpora": "drive",
+    }
+    while True:
+        kwargs = dict(kwargs_base)
+        if page_token:
+            kwargs["pageToken"] = page_token
+        resp = _api_call_with_retry(lambda: service.files().list(**kwargs).execute())
+        total += len(resp.get("files", []))
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return total
+
+
 def list_files_in_drive(service, drive_id: str) -> list[dict]:
     files: list[dict] = []
     page_token = None

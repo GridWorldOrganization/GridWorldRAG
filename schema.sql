@@ -30,6 +30,13 @@ CREATE TABLE IF NOT EXISTS public.fd_registry (
 -- Migration: add column if table already existed without it
 ALTER TABLE public.fd_registry ADD COLUMN IF NOT EXISTS search_enabled BOOLEAN NOT NULL DEFAULT FALSE;
 
+-- file_count_estimate: fresh count of non-trashed files in the drive,
+-- refreshed by the control API background pump every 30 min regardless of
+-- the enabled flag. Lets the UI show "this drive has ~N files" before the
+-- user turns on indexing so they can gauge the cost of a build.
+ALTER TABLE public.fd_registry ADD COLUMN IF NOT EXISTS file_count_estimate INTEGER;
+ALTER TABLE public.fd_registry ADD COLUMN IF NOT EXISTS file_count_estimate_at TIMESTAMPTZ;
+
 -- v0.4 experiment mode: file-parallel build + immediate cancellation.
 -- pending_rotate_token  : Changes API start token, captured at list-task time.
 --                         Commits into rotate_token at finalize. Survives

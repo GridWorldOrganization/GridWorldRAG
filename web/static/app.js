@@ -60,6 +60,20 @@ function fmtTs(s) {
     return d.toLocaleString("ja-JP", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
   } catch { return s; }
 }
+function fmtFileCount(r) {
+  // Shows "<actual> / ~<estimate>" when both are known, or just the
+  // available one. Estimate (shaded, with ~) comes from the Drive API
+  // preview pump; actual is the number of files already indexed.
+  const actual = Number(r.file_count) || 0;
+  const est = r.file_count_estimate;
+  const hasEst = est !== null && est !== undefined;
+  if (!actual && !hasEst) return "—";
+  if (!hasEst) return actual.toLocaleString();
+  if (!actual) return `<span class="muted">~${Number(est).toLocaleString()}</span>`;
+  if (Number(est) === actual) return actual.toLocaleString();
+  return `${actual.toLocaleString()} <span class="muted">/ ~${Number(est).toLocaleString()}</span>`;
+}
+
 function escapeHtml(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
@@ -270,7 +284,7 @@ function renderBuildTable(rows) {
         <td class="col-toggle"><input type="checkbox" class="toggle" ${r.enabled ? "checked" : ""} data-action="toggle-build" aria-label="ビルド ON/OFF"></td>
         <td title="${escapeHtml(r.drive_id)}">${escapeHtml(r.name || "(no name)")}</td>
         <td><span class="state ${state}">${state}${r.running ? " ●" : ""}</span></td>
-        <td>${(Number(r.file_count) || 0).toLocaleString()}</td>
+        <td>${fmtFileCount(r)}</td>
         <td>${(Number(r.chunk_count) || 0).toLocaleString()}</td>
         <td>${fmtTs(r.last_sync_at)}</td>
         <td>${fmtTs(r.last_build_at)}</td>
@@ -401,7 +415,7 @@ const refreshMcpScope = withInflight(async function _refreshMcpScopeImpl() {
           ${hint ? `<span class="muted small"> ${hint}</span>` : ""}
         </td>
         <td><span class="state ${state}">${state}</span></td>
-        <td>${(Number(r.file_count) || 0).toLocaleString()}</td>
+        <td>${fmtFileCount(r)}</td>
         <td>${(Number(r.chunk_count) || 0).toLocaleString()}</td>
         <td>${fmtTs(r.last_build_at)}</td>
       </tr>

@@ -227,6 +227,7 @@ def list_fds(conn: psycopg.Connection) -> list[dict]:
             SELECT drive_id, name, enabled, search_enabled, state,
                    last_sync_at, last_build_at,
                    file_count, chunk_count,
+                   file_count_estimate, file_count_estimate_at,
                    rotate_token, pending_rotate_token, total_files_listed,
                    last_error, created_at, updated_at
             FROM public.fd_registry
@@ -446,6 +447,23 @@ def inflight_workers_on_drive(conn: psycopg.Connection, drive_id: str) -> int:
             (drive_id,),
         )
         return int((cur.fetchone() or {"n": 0})["n"])
+
+
+def set_file_count_estimate(conn: psycopg.Connection, drive_id: str, count: int) -> None:
+    """Write the drive's cached file-count estimate. Caller does not need to
+    manage transactions — commits on success, rolls back on error."""
+    with conn.cursor() as cur:
+        try:
+            cur.execute(
+                "UPDATE public.fd_registry "
+                "   SET file_count_estimate=%s, file_count_estimate_at=NOW() "
+                " WHERE drive_id=%s",
+                (count, drive_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def set_rotate_token(conn: psycopg.Connection, drive_id: str, token: Optional[str]) -> None:
