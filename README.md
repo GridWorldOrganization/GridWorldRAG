@@ -1,8 +1,72 @@
 # WinServerRAG
 
-Windows 常駐の RAG サーバー。Google Drive 共有フォルダ単位で DB を持ち、
-Claude Cowork / Claude Desktop から **MCP (Model Context Protocol) 経由で遠隔検索可能**。
-既存 GridWorldRAG のロジックを Windows ネイティブ向けに移植したもの。
+[![GridJapan](https://img.shields.io/badge/built_by-GridJapan-0a84ff)](#%E9%96%8B%E7%99%BA%E6%A1%88%E4%BB%B6%E3%81%AE%E3%81%94%E7%9B%B8%E8%AB%87)
+[![Windows Native](https://img.shields.io/badge/runtime-Windows_11-0078d4)](.)
+[![PostgreSQL](https://img.shields.io/badge/db-PostgreSQL_17_%2B_pgvector-336791)](.)
+[![GPU](https://img.shields.io/badge/embedding-RTX_4070_CUDA_12.4-76b900)](.)
+
+Windows 常駐の RAG（Retrieval-Augmented Generation）サーバー。
+Google Drive の共有フォルダをセマンティック検索できるようにし、
+Claude Cowork / Claude Desktop / 任意の MCP クライアントから **MCP (Model Context Protocol) 経由で遠隔検索** できます。
+
+> ⚡ **実測性能**: warm search **840ms** (AWS API Gateway 経由、リランカー込み、RTX 4070 SUPER)
+> 🔒 **セキュリティ**: Basic Auth + per-drive 分離スキーマ + PBKDF2-SHA256 + AWS IAM 最小権限
+> 🔧 **運用**: 4 並列ワーカー、自動差分同期、ゾンビ GC、障害耐性
+
+---
+
+## このリポジトリについて
+
+これは **GridJapan** が実際に自社で運用している業務ツールのソースコードです。
+社内 Google Drive の資料（数万件）を横断的に検索し、
+Claude Cowork から遠隔で呼び出すために構築しました。
+
+姉妹プロジェクトとして [Mac 版 GridWorldRAG](../../tree/master) (master branch) もあります。
+
+### 開発案件のご相談
+
+このプロダクトのようなシステムを「自社にも作りたい」と感じた方へ。
+
+GridJapan は **AI × 業務システム** の開発を請け負っています。
+以下のようなテーマでご相談歓迎です：
+
+- 社内ナレッジを **LLM / RAG** 経由で検索できる仕組み
+- **Claude / OpenAI / 独自 LLM** の業務組み込み（MCP / Function Calling / Agent）
+- **Windows サーバー** 上で動く AI システム（GPU 活用、常駐サービス化）
+- **Google Workspace / Microsoft 365** など既存ツールとのネイティブ連携
+- 既存の業務データから RAG データセットを構築するパイプライン
+
+**お問い合わせ**: [tobisako@gridworld.co](mailto:tobisako@gridworld.co)
+または GitHub Issue でお気軽にどうぞ。
+
+---
+
+## What is this?
+
+WinServerRAG is a Windows-native RAG server we built and run internally at GridJapan.
+It indexes Google Drive shared folders into pgvector, serves a Web monitor
+and an Electron mini-monitor, and exposes search through the Model Context
+Protocol so Claude Cowork on another machine can query it remotely through
+an AWS serverless bridge.
+
+The code in this branch is the real production copy we use day-to-day.
+
+We are a small engineering shop based in Japan. If your team wants something
+like this built for your business, reach out: **tobisako@gridworld.co**.
+
+---
+
+## 既存 GridWorldRAG との違い
+
+| 観点 | GridWorldRAG (Mac, master) | WinServerRAG (このブランチ) |
+|---|---|---|
+| OS | macOS (M2 Max) | Windows 11 |
+| デーモン | launchd | 手動起動 or NSSM (Task Scheduler 禁止) |
+| DB | Homebrew pgvector | Windows native PG17 + 自ビルド pgvector |
+| UI | Web モニターのみ | Web モニター + Electron ミニモニター |
+| 並列化 | ビルドだけ 4 並列 | ビルド + MCP + AWS bridge が独立 |
+| MCP | ローカル MCP server | AWS (API GW + Lambda + SQS) 経由で世界中から接続可能 |
+| 埋め込み | CPU (MPS) | GPU (RTX 4070 SUPER CUDA) |
 
 ---
 
