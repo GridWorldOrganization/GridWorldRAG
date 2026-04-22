@@ -1,4 +1,4 @@
-// Mini monitor — polls control API every 500ms.
+// Mini monitor — polls control API every 250ms.
 
 let API = "http://127.0.0.1:17600";
 
@@ -26,7 +26,7 @@ async function fetchJSON(path, timeoutMs = 1500) {
 
 let consecutiveFails = 0;
 let lastFilesDoneSum = 0;
-let _inflight = false;  // prevent overlapping fetches if a tick takes longer than 500ms
+let _inflight = false;  // prevent overlapping fetches if a tick takes longer than 250ms
 
 // A worker row is considered stale (its owning daemon died / crashed) if
 // its heartbeat hasn't advanced within this window. Normal sources of gap:
@@ -196,5 +196,5 @@ window.addEventListener("DOMContentLoaded", async () => {
   $("api-url").textContent = API.replace(/^https?:\/\//, "");
   $("open-btn").addEventListener("click", () => window.winsrv.openWebUi());
   tick();
-  setInterval(tick, 500);
+  setInterval(tick, 250);
 });
