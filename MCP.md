@@ -25,7 +25,7 @@ Claude Cowork / Claude Desktop / 任意の MCP クライアントから、
 
 - WinServerRAG がインストール済みかつ API 稼働中 (`http://127.0.0.1:17600/mcp` が応答)
 - Windows モニターの **MCP 検索設定** タブで検索対象ドライブの `search_enabled` を ON にしておく
-- MCP ログインユーザー (`tobisako` / `izumi` など) が登録済み
+- MCP ログインユーザーが `public.mcp_users` に登録済み（`/api/mcp/users` で作成、または `WINSERVERRAG_SEED_USERS="user1:pw1,user2:pw2"` の環境変数で初回 seed）
 
 ## 2. 公開トンネルを張る (いずれか一つ)
 
@@ -94,8 +94,8 @@ Base64 作成例 (PowerShell):
 
 - **URL**: `https://<あなたの公開URL>/mcp`
 - **認証方式**: HTTP Basic Auth
-- **ユーザー名**: `tobisako` (または管理者から払い出されたアカウント)
-- **パスワード**: 対応パスワード (初期は `admin`、運用時は必ず変更)
+- **ユーザー名**: 管理者から払い出されたアカウント
+- **パスワード**: 発行時に受け取った値（共有時は 20文字以上のランダム文字列を推奨）
 
 ## 4. 提供ツール
 
@@ -123,7 +123,7 @@ curl -X POST https://<URL>/mcp/ \
 
 ## 6. セキュリティ注意
 
-- **初期パスワード `admin` は必ず変更** してください (`/mcp/users/{username}/password` or UI の MCP タブから)
+- **弱いパスワードを設定しない** (20文字以上のランダム推奨)。変更は `/mcp/users/{username}/password` または UI の MCP タブから
 - 公開トンネルを使う場合、**必ず Basic Auth を有効に** (当サーバーは強制)
 - トンネル経由での公開は信頼できる人にのみ URL を渡す
 - ユーザーの削除は Windows モニター → MCP 検索設定タブ → ユーザーテーブルの [削除]

@@ -8,14 +8,17 @@ variable "aws_profile" {
   default = "sandbox2"
 }
 
+# Credentials for the public Lambda URL's embedded Basic Auth check.
+# No defaults on purpose — an accidental `terraform apply` without
+# terraform.tfvars should fail, not silently ship a weak default into
+# Lambda env. Keep the real values in infra/aws/terraform.tfvars, which is
+# gitignored.
 variable "basic_user" {
   type      = string
-  default   = "tobisako"
   sensitive = true
 }
 
 variable "basic_pass" {
   type      = string
-  default   = "admin"
   sensitive = true
 }

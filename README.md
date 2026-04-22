@@ -64,8 +64,9 @@ Claude Cowork / Claude Desktop から **MCP (Model Context Protocol) 経由で�
 
 ### MCP 検索設定画面 (`/` → MCP タブ)
 
-- **MCP ログインユーザー** 管理 (初期値: `tobisako` / `izumi`、PW は `admin`)
-  - 追加・パスワード変更・削除
+- **MCP ログインユーザー** 管理
+  - 初回 seed は `WINSERVERRAG_SEED_USERS="user1:pw1,user2:pw2"` の環境変数経由 (バンドルデフォルト無し)
+  - UI から 追加・パスワード変更・削除 が可能
 - **MCP 検索スコープ**: どの共有ドライブを遠隔検索の対象にするか行クリックで ON/OFF
 
 ### Electron ミニモニター

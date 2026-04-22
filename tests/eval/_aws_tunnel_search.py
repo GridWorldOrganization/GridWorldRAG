@@ -1,18 +1,42 @@
 """E2E test: Hirai Cowork → AWS Lambda URL → SQS → Akasaka aws_bridge → DDB.
 
 Simulates what Cowork does when configured against the serverless pipe.
+
+Reads connection info from the environment so credentials never land in the
+repo:
+
+    WINSERVERRAG_MCP_URL   — full API Gateway URL, e.g. https://xxx.execute-api...amazonaws.com/
+    WINSERVERRAG_MCP_USER  — Basic Auth username
+    WINSERVERRAG_MCP_PASS  — Basic Auth password
+
+Fail loudly if any is missing — don't silently default to a publishable stub.
 """
 from __future__ import annotations
 
 import base64
 import json
+import os
 import sys
 import time
 
 import requests
 
-URL = "https://REDACTED-API-GW-HOST/"
-AUTH = "Basic " + base64.b64encode(b"***:***").decode()
+
+def _require(name: str) -> str:
+    v = os.environ.get(name)
+    if not v:
+        sys.stderr.write(
+            f"ERROR: {name} is not set. Export WINSERVERRAG_MCP_URL, "
+            "WINSERVERRAG_MCP_USER, WINSERVERRAG_MCP_PASS before running.\n"
+        )
+        sys.exit(2)
+    return v
+
+
+URL  = _require("WINSERVERRAG_MCP_URL")
+USER = _require("WINSERVERRAG_MCP_USER")
+PASS = _require("WINSERVERRAG_MCP_PASS")
+AUTH = "Basic " + base64.b64encode(f"{USER}:{PASS}".encode()).decode()
 
 sys.stdout.reconfigure(encoding="utf-8")
 

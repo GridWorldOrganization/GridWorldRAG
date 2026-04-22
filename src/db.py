@@ -670,13 +670,37 @@ def get_mcp_user_hash(conn: psycopg.Connection, username: str) -> Optional[str]:
 
 
 def seed_default_mcp_users(conn: psycopg.Connection) -> list[str]:
-    """Create tobisako / izumi on first init (pw=admin) if they don't exist.
+    """Seed MCP Basic-Auth users from the environment on first init.
+
+    Reads WINSERVERRAG_SEED_USERS as a comma-separated list of
+    `username:password` pairs, e.g. `alice:s3cret,bob:hunter2`. Each
+    entry is upserted into public.mcp_users only if the username is not
+    already present, so repeat runs are idempotent. If the env var is
+    unset or empty the function is a no-op — callers should create the
+    first user through the admin API (or a one-off script) instead of
+    relying on bundled default credentials.
+
     Returns the list of usernames that were newly created.
     """
+    import os
     from src.mcp_auth import hash_password
+
     created: list[str] = []
-    defaults = [("tobisako", "admin"), ("izumi", "admin")]
-    for username, pw in defaults:
+    raw = os.environ.get("WINSERVERRAG_SEED_USERS", "").strip()
+    if not raw:
+        return created
+
+    pairs: list[tuple[str, str]] = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item or ":" not in item:
+            continue
+        u, _, p = item.partition(":")
+        u, p = u.strip(), p.strip()
+        if u and p:
+            pairs.append((u, p))
+
+    for username, pw in pairs:
         with conn.cursor() as cur:
             cur.execute("SELECT 1 FROM public.mcp_users WHERE username=%s", (username,))
             if cur.fetchone() is None:
