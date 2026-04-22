@@ -45,7 +45,7 @@ Claude Cowork / Claude Desktop から **MCP (Model Context Protocol) 経由で�
 8. ブラウザで `http://127.0.0.1:17600/` → 管理画面
 9. Electron ミニモニター: `scripts\run_mini.bat`
 10. MCP 公開: [MCP.md](./MCP.md) 参照
-11. バックアップ登録: `scripts\install_service.md` の Task Scheduler セクション
+11. バックアップは手動で `scripts\backup.bat` を実行（自動化は `scripts\install_service.md` 参照、Task Scheduler は使用禁止）
 
 ## 廃案（設計書にあるが採用しない）
 

@@ -8,7 +8,11 @@ polling for it.
 Credentials come from the `winserverrag-bridge` AWS profile (least-privilege
 IAM user: sqs recv/delete + ddb put only). Region is ap-northeast-1.
 
-Run as a Windows service (nssm) alongside rag_daemon.py.
+Launch manually in its own PowerShell/Command Prompt window kept open:
+    cd C:\\claude_code\\dev\\WinServerRAG
+    .venv\\Scripts\\python.exe -m src.aws_bridge
+
+Task Scheduler registration is forbidden per the project policy.
 """
 from __future__ import annotations
 
