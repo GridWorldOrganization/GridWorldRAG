@@ -11,6 +11,14 @@ httplib2
 
 # Embedding
 sentence-transformers>=3.0
+# torch: pip resolves to the CPU wheel by default. For NVIDIA GPU
+# (reranker latency 3-13s -> ~200ms, 15x faster search; ~25% faster
+# build), uninstall the CPU wheel and install the CUDA variant via
+# PyTorch's index AFTER `pip install -r requirements.txt`:
+#   pip uninstall torch -y
+#   pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+# Tested on RTX 4070 SUPER + driver 595.79 (CUDA 13.2 runtime). CUDA 12.4
+# wheels are forward-compatible with newer drivers.
 torch
 
 # Text extraction
