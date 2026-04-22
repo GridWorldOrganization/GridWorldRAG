@@ -23,6 +23,8 @@ Claude Cowork から遠隔で呼び出すために構築しました。
 
 姉妹プロジェクトとして [Mac 版 GridWorldRAG](../../tree/master) (master branch) もあります。
 
+> 📖 **このシステムが 1 台の PC のバッチから GPU 駆動の AWS サーバーレスに変わるまでの進化記録は** [docs/EVOLUTION.md](./docs/EVOLUTION.md) **にあります**。
+
 ### 開発案件のご相談
 
 このプロダクトのようなシステムを「自社にも作りたい」と感じた方へ。
