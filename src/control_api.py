@@ -580,15 +580,29 @@ def api_stats():
 # --- file_count_estimate pump --------------------------------------------
 # Refreshes fd_registry.file_count_estimate for EVERY known drive (enabled
 # or not) so the UI can preview "~N files" before the user turns indexing
-# on. This uses the cheap id-only Drive API query — not a full list. Runs
-# at startup (staggered so we don't hammer the API) and then every 30 min.
-COUNT_REFRESH_INTERVAL_SEC = 1800   # 30 min
-COUNT_REFRESH_STAGGER_SEC  = 2      # one drive every N seconds initially
+# on. Uses the cheap id-only Drive API query — not a full list.
+#
+# Hot loop semantics:
+#   - Re-reads the drive list from fd_registry every iteration so newly
+#     discovered drives (e.g. user just pressed "共有ドライブを取得")
+#     are picked up within seconds, not on the next 30-min sweep.
+#   - Prioritizes uncounted drives. Drives that already have a recent
+#     estimate are skipped until it goes stale.
+#   - Stagger the API calls so we don't burst Drive quota when a user
+#     first discovers 29+ drives at once.
+COUNT_FRESH_WINDOW_SEC  = 1800   # don't re-count drives younger than 30 min
+COUNT_IDLE_SLEEP_SEC    = 30     # how long to nap when nothing is stale
+COUNT_STAGGER_SEC       = 0.5    # min gap before launching the next count
+COUNT_CONCURRENCY       = 4      # how many Drive-API counts can run at once
 
 
 async def _count_estimate_pump():
-    """Background: count files in every registered drive periodically."""
+    """Background: keep fd_registry.file_count_estimate fresh for every
+    registered drive, whether indexing is on or off.
+    """
     import asyncio as _a
+    from datetime import datetime, timezone, timedelta
+
     # Let the lifespan finish priming Drive auth first
     await _a.sleep(10)
 
@@ -608,25 +622,70 @@ async def _count_estimate_pump():
         except Exception as e:
             log.warning(f"file_count_estimate failed for {name!s}: {e}")
 
+    # Semaphore caps how many Drive API paginations run at once so one
+    # mega-drive (e.g. 20,000 files, 21 pages × ~2s) can't block 28 smaller
+    # ones. 4 gives good throughput without bursting the quota.
+    sem = _a.Semaphore(COUNT_CONCURRENCY)
+    in_flight: set = set()
+
+    async def _count_guarded(drive_id: str, name: str):
+        try:
+            async with sem:
+                await _count_one(drive_id, name)
+        finally:
+            in_flight.discard(drive_id)
+
+    log.info(f"file_count_estimate pump started (concurrency={COUNT_CONCURRENCY})")
     while True:
+        # Pull the full registry every iteration so freshly discovered
+        # drives show up within seconds.
         try:
             def _fetch_drives():
                 conn = db.connect()
                 try:
-                    return [(r["drive_id"], r["name"]) for r in db.list_fds(conn)]
+                    return [
+                        (r["drive_id"], r["name"], r.get("file_count_estimate_at"))
+                        for r in db.list_fds(conn)
+                    ]
                 finally:
                     conn.close()
             drives = await _a.to_thread(_fetch_drives)
         except Exception as e:
             log.warning(f"count pump: list_fds failed: {e}")
-            drives = []
+            await _a.sleep(COUNT_IDLE_SLEEP_SEC)
+            continue
 
-        log.info(f"file_count_estimate: sweeping {len(drives)} drives")
-        for drive_id, name in drives:
-            await _count_one(drive_id, name)
-            await _a.sleep(COUNT_REFRESH_STAGGER_SEC)
+        now = datetime.now(timezone.utc)
+        stale_cutoff = now - timedelta(seconds=COUNT_FRESH_WINDOW_SEC)
 
-        await _a.sleep(COUNT_REFRESH_INTERVAL_SEC)
+        def _is_stale(ts):
+            # Treat never-counted (NULL) as highest priority.
+            return ts is None or ts < stale_cutoff
+
+        # Prioritize never-counted drives, then the oldest-counted.
+        pending = [
+            (did, name, ts) for did, name, ts in drives
+            if _is_stale(ts) and did not in in_flight
+        ]
+        pending.sort(key=lambda r: (r[2] is not None, r[2] or stale_cutoff))
+
+        if not pending and not in_flight:
+            # Everyone is fresh. Nap and re-check shortly.
+            await _a.sleep(COUNT_IDLE_SLEEP_SEC)
+            continue
+
+        if pending:
+            log.info(
+                f"file_count_estimate: {len(pending)} pending, "
+                f"{len(in_flight)} in flight (of {len(drives)} total)"
+            )
+            for drive_id, name, _ts in pending:
+                in_flight.add(drive_id)
+                _a.create_task(_count_guarded(drive_id, name))
+                await _a.sleep(COUNT_STAGGER_SEC)
+
+        # Don't respin the scan too fast; let in-flight work breathe.
+        await _a.sleep(COUNT_STAGGER_SEC)
 
 
 @app.post("/api/fds/{drive_id}/refresh-count",
