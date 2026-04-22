@@ -105,6 +105,27 @@ const refreshStats = withInflight(async function _refreshStatsImpl() {
     set("#stat-files",  `Files: ${(s.total_files ?? 0).toLocaleString()}`);
     set("#stat-chunks", `Chunks: ${(s.total_chunks ?? 0).toLocaleString()}`);
     set("#stat-dbsize", `DB: ${fmtBytes(s.db_size_bytes)}`);
+
+    // Device badge: 🎮 GPU (name · util% · VRAM used/total) or 💻 CPU
+    const dev = $("#stat-device");
+    if (dev) {
+      const d = s.device || { kind: "cpu" };
+      if (d.kind === "cuda") {
+        const shortName = (d.name || "GPU").replace(/^NVIDIA\s+GeForce\s+/i, "");
+        const util = (d.util_pct ?? null) !== null ? ` · ${d.util_pct}%` : "";
+        const vram = (d.used_vram_mb ?? null) !== null && d.total_vram_mb
+          ? ` · ${(d.used_vram_mb/1024).toFixed(1)}/${(d.total_vram_mb/1024).toFixed(1)}GB`
+          : "";
+        const pwr  = (d.power_w ?? null) !== null ? ` · ${d.power_w}W` : "";
+        dev.textContent = `🎮 ${shortName}${util}${vram}${pwr}`;
+        dev.className = "badge device-gpu";
+        dev.title = `Embedding / Reranker on CUDA\n${d.name}`;
+      } else {
+        dev.textContent = "💻 CPU";
+        dev.className = "badge device-cpu";
+        dev.title = "Embedding / Reranker on CPU (no CUDA available)";
+      }
+    }
   } catch (e) {
     console.error("refreshStats failed:", e);
     _lastPgOk = false;

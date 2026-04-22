@@ -90,6 +90,13 @@ header h1 { margin: 0 0 8px 0; font-size: 18px; font-weight: 600; display: flex;
 }
 .badge.ok  { color: var(--ok); border-color: #1f4a36; }
 .badge.err { color: var(--err); border-color: #4d2127; }
+.badge.device-gpu {
+  color: #9af29a; border-color: #2f6a3a; background: #142617;
+  font-variant-numeric: tabular-nums; letter-spacing: 0.02em;
+}
+.badge.device-cpu {
+  color: #aab1c6; border-color: #3a4158; background: #1a1f2c;
+}
 button {
   background: #1b2030; color: var(--fg); border: 1px solid var(--border);
   border-radius: 6px; padding: 4px 10px; cursor: pointer; font-size: 13px;

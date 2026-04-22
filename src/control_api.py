@@ -475,13 +475,70 @@ _stats_cache: dict = {
     "total_fds": 0, "enabled_fds": 0, "total_files": 0, "total_chunks": 0,
     "db_size_bytes": None, "pg_ok": False, "drive_ok": True,
     "last_updated": None,
+    # Device info (GPU vs CPU). Static fields are probed once at startup;
+    # dynamic VRAM / util are refreshed in _stats_pump via nvidia-smi.
+    "device": {
+        "kind": "cpu",              # "cuda" or "cpu"
+        "name": None,               # e.g. "NVIDIA GeForce RTX 4070 SUPER"
+        "total_vram_mb": None,
+        "used_vram_mb": None,
+        "util_pct": None,
+        "power_w": None,
+    },
 }
 _stats_lock = threading.Lock()
 
 
+def _probe_device_static() -> dict:
+    """One-shot probe at startup: GPU name + total VRAM if CUDA is available."""
+    try:
+        import torch  # imported lazily; ~100ms first time
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            props = torch.cuda.get_device_properties(0)
+            return {
+                "kind": "cuda",
+                "name": torch.cuda.get_device_name(0),
+                "total_vram_mb": int(props.total_memory / 1024 / 1024),
+                "used_vram_mb": None, "util_pct": None, "power_w": None,
+            }
+    except Exception:
+        pass
+    return {"kind": "cpu", "name": None, "total_vram_mb": None,
+            "used_vram_mb": None, "util_pct": None, "power_w": None}
+
+
+def _probe_gpu_live() -> dict | None:
+    """Cheap nvidia-smi call to grab util/mem/power. Returns None if no GPU."""
+    try:
+        import subprocess
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,power.draw",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if r.returncode != 0:
+            return None
+        parts = [p.strip() for p in r.stdout.strip().split(",")]
+        if len(parts) < 3:
+            return None
+        return {
+            "util_pct":     int(float(parts[0])),
+            "used_vram_mb": int(float(parts[1])),
+            "power_w":      int(float(parts[2])),
+        }
+    except Exception:
+        return None
+
+
 async def _stats_pump():
-    """Background task: refresh _stats_cache every 5s from DB."""
+    """Background task: refresh _stats_cache every 5s from DB + nvidia-smi."""
     import asyncio as _a
+    # One-shot static device probe
+    static_dev = await _a.to_thread(_probe_device_static)
+    with _stats_lock:
+        _stats_cache["device"].update(static_dev)
+    log.info(f"device probed: kind={static_dev['kind']} name={static_dev.get('name')}")
+
     while True:
         await _a.sleep(5.0)
         try:
@@ -501,6 +558,13 @@ async def _stats_pump():
             with _stats_lock:
                 _stats_cache["pg_ok"] = False
                 _stats_cache["last_updated"] = _time.time()
+
+        # GPU live telemetry (only if we detected CUDA at startup)
+        if _stats_cache["device"].get("kind") == "cuda":
+            live = await _a.to_thread(_probe_gpu_live)
+            if live is not None:
+                with _stats_lock:
+                    _stats_cache["device"].update(live)
 
 
 @app.get("/api/stats", dependencies=[Depends(require_token)])
