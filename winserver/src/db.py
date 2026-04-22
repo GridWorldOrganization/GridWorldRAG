@@ -162,15 +162,51 @@ CREATE INDEX IF NOT EXISTS idx_{schema_raw}_documents_sheet_gid
 
 
 def ensure_fd_schema(conn: psycopg.Connection, drive_id: str) -> str:
+    """Create the per-FD schema + tables + indexes if missing.
+
+    PostgreSQL's `CREATE SCHEMA IF NOT EXISTS` is NOT race-free: concurrent
+    callers can both see "does not exist", both proceed, and one loses with
+    a pg_namespace unique-violation. We detect "already exists" (SQLSTATE
+    42P06 `duplicate_schema` or 23505 `unique_violation` on pg_namespace)
+    and treat it as success. Same for index name collisions (42P07).
+    """
     schema = schema_for_drive(drive_id)
     sql = _FD_SCHEMA_SQL.format(
         schema_q=_quote_ident(schema),
         schema_raw=schema,
         dim=EMBEDDING_DIM,
     )
-    with conn.cursor() as cur:
-        cur.execute(sql)
-    conn.commit()
+    for _attempt in range(3):
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+            conn.commit()
+            return schema
+        except psycopg.errors.DuplicateSchema:
+            conn.rollback()
+            return schema
+        except psycopg.errors.DuplicateTable:
+            conn.rollback()
+            return schema
+        except psycopg.errors.DuplicateObject:
+            # e.g., index already exists from a parallel create
+            conn.rollback()
+            return schema
+        except psycopg.errors.UniqueViolation as e:
+            # Typically pg_namespace_nspname_index race. Re-check existence.
+            conn.rollback()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM information_schema.schemata WHERE schema_name=%s",
+                    (schema,),
+                )
+                if cur.fetchone() is not None:
+                    return schema
+            # Not there after rollback — unexpected, re-raise
+            raise
+        except Exception:
+            conn.rollback()
+            raise
     return schema
 
 
@@ -289,6 +325,126 @@ def touch_sync(conn: psycopg.Connection, drive_id: str, *, built: bool = False) 
     with conn.cursor() as cur:
         cur.execute(sql, (drive_id,))
     conn.commit()
+
+
+# ---------------------------------------------------------------------
+# v0.4: build lifecycle helpers for the task-queue daemon
+# ---------------------------------------------------------------------
+def begin_build(conn: psycopg.Connection, drive_id: str,
+                start_token: str, total_files: int) -> None:
+    """Mark a build as in-progress with the start token captured (held in
+    pending_rotate_token) and the total file count recorded. Idempotent."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE public.fd_registry
+               SET state='building',
+                   pending_rotate_token=%s,
+                   total_files_listed=%s,
+                   cancel_requested=FALSE,
+                   last_error=NULL,
+                   updated_at=NOW()
+             WHERE drive_id=%s
+            """,
+            (start_token, total_files, drive_id),
+        )
+    conn.commit()
+
+
+def commit_build(conn: psycopg.Connection, drive_id: str) -> None:
+    """Finalize a build: commit pending_rotate_token → rotate_token,
+    set state='idle', last_build_at=NOW, and recompute file/chunk counts
+    via a single aggregate query on the FD schema."""
+    schema = schema_for_drive(drive_id)
+    with conn.cursor() as cur:
+        # Recompute counts with our double split_part trick
+        # (spreadsheets have {file_id}_sheet_{gid}_chunk_{n} — strip both).
+        cur.execute(
+            f"""
+            SELECT COUNT(DISTINCT split_part(split_part(drive_file_id,'_chunk_',1),
+                                              '_sheet_', 1)) AS files,
+                   COUNT(*) AS chunks
+              FROM {_quote_ident(schema)}.documents
+            """
+        )
+        row = cur.fetchone() or {"files": 0, "chunks": 0}
+        cur.execute(
+            """
+            UPDATE public.fd_registry
+               SET rotate_token = COALESCE(pending_rotate_token, rotate_token),
+                   pending_rotate_token = NULL,
+                   total_files_listed = NULL,
+                   cancel_requested = FALSE,
+                   file_count = %s,
+                   chunk_count = %s,
+                   last_build_at = NOW(),
+                   last_sync_at = NOW(),
+                   state = 'idle',
+                   updated_at = NOW()
+             WHERE drive_id=%s
+            """,
+            (row["files"], row["chunks"], drive_id),
+        )
+    conn.commit()
+
+
+def abort_build(conn: psycopg.Connection, drive_id: str, *,
+                drop_schema: bool = False) -> None:
+    """Clear build state when a cancelled drive is cleaned up. If
+    drop_schema is True, the per-FD schema is also dropped (used when
+    cancel happens during initial full-build where data was partial)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE public.fd_registry
+               SET pending_rotate_token = NULL,
+                   total_files_listed = NULL,
+                   cancel_requested = FALSE,
+                   state = 'idle',
+                   updated_at = NOW()
+             WHERE drive_id=%s
+            """,
+            (drive_id,),
+        )
+    conn.commit()
+    if drop_schema:
+        drop_fd_schema(conn, drive_id)
+
+
+def request_cancel(conn: psycopg.Connection, drive_id: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE public.fd_registry SET cancel_requested=TRUE, updated_at=NOW() WHERE drive_id=%s",
+            (drive_id,),
+        )
+    conn.commit()
+
+
+def is_cancel_requested(conn: psycopg.Connection, drive_id: str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT cancel_requested FROM public.fd_registry WHERE drive_id=%s",
+            (drive_id,),
+        )
+        r = cur.fetchone()
+        return bool(r and r["cancel_requested"])
+
+
+def inflight_workers_on_drive(conn: psycopg.Connection, drive_id: str) -> int:
+    """Workers currently heart-beating on this drive in an active state.
+    Used by the manager to decide whether finalize can be enqueued."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*)::int AS n
+              FROM public.daemon_workers
+             WHERE drive_id = %s
+               AND state IN ('claiming','listing','building','syncing')
+               AND heartbeat_at > NOW() - INTERVAL '60 seconds'
+            """,
+            (drive_id,),
+        )
+        return int((cur.fetchone() or {"n": 0})["n"])
 
 
 def set_rotate_token(conn: psycopg.Connection, drive_id: str, token: Optional[str]) -> None:

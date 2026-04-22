@@ -1,16 +1,51 @@
-"""Multi-threaded RAG daemon.
+"""Multi-threaded RAG daemon (v0.4 — task-queue architecture).
 
-Architecture:
-  main thread    : manager — authenticates, populates registry, keeps a work
-                   queue of enabled FDs, enforces target worker count (1..10).
-  worker threads : pull a drive_id from the queue, claim it via a PG advisory
-                   lock so no other process/worker touches it, then run a
-                   full/delta build. Progress is mirrored into
-                   public.daemon_workers on every phase change.
+Architecture
+============
 
-Scaling is live: the control API sets daemon_config.worker_count; the manager
-thread polls it and spawns/retires workers accordingly. Retiring workers
-finish their current FD and then exit cleanly.
+    Manager (1 thread)                 Workers (N threads, uniform)
+    ──────────────────                 ─────────────────────────────
+    ├─ enumerate fd_registry    ╲       ├─ task = _queue.get()
+    ├─ for enabled & idle drives ╲      └─ dispatch:
+    │   enqueue ("list_full", d)  ─────▶    ("list_full", d)
+    ├─ for enabled & idle w/token ╲            list_files_in_drive
+    │   enqueue ("list_delta", d)  ─────▶   ("list_delta", d)
+    ├─ for disabled & building     ─────▶      list_changes
+    │   request_cancel + drain queue │         ├─ drain 前検出
+    ├─ for building drives where    │          └─ for f in files:
+    │   queue empty & no inflight:  │              enqueue ("file", d, f)
+    │   enqueue ("finalize", d)     │       ("file", d, file_info)
+    │                                │           process_one_file
+    │                                │       ("file_delete", d, fid)
+    │                                │           tombstone the chunks
+    │                                │       ("finalize", d)
+    │                                │           commit_build (agg counts,
+    │                                │           pending_rotate_token→rotate_token)
+    │                                │
+    └─ also: zombie cleanup, events TTL, reconnect manager_conn
+
+Cancel semantics
+----------------
+`fd_registry.cancel_requested` is the cancel flag. Manager sets it when a
+drive's enabled flips OFF while in state='building'. Workers check it
+before processing each item and short-circuit. In-flight embedding is
+NOT interrupted (by design — interrupting PyTorch kernels is unreliable).
+
+Recovery
+--------
+- Worker dies mid-list: advisory lock auto-releases; next sweep sees
+  state='building' but queue empty + inflight=0 → finalize enqueued →
+  commit completes what was already processed. rotate_token advances
+  if possible. If pending_rotate_token was set, it survives; otherwise
+  state goes back to idle with no token change.
+- Worker dies mid-file: file is lost from this build. On next sweep the
+  drive looks complete (queue empty) and finalize runs. file_count will
+  reflect actual DB content (aggregate query). Missing file gets picked
+  up by next delta sync when its modifiedTime pushes it through
+  Changes API, or next full rebuild.
+- Daemon restart: clear_workers wipes stale worker rows. Manager sees
+  drives in state='building' with pending_rotate_token; treats queue as
+  empty and enqueues finalize to close them out.
 """
 from __future__ import annotations
 
@@ -21,7 +56,7 @@ import sys
 import threading
 import time
 import traceback
-from typing import Optional
+from typing import Optional, Tuple
 
 from src import config, db, drive_client as dc
 from src.embedding import embed_batch
@@ -34,40 +69,19 @@ LOCK_PATH = config.LOCK_DIR / "rag_daemon.lock"
 MAX_WORKERS = 10
 MIN_WORKERS = 1
 
-
-# ----- Liveness helpers for DB connections (Fix A) -----------------
-def _conn_alive(conn) -> bool:
-    """Cheap liveness probe. Returns False for a closed or broken conn."""
-    if conn is None:
-        return False
-    try:
-        if getattr(conn, "closed", False):
-            return False
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1")
-        return True
-    except Exception:
-        return False
-
-
-def _replace_conn(conn, *, label: str = ""):
-    """Close a broken conn and return a fresh one (or None on fail).
-    Never raises — caller decides whether to retry."""
-    if conn is not None:
-        try: conn.rollback()
-        except Exception: pass
-        try: conn.close()
-        except Exception: pass
-    try:
-        return db.connect()
-    except Exception as e:
-        log.error("%s reopen DB conn failed: %s", label or "conn", e)
-        return None
-
 _stop_flag = False
 _global_stop = threading.Event()
 
-_work_queue: queue.Queue = queue.Queue()
+# One shared queue for all task types. Items are tuples, first element is
+# the task kind: "list_full" | "list_delta" | "file" | "file_delete" | "finalize"
+_queue: queue.Queue = queue.Queue()
+
+# Per-drive pending-item counter. Used for completion detection without
+# scanning the queue. Incremented on put, decremented on get (for file
+# and file_delete tasks only — list/finalize are bookkeeping, not work).
+_queue_counts: dict[str, int] = {}
+_queue_counts_lock = threading.Lock()
+
 _workers_lock = threading.Lock()
 _workers: dict[int, dict] = {}  # wid -> {thread, stop_event, conn}
 _next_worker_id = 1
@@ -81,8 +95,34 @@ def _signal_handler(signum, frame):
 
 
 # ---------------------------------------------------------------------
-# Disk preflight
+# DB liveness helpers (Fix A from v0.3)
 # ---------------------------------------------------------------------
+def _conn_alive(conn) -> bool:
+    if conn is None:
+        return False
+    try:
+        if getattr(conn, "closed", False):
+            return False
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        return True
+    except Exception:
+        return False
+
+
+def _replace_conn(conn, *, label: str = ""):
+    if conn is not None:
+        try: conn.rollback()
+        except Exception: pass
+        try: conn.close()
+        except Exception: pass
+    try:
+        return db.connect()
+    except Exception as e:
+        log.error("%s reopen DB conn failed: %s", label or "conn", e)
+        return None
+
+
 def _min_free_bytes_ok() -> bool:
     import shutil
     try:
@@ -90,31 +130,171 @@ def _min_free_bytes_ok() -> bool:
         usage = shutil.disk_usage(drive)
         return usage.free >= config.DAEMON_MIN_FREE_BYTES
     except Exception:
-        return False  # fail-closed
+        return False
 
 
 # ---------------------------------------------------------------------
-# Registry sync (Drive side -> fd_registry)
+# Queue helpers (counted)
 # ---------------------------------------------------------------------
-def _register_discovered_drives(conn, service) -> None:
-    try:
-        drives = dc.list_shared_drives(service)
-    except Exception as e:
-        log.error("list_shared_drives failed: %s", e)
+def _enqueue(task: tuple) -> None:
+    """Push a task; update per-drive pending counter for file-type tasks."""
+    kind = task[0]
+    if kind in ("file", "file_delete"):
+        drive_id = task[1]
+        with _queue_counts_lock:
+            _queue_counts[drive_id] = _queue_counts.get(drive_id, 0) + 1
+    _queue.put(task)
+
+
+def _mark_consumed(task: tuple) -> None:
+    """Call after a file/file_delete task has been pulled from the queue
+    and the worker is about to process it (or skip it). Decrements count."""
+    kind = task[0]
+    if kind in ("file", "file_delete"):
+        drive_id = task[1]
+        with _queue_counts_lock:
+            n = _queue_counts.get(drive_id, 0) - 1
+            _queue_counts[drive_id] = max(0, n)
+
+
+def _pending_for_drive(drive_id: str) -> int:
+    with _queue_counts_lock:
+        return _queue_counts.get(drive_id, 0)
+
+
+# ---------------------------------------------------------------------
+# Worker context (heartbeat)
+# ---------------------------------------------------------------------
+_worker_ctx: dict[int, dict] = {}
+_worker_ctx_lock = threading.Lock()
+
+
+def _hb(conn, worker_id: Optional[int], **fields):
+    if worker_id is None:
         return
-    for d in drives:
+    with _worker_ctx_lock:
+        ctx = _worker_ctx.setdefault(worker_id, {})
+        ctx.update(fields)
+        full = dict(ctx)
+    try:
+        db.heartbeat_worker(conn, worker_id, **full)
+    except Exception:
+        try: conn.rollback()
+        except Exception: pass
+
+
+def _hb_reset(worker_id: int) -> None:
+    with _worker_ctx_lock:
+        _worker_ctx.pop(worker_id, None)
+
+
+# ---------------------------------------------------------------------
+# Task handlers
+# ---------------------------------------------------------------------
+def _handle_list(conn, wid: int, drive_id: str, mode: str) -> None:
+    """mode = 'full' or 'delta'.
+
+    Captures rotate_token BEFORE enumerating, then calls the appropriate
+    Drive API (list_files_in_drive for full, list_changes for delta) and
+    enqueues one file/file_delete task per item.
+
+    Uses a drive-level advisory lock so two workers can never list the
+    same drive concurrently; auto-released on conn close on worker crash.
+    """
+    row = db.get_fd(conn, drive_id)
+    if not row:
+        return
+    drive_name = (row.get("name") or "")
+
+    if db.is_cancel_requested(conn, drive_id):
+        log.info("list: drive %s cancel_requested, skipping", drive_id)
+        db.abort_build(conn, drive_id)
+        return
+
+    if not db.try_claim_drive(conn, drive_id):
+        log.info("list: drive %s already being listed by another worker", drive_id)
+        return
+
+    try:
+        _hb_reset(wid)
+        _hb(conn, wid, state="listing", drive_id=drive_id, drive_name=drive_name,
+            phase=f"list_{mode}_start", current_file=None, files_done=0,
+            total_files=0, last_error=None)
+
+        service = dc.get_drive_service()
+
         try:
-            db.upsert_fd(conn, d["id"], d["name"])
+            if mode == "full":
+                start_token = dc.get_changes_start_token(service, drive_id)
+            else:
+                start_token = row.get("rotate_token")
+                if not start_token:
+                    log.warning("delta list for %s but no rotate_token; falling back to full",
+                                drive_id)
+                    start_token = dc.get_changes_start_token(service, drive_id)
+                    mode = "full"
         except Exception as e:
-            log.error("upsert_fd %s failed: %s", d.get("id"), e)
+            log.error("list: getStartPageToken failed for %s: %s", drive_id, e)
+            db.set_state(conn, drive_id, "error", str(e))
+            return
+
+        _hb(conn, wid, phase=f"list_{mode}_enumerating")
+
+        try:
+            if mode == "full":
+                files = dc.list_files_in_drive(service, drive_id)
+                files = dc.attach_folder_paths(files, drive_name=drive_name)
+                changes = [(False, f) for f in files]  # (is_delete, file_info)
+                new_token = start_token
+            else:
+                raw_changes, new_token = dc.list_changes(service, start_token, drive_id)
+                changes = []
+                for ch in raw_changes:
+                    fid = ch.get("fileId")
+                    f = ch.get("file")
+                    is_delete = bool(ch.get("removed") or (f and f.get("trashed")))
+                    if is_delete:
+                        changes.append((True, {"id": fid}))
+                    elif f:
+                        f["folder_path"] = f.get("folder_path", drive_name)
+                        changes.append((False, f))
+        except Exception as e:
+            log.error("list: API enumerate failed for %s: %s", drive_id, e)
+            db.set_state(conn, drive_id, "error", str(e))
+            return
+
+        total = len(changes)
+        db.begin_build(conn, drive_id, start_token=new_token, total_files=total)
+        # Pre-create the FD schema before unleashing N workers on it — avoids
+        # the CREATE SCHEMA IF NOT EXISTS race on pg_namespace.
+        db.ensure_fd_schema(conn, drive_id)
+        log.info("[%s] (w#%s) list_%s — %d items", drive_id, wid, mode, total)
+
+        enqueued = 0
+        for is_delete, info in changes:
+            if db.is_cancel_requested(conn, drive_id):
+                log.info("list: cancel detected mid-enqueue at %d/%d", enqueued, total)
+                break
+            if is_delete:
+                _enqueue(("file_delete", drive_id, info.get("id")))
+            else:
+                _enqueue(("file", drive_id, info))
+            enqueued += 1
+
+        _hb(conn, wid, total_files=enqueued, phase=f"list_{mode}_done")
+    finally:
+        try:
+            db.release_drive(conn, drive_id)
+        except Exception:
+            try: conn.rollback()
+            except Exception: pass
 
 
-# ---------------------------------------------------------------------
-# Per-file processing
-# ---------------------------------------------------------------------
 def _embed_and_chunks_for_file(file_info: dict, service) -> list[dict]:
+    """Extract text, split into chunks, embed. Same as v0.3."""
     mime = file_info.get("mimeType", "")
     out: list[dict] = []
+
     if mime == "application/vnd.google-apps.spreadsheet":
         sheets = dc.extract_spreadsheet_sheets(file_info["id"])
         for sh in sheets:
@@ -152,264 +332,107 @@ def _embed_and_chunks_for_file(file_info: dict, service) -> list[dict]:
     return out
 
 
-def _process_file(conn, schema: str, drive_id: str, file_info: dict, service) -> None:
+def _handle_file(conn, wid: int, drive_id: str, file_info: dict) -> None:
+    """Process one file: check cancel, embed, upsert chunks.
+
+    Cancel check: happens BEFORE any Drive/embedding work. If set, the
+    task is dropped silently. The in-flight embedding of the PREVIOUS
+    file (if any) has already completed — we honor it but take no new
+    work for this drive."""
+    if db.is_cancel_requested(conn, drive_id):
+        return
+
+    row = db.get_fd(conn, drive_id)
+    drive_name = (row or {}).get("name", "") or ""
+    _hb(conn, wid, state="building", drive_id=drive_id, drive_name=drive_name,
+        phase="processing_file", current_file=file_info.get("name", ""))
+
+    if not _min_free_bytes_ok():
+        log.error("[%s] (w#%s) disk low, marking error", drive_id, wid)
+        try: db.set_state(conn, drive_id, "error", "disk low")
+        except Exception: pass
+        return
+
     try:
+        service = dc.get_drive_service()
+        schema = db.ensure_fd_schema(conn, drive_id)
         chunks = _embed_and_chunks_for_file(file_info, service)
-        if not chunks:
-            return
-        db.upsert_file_chunks(conn, schema, file_info["id"], chunks)
+        if chunks:
+            db.upsert_file_chunks(conn, schema, file_info["id"], chunks)
     except Exception as e:
-        log.warning("process file %s failed: %s", file_info.get("id"), e)
-        try:
-            conn.rollback()
-        except Exception:
-            pass
+        log.warning("[%s] (w#%s) file %s failed: %s",
+                    drive_id, wid, file_info.get("id"), e)
+        try: conn.rollback()
+        except Exception: pass
         try:
             db.add_failed_file(conn, drive_id, file_info["id"], str(e))
         except Exception:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-        db.log_event(conn, drive_id=drive_id, level="warn", event="file_fail",
-                     message=str(e)[:300],
-                     extra={"file_id": file_info.get("id"), "name": file_info.get("name")})
+            try: conn.rollback()
+            except Exception: pass
 
 
-# ---------------------------------------------------------------------
-# Full build & delta sync — both accept worker_id for live progress
-# ---------------------------------------------------------------------
-# Per-worker context kept in memory so every heartbeat sends the FULL state
-# of the worker — defends against zombie_cleanup DELETEing a row during a
-# long list_files() gap and the next heartbeat INSERTing a partial row.
-_worker_ctx: dict[int, dict] = {}
-_worker_ctx_lock = threading.Lock()
-
-
-def _hb(conn, worker_id: Optional[int], **fields):
-    """heartbeat — no-op when worker_id is None. Merges `fields` into the
-    per-worker context, then writes the full context to the row so the DB
-    never sees a half-specified INSERT."""
-    if worker_id is None:
+def _handle_file_delete(conn, wid: int, drive_id: str, file_id: str) -> None:
+    if db.is_cancel_requested(conn, drive_id):
         return
-    with _worker_ctx_lock:
-        ctx = _worker_ctx.setdefault(worker_id, {})
-        ctx.update(fields)
-        full = dict(ctx)
-    try:
-        db.heartbeat_worker(conn, worker_id, **full)
-    except Exception:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-
-
-def _hb_reset(worker_id: int) -> None:
-    """Clear the in-memory context for a worker (used when it goes idle)."""
-    with _worker_ctx_lock:
-        _worker_ctx.pop(worker_id, None)
-
-
-def build_full(conn, drive_id: str, service, *, worker_id: Optional[int] = None) -> None:
     row = db.get_fd(conn, drive_id)
     drive_name = (row or {}).get("name", "") or ""
-    log.info("[%s] (w#%s) full build starting", drive_id, worker_id)
-    db.set_state(conn, drive_id, "building")
-    db.log_event(conn, drive_id=drive_id, level="info", event="build_start", message="full build")
-    _hb(conn, worker_id, state="listing", phase="getting_start_token",
-        drive_id=drive_id, drive_name=drive_name,
-        current_file=None, files_done=0, total_files=0,
-        started_at="now()" and None)
-
+    _hb(conn, wid, state="syncing", drive_id=drive_id, drive_name=drive_name,
+        phase="deleting_file", current_file=file_id)
     try:
-        start_token = dc.get_changes_start_token(service, drive_id)
+        schema = db.ensure_fd_schema(conn, drive_id)
+        db.delete_by_file_id(conn, schema, file_id)
     except Exception as e:
-        log.error("getStartPageToken failed: %s", e)
-        db.set_state(conn, drive_id, "error", str(e))
-        return
-
-    schema = db.ensure_fd_schema(conn, drive_id)
-
-    _hb(conn, worker_id, state="listing", phase="listing_files",
-        drive_id=drive_id, drive_name=drive_name)
-    try:
-        files = dc.list_files_in_drive(service, drive_id)
-    except Exception as e:
-        log.error("list_files_in_drive failed: %s", e)
-        db.set_state(conn, drive_id, "error", str(e))
-        return
-    files = dc.attach_folder_paths(files, drive_name=drive_name)
-    total = len(files)
-    log.info("[%s] (w#%s) %d items", drive_id, worker_id, total)
-    _hb(conn, worker_id, state="building", phase="processing_file",
-        total_files=total, files_done=0)
-
-    for i, f in enumerate(files, 1):
-        if _stop_flag:
-            break
-        if not _min_free_bytes_ok():
-            log.error("[%s] disk low, aborting", drive_id)
-            db.set_state(conn, drive_id, "error", "disk low")
-            return
-        _hb(conn, worker_id, files_done=i - 1, current_file=f.get("name", ""))
-        _process_file(conn, schema, drive_id, f, service)
-        if i % 25 == 0:
-            try:
-                db.update_counts(conn, drive_id)
-            except Exception:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-
-    db.set_rotate_token(conn, drive_id, start_token)
-    try:
-        db.update_counts(conn, drive_id)
-    except Exception:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-    db.touch_sync(conn, drive_id, built=True)
-    db.set_state(conn, drive_id, "idle")
-    db.log_event(conn, drive_id=drive_id, level="info", event="build_done",
-                 message=f"items={total}")
-    _hb(conn, worker_id, state="done", phase=None,
-        files_done=total, total_files=total, current_file=None)
-    log.info("[%s] (w#%s) full build done", drive_id, worker_id)
+        log.warning("[%s] (w#%s) delete %s failed: %s", drive_id, wid, file_id, e)
+        try: conn.rollback()
+        except Exception: pass
 
 
-def sync_delta(conn, drive_id: str, service, *, worker_id: Optional[int] = None) -> None:
+def _handle_finalize(conn, wid: int, drive_id: str) -> None:
+    """Commit the build: aggregate counts + advance rotate_token.
+    Idempotent; if cancel was requested, falls back to abort."""
     row = db.get_fd(conn, drive_id)
     if not row:
         return
-    token = row.get("rotate_token")
-    if not token:
-        build_full(conn, drive_id, service, worker_id=worker_id)
-        return
-
-    drive_name = row.get("name", "") or ""
-    schema = db.ensure_fd_schema(conn, drive_id)
-    db.set_state(conn, drive_id, "syncing")
-    _hb(conn, worker_id, state="syncing", phase="fetching_changes",
+    drive_name = (row.get("name") or "")
+    _hb(conn, wid, state="building", phase="finalizing",
         drive_id=drive_id, drive_name=drive_name,
-        current_file=None, files_done=0, total_files=0)
+        current_file=None)
 
     try:
-        changes, new_token = dc.list_changes(service, token, drive_id)
+        if row.get("cancel_requested"):
+            log.info("[%s] (w#%s) finalize: cancel_requested set → abort", drive_id, wid)
+            db.abort_build(conn, drive_id)
+            return
+        db.commit_build(conn, drive_id)
+        log.info("[%s] (w#%s) finalize: committed", drive_id, wid)
     except Exception as e:
-        log.error("[%s] list_changes failed: %s", drive_id, e)
-        db.set_state(conn, drive_id, "error", str(e))
-        return
-
-    # Retry failed_files first
-    failed = db.get_failed_files(conn, drive_id)
-    for entry in list(failed):
-        if _stop_flag:
-            break
-        fid = entry.get("file_id")
-        if not fid:
-            db.clear_failed_file(conn, drive_id, fid or "")
-            continue
-        info = dc.get_file_info(service, fid)
-        if info is None or info.get("trashed"):
-            db.clear_failed_file(conn, drive_id, fid)
-            continue
-        try:
-            chunks = _embed_and_chunks_for_file(info, service)
-            if chunks:
-                db.upsert_file_chunks(conn, schema, fid, chunks)
-            db.clear_failed_file(conn, drive_id, fid)
-        except Exception as e:
-            log.warning("retry %s still failing: %s", fid, e)
-
-    _hb(conn, worker_id, phase="processing_file", total_files=len(changes), files_done=0)
-    n_upd = n_del = n_fail = 0
-    for i, ch in enumerate(changes, 1):
-        if _stop_flag:
-            break
-        fid = ch.get("fileId")
-        f = ch.get("file")
-        if ch.get("removed") or (f and f.get("trashed")):
-            try:
-                db.delete_by_file_id(conn, schema, fid)
-                n_del += 1
-            except Exception as e:
-                log.warning("delete %s failed: %s", fid, e)
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-                n_fail += 1
-            continue
-        if not f:
-            continue
-        f["folder_path"] = f.get("folder_path", drive_name)
-        _hb(conn, worker_id, files_done=i - 1, current_file=f.get("name", ""))
-        try:
-            chunks = _embed_and_chunks_for_file(f, service)
-            if chunks:
-                db.upsert_file_chunks(conn, schema, fid, chunks)
-                n_upd += 1
-        except Exception as e:
-            log.warning("update %s failed: %s", fid, e)
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-            try:
-                db.add_failed_file(conn, drive_id, fid, str(e))
-            except Exception:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-            n_fail += 1
-
-    db.set_rotate_token(conn, drive_id, new_token)
-    try:
-        db.update_counts(conn, drive_id)
-    except Exception:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
-    db.touch_sync(conn, drive_id)
-    db.set_state(conn, drive_id, "idle")
-    db.log_event(conn, drive_id=drive_id, level="info", event="sync_done",
-                 message=f"updated={n_upd} deleted={n_del} failed={n_fail}")
-    _hb(conn, worker_id, state="done", phase=None, current_file=None)
+        log.error("[%s] (w#%s) finalize failed: %s\n%s",
+                  drive_id, wid, e, traceback.format_exc())
+        try: conn.rollback()
+        except Exception: pass
 
 
 # ---------------------------------------------------------------------
-# Worker thread lifecycle
+# Worker thread main loop
 # ---------------------------------------------------------------------
 def _worker_loop(wid: int, personal_stop: threading.Event) -> None:
-    """One worker thread. Gets its own DB connection and its own Drive
-    service (via dc.get_drive_service()'s thread-local cache).
-
-    Fix B: if the DB connection dies mid-operation, we drop the worker
-    entirely (manager will scale back up automatically). Advisory locks are
-    tied to the conn; closing it releases them — no drive gets stuck.
-    """
     conn = None
     try:
         conn = db.connect()
         db.heartbeat_worker(conn, wid, state="idle",
                             drive_id=None, drive_name=None, current_file=None,
                             files_done=0, total_files=0, phase=None, last_error=None)
-        service = dc.get_drive_service()
+        # Prime per-thread Drive service (thread-local).
+        _ = dc.get_drive_service()
         log.info("worker %d started", wid)
 
         while not _global_stop.is_set() and not personal_stop.is_set():
-            # Liveness check before each iteration (Fix B).
             if not _conn_alive(conn):
                 log.warning("worker %d: conn dead, exiting (manager will respawn)", wid)
-                return  # finally block still runs
+                return
 
             try:
-                drive_id = _work_queue.get(timeout=2.0)
+                task = _queue.get(timeout=2.0)
             except queue.Empty:
                 _hb_reset(wid)
                 try:
@@ -424,63 +447,30 @@ def _worker_loop(wid: int, personal_stop: threading.Event) -> None:
                         return
                 continue
 
-            # Try to claim the drive exclusively across all workers + processes.
+            # Decrement pending counter for file tasks (even if skipped later)
+            _mark_consumed(task)
+
+            kind = task[0]
             try:
-                claimed = db.try_claim_drive(conn, drive_id)
+                if kind == "list_full":
+                    _handle_list(conn, wid, task[1], mode="full")
+                elif kind == "list_delta":
+                    _handle_list(conn, wid, task[1], mode="delta")
+                elif kind == "file":
+                    _handle_file(conn, wid, task[1], task[2])
+                elif kind == "file_delete":
+                    _handle_file_delete(conn, wid, task[1], task[2])
+                elif kind == "finalize":
+                    _handle_finalize(conn, wid, task[1])
+                else:
+                    log.warning("unknown task kind: %s", kind)
             except Exception as e:
-                log.warning("worker %d: try_claim_drive failed: %s", wid, e)
+                log.error("worker %d task %s failed: %s\n%s",
+                          wid, kind, e, traceback.format_exc())
                 try: conn.rollback()
                 except Exception: pass
                 if not _conn_alive(conn):
                     return
-                continue
-
-            if not claimed:
-                log.info("worker %d: drive %s already claimed, skipping", wid, drive_id)
-                continue
-
-            got_drive = True
-            try:
-                row = db.get_fd(conn, drive_id)
-                dname = (row or {}).get("name", "") or ""
-                _hb_reset(wid)
-                _hb(conn, wid, state="claiming",
-                    drive_id=drive_id, drive_name=dname,
-                    current_file=None, files_done=0, total_files=0,
-                    phase=None, last_error=None)
-                try:
-                    sync_delta(conn, drive_id, service, worker_id=wid)
-                except Exception as e:
-                    log.error("worker %d failed %s: %s\n%s",
-                              wid, drive_id, e, traceback.format_exc())
-                    # Rollback the poisoned transaction before doing anything
-                    # else on this conn — otherwise set_state / heartbeat /
-                    # release_drive all fail with InFailedSqlTransaction.
-                    try: conn.rollback()
-                    except Exception: pass
-                    if not _conn_alive(conn):
-                        got_drive = False  # lock already released by conn close
-                        return
-                    try:
-                        db.set_state(conn, drive_id, "error", str(e))
-                    except Exception:
-                        try: conn.rollback()
-                        except Exception: pass
-                    try:
-                        db.heartbeat_worker(conn, wid, state="error",
-                                            last_error=str(e)[:500])
-                    except Exception:
-                        try: conn.rollback()
-                        except Exception: pass
-            finally:
-                # Release AFTER rollback so the transaction isn't poisoned.
-                # If conn is dead, skip — PG released the lock on conn close.
-                if got_drive and _conn_alive(conn):
-                    try:
-                        db.release_drive(conn, drive_id)
-                    except Exception:
-                        try: conn.rollback()
-                        except Exception: pass
     finally:
         if conn is not None:
             try:
@@ -489,15 +479,16 @@ def _worker_loop(wid: int, personal_stop: threading.Event) -> None:
                 conn.commit()
             except Exception:
                 pass
-            try:
-                conn.close()
-            except Exception:
-                pass
+            try: conn.close()
+            except Exception: pass
         with _workers_lock:
             _workers.pop(wid, None)
         log.info("worker %d exited", wid)
 
 
+# ---------------------------------------------------------------------
+# Worker pool management
+# ---------------------------------------------------------------------
 def _spawn_worker() -> int:
     global _next_worker_id
     with _workers_lock:
@@ -512,26 +503,20 @@ def _spawn_worker() -> int:
     return wid
 
 
-def _scale_to(target: int) -> tuple[int, int]:
-    """Adjust worker pool to `target`. Returns (spawned, retired)."""
+def _scale_to(target: int) -> None:
     target = max(MIN_WORKERS, min(MAX_WORKERS, int(target)))
     with _workers_lock:
         live_ids = list(_workers.keys())
-    spawned = retired = 0
     current = len(live_ids)
     if target > current:
         for _ in range(target - current):
             _spawn_worker()
-            spawned += 1
     elif target < current:
-        # Retire highest-numbered workers first.
         for wid in sorted(live_ids, reverse=True)[:current - target]:
             with _workers_lock:
                 w = _workers.get(wid)
             if w:
                 w["stop"].set()
-                retired += 1
-    return spawned, retired
 
 
 def _live_worker_count() -> int:
@@ -540,28 +525,81 @@ def _live_worker_count() -> int:
 
 
 # ---------------------------------------------------------------------
-# Manager main loop
+# Manager loop
 # ---------------------------------------------------------------------
-def _enqueue_pending_work(conn) -> int:
-    """Put each enabled FD that is not currently being worked on into the queue.
-
-    Already-queued duplicates are harmless — the worker's advisory lock will
-    cause the duplicate pickup to skip.
-    """
+def _drain_queue_for_drive(drive_id: str) -> int:
+    """Remove all queued file/file_delete tasks for a specific drive.
+    Uses a temp list since queue.Queue doesn't support filtered pop."""
+    drained = 0
+    keep: list = []
     try:
-        active = db.active_drive_ids(conn)
-    except Exception:
-        active = set()
-    fds = db.list_fds(conn)
-    n = 0
-    for r in fds:
-        if not r.get("enabled"):
+        while True:
+            task = _queue.get_nowait()
+            if task[0] in ("file", "file_delete") and task[1] == drive_id:
+                drained += 1
+                _mark_consumed(task)
+            else:
+                keep.append(task)
+    except queue.Empty:
+        pass
+    for t in keep:
+        _queue.put(t)
+    return drained
+
+
+def _manager_iter(manager_conn) -> None:
+    """Single iteration of the manager loop."""
+    fds = db.list_fds(manager_conn)
+
+    # Respect cancel: set flag, drain queue entries for cancelled drives
+    for row in fds:
+        if not row.get("enabled") and row.get("state") == "building":
+            drive_id = row["drive_id"]
+            if not row.get("cancel_requested"):
+                db.request_cancel(manager_conn, drive_id)
+                log.info("[%s] cancel requested (disabled mid-build)", drive_id)
+            drained = _drain_queue_for_drive(drive_id)
+            if drained:
+                log.info("[%s] drained %d queued tasks", drive_id, drained)
+
+    # Re-read after cancel writes
+    fds = db.list_fds(manager_conn)
+
+    # Enqueue new work for enabled+idle drives
+    for row in fds:
+        if not row.get("enabled"):
             continue
-        if r["drive_id"] in active:
+        drive_id = row["drive_id"]
+        state = row.get("state")
+
+        # Skip if already building or if queue has pending work for it
+        if state == "building":
             continue
-        _work_queue.put(r["drive_id"])
-        n += 1
-    return n
+        if _pending_for_drive(drive_id) > 0:
+            continue
+        if db.inflight_workers_on_drive(manager_conn, drive_id) > 0:
+            continue
+
+        # Decide full vs delta
+        if row.get("rotate_token"):
+            _enqueue(("list_delta", drive_id))
+        else:
+            _enqueue(("list_full", drive_id))
+
+    # Completion detection: for drives in state='building' with no pending
+    # work and no inflight workers, enqueue finalize.
+    for row in fds:
+        if row.get("state") != "building":
+            continue
+        drive_id = row["drive_id"]
+        if _pending_for_drive(drive_id) > 0:
+            continue
+        if db.inflight_workers_on_drive(manager_conn, drive_id) > 0:
+            continue
+        # total_files_listed tells us if list_task ran; without it we can't
+        # say "done". But cancel + abort already cleared state, so here
+        # we're safely saying "everything consumed, time to commit".
+        _enqueue(("finalize", drive_id))
 
 
 def main() -> int:
@@ -579,43 +617,32 @@ def main() -> int:
         return 2
 
     try:
-        log.info("rag_daemon starting pid=%s", os.getpid())
+        log.info("rag_daemon starting pid=%s (v0.4 task-queue)", os.getpid())
         db.ensure_database()
         manager_conn = db.connect()
         db.apply_global_schema(manager_conn)
-        db.clear_workers(manager_conn)  # wipe stale rows from last run
+        db.clear_workers(manager_conn)
 
-        # Seed target worker count if not set.
-        if db.get_config(manager_conn, "worker_count") is None:
-            db.set_config(manager_conn, "worker_count", str(config.DAEMON_WORKER_THREADS))
+        # Authenticate once; workers use thread-local services backed by these creds.
+        _ = dc.authenticate()
 
-        # Authenticate once (this refreshes creds, seeds dc._credentials).
-        main_service = dc.authenticate()
-        _register_discovered_drives(manager_conn, main_service)
+        _scale_to(config.DAEMON_WORKER_THREADS)
+        log.info("initial worker pool: %d", _live_worker_count())
 
-        # Initial scale.
-        try:
-            initial = int(db.get_config(manager_conn, "worker_count",
-                                        str(config.DAEMON_WORKER_THREADS)))
-        except (TypeError, ValueError):
-            initial = config.DAEMON_WORKER_THREADS
-        _scale_to(initial)
-        log.info("initial worker pool size: %d", _live_worker_count())
-
-        last_enqueue = 0.0
+        last_iter = 0.0
         last_cleanup = 0.0
         last_events_gc = 0.0
         last_liveness = 0.0
+
         while not _stop_flag:
-            # Reconnect manager_conn if dead (Fix A). Probe every 10s to avoid
-            # wasting round-trips.
             now = time.time()
+
+            # Reconnect manager_conn if dead
             if now - last_liveness >= 10:
                 if not _conn_alive(manager_conn):
                     log.warning("manager_conn dead; reconnecting...")
                     manager_conn = _replace_conn(manager_conn, label="manager")
                     if manager_conn is None:
-                        # Back off and retry in the next loop tick
                         for _ in range(5):
                             if _stop_flag:
                                 break
@@ -623,15 +650,23 @@ def main() -> int:
                         continue
                 last_liveness = now
 
-            # Worker count is fixed at startup from config.DAEMON_WORKER_THREADS.
-            # The dynamic scale UI was removed; manager just keeps the pool at
-            # the initial size. If workers died (crashed, conn gone), respawn.
+            # Maintain pool size
             target = max(MIN_WORKERS, min(MAX_WORKERS, config.DAEMON_WORKER_THREADS))
-            current = _live_worker_count()
-            if current < target:
+            if _live_worker_count() < target:
                 _scale_to(target)
 
-            # Zombie cleanup (stale workers, stuck drives). Every 30s.
+            # Manager iteration (enqueue + cancel + finalize detection) — every 5s
+            if now - last_iter >= 5:
+                try:
+                    _manager_iter(manager_conn)
+                    last_iter = now
+                except Exception as e:
+                    log.error("manager iter failed: %s", e)
+                    try: manager_conn.rollback()
+                    except Exception: pass
+                    manager_conn = _replace_conn(manager_conn, label="manager")
+
+            # Zombie cleanup — every 30s
             if now - last_cleanup >= 30:
                 try:
                     gc = db.cleanup_zombies(manager_conn, stale_after_sec=300)
@@ -647,8 +682,7 @@ def main() -> int:
                     try: manager_conn.rollback()
                     except Exception: pass
 
-            # Fix E: daemon_events 30d TTL. Hourly GC so the table doesn't
-            # grow unbounded (tens of thousands of rows/day on busy builds).
+            # daemon_events TTL — every hour
             if now - last_events_gc >= 3600:
                 try:
                     with manager_conn.cursor() as cur:
@@ -659,33 +693,20 @@ def main() -> int:
                         gone = cur.rowcount
                     manager_conn.commit()
                     if gone:
-                        log.info("daemon_events TTL: deleted %d rows (>30d)", gone)
+                        log.info("daemon_events TTL: deleted %d rows", gone)
                     last_events_gc = now
                 except Exception as e:
                     log.warning("daemon_events TTL GC failed: %s", e)
                     try: manager_conn.rollback()
                     except Exception: pass
 
-            if now - last_enqueue >= config.DAEMON_ROTATE_INTERVAL_SEC:
-                try:
-                    n = _enqueue_pending_work(manager_conn)
-                    if n:
-                        log.info("manager: enqueued %d FD(s)", n)
-                    last_enqueue = now
-                except Exception as e:
-                    log.error("enqueue failed: %s", e)
-                    try:
-                        manager_conn.rollback()
-                    except Exception:
-                        pass
-
-            # Short sleep so signals & scale changes are responsive.
-            for _ in range(3):
+            # Sleep in short slices so signals / scale changes are responsive
+            for _ in range(2):
                 if _stop_flag:
                     break
                 time.sleep(1)
 
-        # Shutdown: signal all workers, wait up to 30s.
+        # Graceful shutdown
         log.info("shutting down; signalling %d workers", _live_worker_count())
         _global_stop.set()
         with _workers_lock:
@@ -695,10 +716,8 @@ def main() -> int:
         while time.time() < deadline and _live_worker_count() > 0:
             time.sleep(0.5)
 
-        try:
-            db.clear_workers(manager_conn)
-        except Exception:
-            pass
+        try: db.clear_workers(manager_conn)
+        except Exception: pass
         manager_conn.close()
     finally:
         lock.release()

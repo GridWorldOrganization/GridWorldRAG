@@ -45,8 +45,11 @@ app.on("window-all-closed", () => {
 });
 
 // IPC: open full web UI in default browser.
+// Cache-buster so Chrome doesn't serve a stale index.html/app.js from a
+// previous version of WinServerRAG.
 ipcMain.on("open-web-ui", () => {
-  shell.openExternal(API_URL + "/");
+  const cb = Date.now().toString(36);
+  shell.openExternal(`${API_URL}/?v=${cb}`);
 });
 
 // IPC: give the renderer the API URL so it can fetch /api/stats, /api/workers.

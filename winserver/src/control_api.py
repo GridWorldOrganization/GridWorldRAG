@@ -29,12 +29,15 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request, Depends
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 
 from src import config, db
 from src import drive_client as dc
 from src.logging_setup import setup_logger
-from src.rag_daemon import build_full, sync_delta
+# v0.4: the daemon owns build/sync via the shared task queue. The API no
+# longer spawns workers; it just flips flags and the daemon picks them up
+# on the next manager iteration (≤ 5 s latency).
 
 log = setup_logger("control_api")
 
@@ -43,8 +46,6 @@ log = setup_logger("control_api")
 # ---------------------------------------------------------------------
 _service = None
 _service_lock = threading.Lock()
-_workers_lock = threading.Lock()
-_workers: dict[str, threading.Thread] = {}
 
 # In-memory event broadcaster (tail-style); pulls from DB daemon_events table
 _subscribers: set[asyncio.Queue] = set()
@@ -63,27 +64,8 @@ def _get_service():
     return _service
 
 
-def _run_worker(target, drive_id: str) -> None:
-    def _runner():
-        try:
-            conn = db.connect()
-            try:
-                target(conn, drive_id, _get_service())
-            finally:
-                conn.close()
-        except Exception as e:
-            log.error("worker %s failed: %s", target.__name__, e)
-        finally:
-            with _workers_lock:
-                _workers.pop(drive_id, None)
-
-    with _workers_lock:
-        existing = _workers.get(drive_id)
-        if existing and existing.is_alive():
-            raise HTTPException(status_code=409, detail=f"operation already running for {drive_id}")
-        t = threading.Thread(target=_runner, name=f"worker-{drive_id}", daemon=True)
-        _workers[drive_id] = t
-        t.start()
+# (v0.4: API no longer spawns worker threads. Daemon owns all build/sync
+# work via its shared task queue. The API just flips flags in fd_registry.)
 
 
 # ---------------------------------------------------------------------
@@ -155,7 +137,23 @@ async def _lifespan(_app):
         yield
 
 
-app = FastAPI(title="WinServerRAG Control API", version="0.2.0", lifespan=_lifespan)
+app = FastAPI(title="WinServerRAG Control API", version="0.3.0", lifespan=_lifespan)
+
+
+class _NoCacheStaticMiddleware(BaseHTTPMiddleware):
+    """Prevent Chrome from serving a stale index.html / app.js / style.css
+    after a WinServerRAG update. /static/* and / get no-cache; /api/* and
+    other endpoints are untouched."""
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        path = request.url.path
+        if path == "/" or path.startswith("/static"):
+            response.headers["Cache-Control"] = "no-cache, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+        return response
+
+
+app.add_middleware(_NoCacheStaticMiddleware)
 
 _web_root = config.PROJECT_ROOT / "web"
 if _web_root.exists():
@@ -218,12 +216,15 @@ def api_list_fds():
     conn = db.connect()
     try:
         rows = db.list_fds(conn)
+        # "running" = daemon has an active worker on this drive
+        try:
+            active = db.active_drive_ids(conn)
+        except Exception:
+            active = set()
     finally:
         conn.close()
-    with _workers_lock:
-        running_ids = {k for k, t in _workers.items() if t.is_alive()}
     return [
-        FDView(**{**r, "running": r["drive_id"] in running_ids}).model_dump()
+        FDView(**{**r, "running": r["drive_id"] in active}).model_dump()
         for r in rows
     ]
 
@@ -282,31 +283,34 @@ def api_search_disable(drive_id: str):
 
 @app.post("/api/fds/{drive_id}/sync-now", dependencies=[Depends(require_token)])
 def api_sync_now(drive_id: str):
+    """Forces the daemon to pick this drive up on next manager iteration by
+    clearing its state markers. (No worker spawn from API in v0.4.)"""
     conn = db.connect()
     try:
         row = db.get_fd(conn, drive_id)
         if not row:
             raise HTTPException(status_code=404, detail="unknown drive_id")
+        # Mark idle so manager will enqueue list_delta (or list_full if no token)
+        db.abort_build(conn, drive_id)
     finally:
         conn.close()
-    _run_worker(sync_delta, drive_id)
     return {"ok": True, "drive_id": drive_id, "started": "sync-now"}
 
 
 @app.post("/api/fds/{drive_id}/rebuild", dependencies=[Depends(require_token)])
 def api_rebuild(drive_id: str):
-    # full rebuild: reset rotate_token and counts, then run build_full
+    """Drop data + clear rotate_token. Daemon will enqueue a fresh list_full
+    on its next manager iteration."""
     conn = db.connect()
     try:
         row = db.get_fd(conn, drive_id)
         if not row:
             raise HTTPException(status_code=404, detail="unknown drive_id")
-        # drop schema so we rebuild fresh
         db.drop_fd_schema(conn, drive_id)
         db.set_rotate_token(conn, drive_id, None)
+        db.abort_build(conn, drive_id)
     finally:
         conn.close()
-    _run_worker(build_full, drive_id)
     return {"ok": True, "drive_id": drive_id, "started": "rebuild"}
 
 

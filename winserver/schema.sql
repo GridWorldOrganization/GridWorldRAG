@@ -30,6 +30,18 @@ CREATE TABLE IF NOT EXISTS public.fd_registry (
 -- Migration: add column if table already existed without it
 ALTER TABLE public.fd_registry ADD COLUMN IF NOT EXISTS search_enabled BOOLEAN NOT NULL DEFAULT FALSE;
 
+-- v0.4 experiment mode: file-parallel build + immediate cancellation.
+-- pending_rotate_token  : Changes API start token, captured at list-task time.
+--                         Commits into rotate_token at finalize. Survives
+--                         worker death — next sweep can recover.
+-- total_files_listed    : N files produced by the list task; compared to
+--                         queue-drain + inflight-zero for completion detection.
+-- cancel_requested      : Manager sets TRUE when enabled→FALSE. Workers check
+--                         before each file processing and short-circuit.
+ALTER TABLE public.fd_registry ADD COLUMN IF NOT EXISTS pending_rotate_token TEXT;
+ALTER TABLE public.fd_registry ADD COLUMN IF NOT EXISTS total_files_listed   INTEGER;
+ALTER TABLE public.fd_registry ADD COLUMN IF NOT EXISTS cancel_requested     BOOLEAN NOT NULL DEFAULT FALSE;
+
 CREATE INDEX IF NOT EXISTS idx_fd_registry_enabled ON public.fd_registry (enabled);
 CREATE INDEX IF NOT EXISTS idx_fd_registry_search_enabled ON public.fd_registry (search_enabled);
 

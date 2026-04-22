@@ -34,6 +34,12 @@ _sheets_service_cache = None
 import threading as _threading
 _thread_local = _threading.local()
 
+# Sheets API per-minute quota is 60 read requests/minute per user. With
+# 4 workers all hitting spreadsheets in parallel we saturate the quota in
+# seconds. A semaphore of 2 lets two workers pull sheets concurrently,
+# the rest wait. Far safer than rolling the dice on 429 retries.
+_sheets_semaphore = _threading.Semaphore(2)
+
 
 def set_rate_limit_callback(cb):
     global _rate_limit_callback
@@ -385,40 +391,43 @@ def _try_ocr_image(content, filename):
 
 
 def extract_spreadsheet_sheets(file_id: str):
-    service = get_sheets_service()
-    try:
-        spreadsheet = _api_call_with_retry(
-            lambda: service.spreadsheets().get(spreadsheetId=file_id, includeGridData=False).execute()
-        )
-    except Exception:
-        return []
-    sheets = spreadsheet.get("sheets", [])
-    results = []
-    for sheet in sheets:
+    # Guard Sheets API usage with a process-wide semaphore so a pool of
+    # workers can't collectively blow the 60 req/min quota.
+    with _sheets_semaphore:
+        service = get_sheets_service()
         try:
-            props = sheet["properties"]
-            gid = str(props["sheetId"])
-            name = props["title"]
-        except (KeyError, TypeError):
-            continue
-        try:
-            sheet_range = f"'{name}'"
-            resp = _api_call_with_retry(
-                lambda sr=sheet_range: service.spreadsheets().values().get(
-                    spreadsheetId=file_id, range=sr).execute(),
-                max_retries=API_SHEET_MAX_RETRIES,
+            spreadsheet = _api_call_with_retry(
+                lambda: service.spreadsheets().get(spreadsheetId=file_id, includeGridData=False).execute()
             )
-            values = resp.get("values", [])
-            if not values:
-                results.append({"gid": gid, "name": name, "content": None, "failed": False})
-                continue
-            text = "\n".join("\t".join(str(c) for c in row) for row in values)
-            results.append({
-                "gid": gid, "name": name,
-                "content": text if text.strip() else None, "failed": False})
         except Exception:
-            results.append({"gid": gid, "name": name, "content": None, "failed": True})
-    return results
+            return []
+        sheets = spreadsheet.get("sheets", [])
+        results = []
+        for sheet in sheets:
+            try:
+                props = sheet["properties"]
+                gid = str(props["sheetId"])
+                name = props["title"]
+            except (KeyError, TypeError):
+                continue
+            try:
+                sheet_range = f"'{name}'"
+                resp = _api_call_with_retry(
+                    lambda sr=sheet_range: service.spreadsheets().values().get(
+                        spreadsheetId=file_id, range=sr).execute(),
+                    max_retries=API_SHEET_MAX_RETRIES,
+                )
+                values = resp.get("values", [])
+                if not values:
+                    results.append({"gid": gid, "name": name, "content": None, "failed": False})
+                    continue
+                text = "\n".join("\t".join(str(c) for c in row) for row in values)
+                results.append({
+                    "gid": gid, "name": name,
+                    "content": text if text.strip() else None, "failed": False})
+            except Exception:
+                results.append({"gid": gid, "name": name, "content": None, "failed": True})
+        return results
 
 
 # ---------------------------------------------------------------------
