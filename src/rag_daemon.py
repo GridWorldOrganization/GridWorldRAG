@@ -344,8 +344,12 @@ def _handle_file(conn, wid: int, drive_id: str, file_info: dict) -> None:
 
     row = db.get_fd(conn, drive_id)
     drive_name = (row or {}).get("name", "") or ""
+    drive_total = int((row or {}).get("total_files_listed") or 0)
+    # total_files tracks the drive-wide enumerated count so every worker (not
+    # just the one that ran list_full) shows a populated progress bar.
     _hb(conn, wid, state="building", drive_id=drive_id, drive_name=drive_name,
-        phase="processing_file", current_file=file_info.get("name", ""))
+        phase="processing_file", current_file=file_info.get("name", ""),
+        total_files=drive_total)
 
     if not _min_free_bytes_ok():
         log.error("[%s] (w#%s) disk low, marking error", drive_id, wid)
@@ -359,6 +363,11 @@ def _handle_file(conn, wid: int, drive_id: str, file_info: dict) -> None:
         chunks = _embed_and_chunks_for_file(file_info, service)
         if chunks:
             db.upsert_file_chunks(conn, schema, file_info["id"], chunks)
+        # Count only this worker's successful files — shared progress would
+        # need a per-drive counter, out of scope for a point fix.
+        with _worker_ctx_lock:
+            prev_done = int(_worker_ctx.get(wid, {}).get("files_done", 0) or 0)
+        _hb(conn, wid, files_done=prev_done + 1)
     except Exception as e:
         log.warning("[%s] (w#%s) file %s failed: %s",
                     drive_id, wid, file_info.get("id"), e)

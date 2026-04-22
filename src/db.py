@@ -227,6 +227,7 @@ def list_fds(conn: psycopg.Connection) -> list[dict]:
             SELECT drive_id, name, enabled, search_enabled, state,
                    last_sync_at, last_build_at,
                    file_count, chunk_count,
+                   rotate_token, pending_rotate_token, total_files_listed,
                    last_error, created_at, updated_at
             FROM public.fd_registry
             ORDER BY name
