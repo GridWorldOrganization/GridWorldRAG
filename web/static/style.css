@@ -198,6 +198,68 @@ td.empty { text-align: center; color: var(--muted); padding: 30px 0; }
 .worker-card.syncing   { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
 .worker-card.error     { border-color: #4d2127; }
 .worker-card.done      { border-color: #1f4a36; }
+
+/* GPU active: red light chasing around the card border.
+   Applied only when an active worker is running and the device reports
+   non-zero CUDA utilization. On CPU runs or when GPU is idle, the card
+   falls back to the blue/green borders above. */
+.worker-card.gpu-active {
+  position: relative;
+  /* transparent to let the animated gradient below show through */
+  border-color: transparent !important;
+  box-shadow: none !important;
+  background: #11151e;
+  background-clip: padding-box;
+}
+.worker-card.gpu-active::before {
+  content: "";
+  position: absolute;
+  inset: -2px;
+  border-radius: 8px;
+  padding: 2px;
+  background:
+    conic-gradient(
+      from var(--gpu-angle, 0deg),
+      rgba(255, 64, 64, 0)   0deg,
+      rgba(255, 64, 64, 0)   240deg,
+      #ff4040                300deg,
+      #ffb0b0                345deg,
+      #ff4040                360deg
+    );
+  /* carve out the inside so only the border-ring shows */
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+          mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+          mask-composite: exclude;
+  animation: gpu-chase 0.9s linear infinite;
+  pointer-events: none;
+  z-index: 1;
+}
+@property --gpu-angle {
+  syntax: "<angle>";
+  inherits: false;
+  initial-value: 0deg;
+}
+@keyframes gpu-chase {
+  to { --gpu-angle: 360deg; }
+}
+/* Fallback for browsers without @property support: still rotate, but
+   via transform on the pseudo-element. */
+@supports not (background: conic-gradient(from 0deg, red, red)) {
+  .worker-card.gpu-active::before {
+    background:
+      linear-gradient(90deg, rgba(255,64,64,0) 0%, #ff4040 50%, rgba(255,64,64,0) 100%);
+    animation: gpu-chase-fallback 0.9s linear infinite;
+  }
+  @keyframes gpu-chase-fallback {
+    0%   { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+  }
+}
 .worker-header {
   display: flex; justify-content: space-between; align-items: center;
   margin-bottom: 2px;

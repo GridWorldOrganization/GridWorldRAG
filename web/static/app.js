@@ -101,6 +101,10 @@ function setupTabs() {
 
 // ---------------- stats ----------------
 let _lastPgOk = true;    // module-scoped so updateGlobalIndicator() can read
+// Shared device snapshot — populated by refreshStats, read by renderWorkers
+// so active worker cards can show the "GPU is busy" red chase effect.
+let _deviceSnapshot = { kind: "cpu", util_pct: null };
+const GPU_ACTIVE_UTIL_THRESHOLD = 5;  // percent — below this counts as idle
 
 const refreshStats = withInflight(async function _refreshStatsImpl() {
   try {
@@ -123,6 +127,9 @@ const refreshStats = withInflight(async function _refreshStatsImpl() {
     set("#stat-dbsize", `DB: ${fmtBytes(s.db_size_bytes)}`);
 
     // Device badge: 🎮 GPU (name · util% · VRAM used/total) or 💻 CPU
+    _deviceSnapshot = s.device || { kind: "cpu", util_pct: null };
+    // Nudge the worker render if GPU-active state may have flipped.
+    refreshWorkers().catch(() => {});
     const dev = $("#stat-device");
     if (dev) {
       const d = s.device || { kind: "cpu" };
@@ -168,6 +175,11 @@ let _lastWorkersHash = null;
 function workersRenderHash(data) {
   const rel = {
     target: data.target, live: data.live,
+    // Bucket the GPU-active flag into the hash so crossing the util
+    // threshold (idle -> busy or busy -> idle) forces a repaint and
+    // the red chase effect turns on/off without waiting for any
+    // worker field to change.
+    gpu_active: isGpuActive(),
     workers: (data.workers || []).map((w) => ({
       worker_id:    w.worker_id,
       state:        w.state,
@@ -239,6 +251,16 @@ function updateGlobalIndicator(workersPayload) {
   else if (_lastPgOk)         el.classList.add("ok");
 }
 
+// Worker is "active" when it's actually doing drive work. Idle / error /
+// done states don't count.
+const ACTIVE_WORKER_STATES = new Set(["building", "syncing", "listing", "claiming"]);
+
+function isGpuActive() {
+  return _deviceSnapshot
+      && _deviceSnapshot.kind === "cuda"
+      && (Number(_deviceSnapshot.util_pct) || 0) >= GPU_ACTIVE_UTIL_THRESHOLD;
+}
+
 function renderWorkerCard(slotNum, w) {
   if (!w) {
     return `
@@ -256,8 +278,12 @@ function renderWorkerCard(slotNum, w) {
     ? `<div class="progress"><div class="progress-fill" style="width:${pct}%"></div></div>
        <div class="progress-text">${done}/${total} files (${pct}%)</div>`
     : "";
+  // Red chasing GPU indicator: only when the worker is doing active drive
+  // work AND the device reports non-trivial CUDA utilization. Without a
+  // real GPU spike the card keeps its normal blue/green border.
+  const gpuCls = ACTIVE_WORKER_STATES.has(state) && isGpuActive() ? " gpu-active" : "";
   return `
-    <div class="worker-card ${state}">
+    <div class="worker-card ${state}${gpuCls}">
       <div class="worker-header">
         <span class="worker-id">#${w.worker_id}</span>
         <span class="wstate ${state}">${state}</span>
