@@ -138,7 +138,7 @@ async def _lifespan(_app):
         yield
 
 
-app = FastAPI(title="WinServerRAG Control API", version="0.3.0", lifespan=_lifespan)
+app = FastAPI(title="WinServerRAG Control API", version="0.6.0", lifespan=_lifespan)
 
 
 class _NoCacheStaticMiddleware(BaseHTTPMiddleware):
