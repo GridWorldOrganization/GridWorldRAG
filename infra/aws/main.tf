@@ -28,6 +28,9 @@ resource "aws_sqs_queue" "requests" {
   visibility_timeout_seconds = 60
   message_retention_seconds = 600
   receive_wait_time_seconds = 20  # long polling
+  # Enable AWS-managed SSE so messages (MCP request bodies) are encrypted
+  # at rest even for the 10-minute retention window. Trivy AWS-0096 HIGH.
+  sqs_managed_sse_enabled   = true
 }
 
 # ---------------------------------------------------------------
