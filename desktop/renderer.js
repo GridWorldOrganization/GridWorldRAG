@@ -27,6 +27,7 @@ async function fetchJSON(path, timeoutMs = 1500) {
 let consecutiveFails = 0;
 let lastFilesDoneSum = 0;
 let _inflight = false;  // prevent overlapping fetches if a tick takes longer than 250ms
+let _lastWdetailHash = null;  // gate #wdetail innerHTML writes so we don't flicker
 
 // A worker row is considered stale (its owning daemon died / crashed) if
 // its heartbeat hasn't advanced within this window. Normal sources of gap:
@@ -97,12 +98,22 @@ async function tick() {
     else if (s.pg_ok)                setIndicator("ok");
     else                             setIndicator("idle");
 
-    // --- top aggregate progress (sum across active workers)
-    let done = 0, total = 0;
+    // --- top aggregate progress (sum PER DRIVE, not per worker).
+    // 4 workers on one drive all report total_files = the drive's total, so
+    // naive sum over workers triple/quadruple-counts total. Group by drive:
+    // done = sum of workers' files_done; total = that drive's total (any
+    // worker on the drive reports it).
+    const perDrive = new Map();
     for (const x of activeWorkers) {
-      done  += x.files_done  || 0;
-      total += x.total_files || 0;
+      const did = x.drive_id || "(none)";
+      const e = perDrive.get(did) || { done: 0, total: 0 };
+      e.done += x.files_done || 0;
+      if ((x.total_files || 0) > e.total) e.total = x.total_files || 0;
+      perDrive.set(did, e);
     }
+    let done = 0, total = 0;
+    for (const e of perDrive.values()) { done += e.done; total += e.total; }
+
     const agg = $("progress-agg");
     const fill = $("progress-fill");
     const label = $("progress-text");
@@ -120,6 +131,24 @@ async function tick() {
     // even when the percentage bar moves slowly.
     if (done > lastFilesDoneSum) flashTick();
     lastFilesDoneSum = done;
+
+    // --- global progress: cumulative indexed vs estimated total across all
+    // ENABLED drives. Lets the user see "I've built 274 of ~28,143 files
+    // total" regardless of which drive is currently active.
+    const gFill = $("progress-global-fill");
+    const gText = $("progress-global-text");
+    const gDone = Number(s.total_files) || 0;
+    const gTotal = Number(s.enabled_files_estimate) || 0;
+    if (gFill && gText) {
+      if (gTotal > 0) {
+        const gPct = Math.min(100, (gDone / gTotal) * 100);
+        gFill.style.width = gPct.toFixed(1) + "%";
+        gText.textContent = `${gDone.toLocaleString()} / ~${gTotal.toLocaleString()} (${gPct.toFixed(1)}%)`;
+      } else {
+        gFill.style.width = "0";
+        gText.textContent = gDone ? `${gDone.toLocaleString()} / (推定取得中)` : "—";
+      }
+    }
 
     // --- rows
     const pgVal = s.pg_ok ? "PG" : "PG ×";
@@ -170,7 +199,14 @@ async function tick() {
       const tip = escHtmlAttr(tipLines.join("\n"));
       parts.push(`<span class="w ${cls}" title="${tip}">#${x.worker_id} ${label}</span>`);
     }
-    $("wdetail").innerHTML = parts.join("");
+    // Only rewrite #wdetail when the rendered HTML actually changed. Without
+    // this, a 250ms poll interval writes innerHTML 4x/sec and the layout
+    // briefly "blinks" each time the browser reparses + repaints the row.
+    const wHtml = parts.join("");
+    if (wHtml !== _lastWdetailHash) {
+      _lastWdetailHash = wHtml;
+      $("wdetail").innerHTML = wHtml;
+    }
   } catch (_) {
     consecutiveFails++;
     if (consecutiveFails >= 2) showErr();
@@ -186,9 +222,14 @@ function showErr() {
   connsEl.className = "v err";
   $("wsummary").textContent = "-";
   $("wdetail").innerHTML = "";
+  _lastWdetailHash = "";
   $("progress-agg").classList.remove("active");
   $("progress-fill").style.width = "0";
   $("progress-text").textContent = "—";
+  const gFill = $("progress-global-fill");
+  if (gFill) gFill.style.width = "0";
+  const gText = $("progress-global-text");
+  if (gText) gText.textContent = "—";
 }
 
 window.addEventListener("DOMContentLoaded", async () => {

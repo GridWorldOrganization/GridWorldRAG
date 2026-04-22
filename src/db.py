@@ -1079,7 +1079,10 @@ def global_stats(conn: psycopg.Connection) -> dict:
             SELECT COUNT(*)::int AS total_fds,
                    COUNT(*) FILTER (WHERE enabled)::int AS enabled_fds,
                    COALESCE(SUM(file_count),0)::int AS total_files,
-                   COALESCE(SUM(chunk_count),0)::int AS total_chunks
+                   COALESCE(SUM(chunk_count),0)::int AS total_chunks,
+                   COALESCE(SUM(file_count_estimate),0)::int AS total_files_estimate,
+                   COALESCE(SUM(file_count_estimate)
+                              FILTER (WHERE enabled),0)::int AS enabled_files_estimate
             FROM public.fd_registry
             """
         )

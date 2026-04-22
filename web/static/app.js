@@ -158,6 +158,29 @@ function isWorkerStale(w, now) {
 
 let _lastWorkersHash = null;
 
+// Hash only fields that actually appear in the rendered card. heartbeat_at
+// changes every poll (the daemon touches it on every loop), so if we include
+// it the hash differs every time and we wipe+repaint innerHTML 4x/sec —
+// visible as the worker rows briefly going blank. started_at is similar
+// after a restart. Exclude both.
+function workersRenderHash(data) {
+  const rel = {
+    target: data.target, live: data.live,
+    workers: (data.workers || []).map((w) => ({
+      worker_id:    w.worker_id,
+      state:        w.state,
+      phase:        w.phase,
+      current_file: w.current_file,
+      files_done:   w.files_done,
+      total_files:  w.total_files,
+      drive_id:     w.drive_id,
+      drive_name:   w.drive_name,
+      last_error:   w.last_error ? String(w.last_error).slice(0, 200) : null,
+    })),
+  };
+  return hashOf(rel);
+}
+
 const refreshWorkers = withInflight(async function _refreshWorkersImpl() {
   let data;
   try {
@@ -175,8 +198,9 @@ const refreshWorkers = withInflight(async function _refreshWorkersImpl() {
   }
   const setTarget = $("#scale-target"); if (setTarget) setTarget.textContent = data.target;
   const setLive   = $("#scale-live");   if (setLive)   setLive.textContent   = data.live;
-  // Skip re-render when nothing changed (preserves text selection / focus).
-  const h = hashOf(data);
+  // Skip re-render when nothing visible changed (preserves text selection /
+  // focus and eliminates the "workers blink away and back" flicker).
+  const h = workersRenderHash(data);
   if (h !== _lastWorkersHash) {
     _lastWorkersHash = h;
     renderWorkers(data);

@@ -476,6 +476,7 @@ def api_mcp_query_log(limit: int = 50):
 # --- for even SELECT 1, so we must never block request handlers on it.
 _stats_cache: dict = {
     "total_fds": 0, "enabled_fds": 0, "total_files": 0, "total_chunks": 0,
+    "total_files_estimate": 0, "enabled_files_estimate": 0,
     "db_size_bytes": None, "pg_ok": False, "drive_ok": True,
     "last_updated": None,
     # Device info (GPU vs CPU). Static fields are probed once at startup;
