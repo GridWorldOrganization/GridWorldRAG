@@ -1,4 +1,22 @@
-# Windows サービス化 (NSSM)
+# Windows サービス化 + 定期バックアップ
+
+## バックアップ (Task Scheduler)
+
+`scripts/backup.bat` を毎日 深夜 03:00 に実行するよう登録:
+
+```powershell
+schtasks /Create /TN "WinServerRAG Backup" /SC DAILY /ST 03:00 ^
+  /TR "C:\claude_code\dev\WinServerRAG\scripts\backup.bat" ^
+  /F
+```
+
+- 保持: 日次 7 世代、週次 (日曜) 4 世代
+- 保存先: `backups/daily/*.dump` と `backups/weekly/*.dump`
+- 復元: `pg_restore -U postgres -d winserverrag --clean --if-exists <file>.dump`
+- OneDrive や外部ディスクにミラーしたい場合は `WINSRV_BACKUP_DIR` 環境変数で保存先を上書き
+
+## Windows サービス化 (NSSM)
+
 
 開発中は `run_api.bat` / `run_daemon.bat` を別々のコンソールで手動実行する。
 運用時は NSSM (Non-Sucking Service Manager) で常駐サービス化する。

@@ -8,16 +8,27 @@
 </head>
 <body>
   <header>
-    <h1>WinServerRAG Monitor</h1>
+    <h1>
+      <span id="global-indicator" class="global-indicator"><span class="core"></span></span>
+      WinServerRAG Monitor
+    </h1>
     <div class="stats-bar">
-      <span id="stat-pg" class="badge">PG ?</span>
-      <span id="stat-drive" class="badge">Drive ?</span>
-      <span id="stat-fds">FDs: -/-</span>
-      <span id="stat-files">Files: -</span>
-      <span id="stat-chunks">Chunks: -</span>
-      <span id="stat-dbsize">DB: -</span>
-      <button id="btn-refresh">更新</button>
-      <button id="btn-discover">共有ドライブを取得</button>
+      <div class="stats-left">
+        <span id="stat-pg" class="badge">PG ?</span>
+        <span id="stat-drive" class="badge">Drive ?</span>
+        <span id="stat-fds">FDs: -/-</span>
+        <span id="stat-files">Files: -</span>
+        <span id="stat-chunks">Chunks: -</span>
+        <span id="stat-dbsize">DB: -</span>
+      </div>
+      <div class="refresh-controls">
+        <button id="btn-discover" title="Google から共有ドライブ一覧を再取得">共有ドライブ取得</button>
+        <button id="btn-refresh" title="今すぐ更新">↻</button>
+        <label class="interval-slider" title="自動更新間隔 (100ms 単位、最大 20 秒)">
+          <span id="interval-display" class="interval-display">2.0s</span>
+          <input type="range" id="interval-slider" min="100" max="20000" step="100" value="2000">
+        </label>
+      </div>
     </div>
     <nav class="tabs">
       <button class="tab-btn active" data-tab="build">ビルド</button>
@@ -28,15 +39,18 @@
   <main>
     <!-- ============== BUILD TAB ============== -->
     <section class="tab-pane active" data-tab="build">
+      <div class="eval-card" id="eval-card">
+        <span class="muted">RAG 品質 (eval):</span>
+        <span id="eval-score">—</span>
+        <span class="muted small" id="eval-detail"></span>
+        <span class="muted small" id="eval-note"></span>
+      </div>
+
       <div class="workers-card">
         <div class="workers-header">
           <h2>ワーカー（マルチスレッドビルド）</h2>
-          <div class="workers-scale">
-            <span class="muted">スレッド数:</span>
-            <button id="btn-scale-down" title="減らす">−</button>
-            <span id="scale-target">-</span>
-            <button id="btn-scale-up" title="増やす">+</button>
-            <span class="muted">(ライブ <span id="scale-live">-</span> / MIN 1, MAX 10)</span>
+          <div class="workers-scale muted">
+            target <span id="scale-target">-</span> / live <span id="scale-live">-</span>
           </div>
         </div>
         <div id="workers-body" class="workers-grid">
@@ -72,9 +86,9 @@
     <section class="tab-pane" data-tab="mcp">
       <h2>MCP ログインユーザー</h2>
       <p class="muted">
-        Claude Cowork から MCP に接続する際の認証情報。初期値として
-        <code>tobisako</code> / <code>izumi</code> が作成されています（PW: <code>admin</code>）。
-        運用時は必ず PW を変更してください。
+        Claude Cowork から MCP に接続する際の認証情報。初期値:
+        <code>tobisako</code> / <code>izumi</code>（PW: <code>admin</code>）。
+        運用時は必ず PW を変更。
       </p>
       <table id="mcp-users-table">
         <thead>
@@ -95,11 +109,10 @@
 
       <h2 style="margin-top: 32px">MCP 検索スコープ</h2>
       <p class="muted">
-        Claude Cowork からの RAG 検索で対象にするドライブを選択します。
-        ビルドが完了しているドライブだけが実際に検索可能です。
-        ここの ON/OFF はインデックス生成とは別系統で、いつでも切替可能。
+        MCP 経由で検索可能なドライブ。全 MCP ユーザー共通。
+        行クリックで ON/OFF（ビルド未完のドライブも有効化可、検索は空振り）。
       </p>
-      <table id="fds-mcp-table">
+      <table id="mcp-scope-table">
         <thead>
           <tr>
             <th>検索<br>対象</th>
@@ -110,10 +123,13 @@
             <th>最終ビルド</th>
           </tr>
         </thead>
-        <tbody id="fds-mcp-body">
+        <tbody id="mcp-scope-body">
           <tr><td colspan="6" class="empty">読み込み中...</td></tr>
         </tbody>
       </table>
+
+      <h2 style="margin-top: 32px">MCP クエリログ (直近 50 件)</h2>
+      <div id="mcp-query-log" class="events"></div>
     </section>
   </main>
 

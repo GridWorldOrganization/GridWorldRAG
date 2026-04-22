@@ -8,12 +8,15 @@ Claude Cowork / Claude Desktop から **MCP (Model Context Protocol) 経由で�
 
 ## できること
 
-- Google Drive の共有フォルダ群を自動的に索引（チャンク + ベクトル）
+- Google Drive の共有フォルダ群を自動的に索引（構造認識チャンク + ベクトル）
 - **ビルドは自動**: 有効化されたドライブを 4 ワーカー並列で常時追跡（変更検知は Changes API）
-- **マルチスレッド** (1〜10 スレッド、UI からライブ変更可)
-- **2 画面**: 管理者用「ビルド画面」 + ユーザー用「MCP 検索設定画面」
-- **Electron ミニモニター** (always-on-top、500ms 更新、ビルド進捗アニメーション)
-- **MCP サーバー** (Streamable HTTP + Basic Auth) → [MCP 接続ガイドはこちら](./MCP.md)
+- **マルチスレッド** (デフォルト 4、`DAEMON_WORKER_THREADS` で調整)
+- **Reranker**: BGE-m3 cross-encoder で Top-K 並び替え (`ENABLE_RERANKER=1`)
+- **2 画面**: 管理者用「ビルド画面」 + 「MCP 検索設定画面」
+- **Electron ミニモニター** (always-on-top、500ms 更新)
+- **MCP サーバー** (Streamable HTTP + Basic Auth、クエリログ付き) → [MCP 接続ガイドはこちら](./MCP.md)
+- **Eval Suite** (`tests/eval/`) — 品質の定量モニター
+- **自動バックアップ** (`scripts/backup.bat`) — 日次 7 + 週次 4 世代
 
 ## アーキテクチャ
 
@@ -42,6 +45,13 @@ Claude Cowork / Claude Desktop から **MCP (Model Context Protocol) 経由で�
 8. ブラウザで `http://127.0.0.1:17600/` → 管理画面
 9. Electron ミニモニター: `scripts\run_mini.bat`
 10. MCP 公開: [MCP.md](./MCP.md) 参照
+11. バックアップ登録: `scripts\install_service.md` の Task Scheduler セクション
+
+## 廃案（設計書にあるが採用しない）
+
+- **Mac リモートモニター** (旧 Phase 3): Web モニターをトンネルで公開すれば十分。Tauri 別アプリを作る価値無し
+- **スレッド数の動的変更 UI**: 1 ユーザー運用では固定で十分。`DAEMON_WORKER_THREADS` で初期値のみ
+- **per-user MCP 検索スコープ**: 複雑度に見合う価値無し。`fd_registry.search_enabled` でグローバル管理
 
 ## 画面
 

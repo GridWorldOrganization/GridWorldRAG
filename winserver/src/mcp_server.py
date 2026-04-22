@@ -10,8 +10,18 @@ controls this via the Windows monitor's MCP tab.
 from __future__ import annotations
 
 import base64
+import contextvars
+import functools
 import logging
+import threading
+import time
 from typing import Optional
+
+# Set by BasicAuthMiddleware on every authenticated request so tool
+# implementations can know which MCP user is calling.
+_current_user: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "winserverrag_mcp_current_user", default=None
+)
 
 from mcp.server.fastmcp import FastMCP
 from starlette.applications import Starlette
@@ -22,26 +32,34 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount
 
 from src import db
-from src.config import EMBEDDING_MODEL, EMBEDDING_DEVICE
+from src.config import (
+    EMBEDDING_MODEL, EMBEDDING_DEVICE, ENABLE_RERANKER, RERANKER_CANDIDATE_K,
+)
 from src.mcp_auth import verify_password
+from src.reranker import rerank as _rerank
 
 log = logging.getLogger("mcp_server")
 
 # ---------------------------------------------------------------------
-# Embedding (lazy, per-process cache)
+# Embedding (lazy, per-process cache, thread-safe init)
 # ---------------------------------------------------------------------
 _model = None
+_model_lock = threading.Lock()  # Fix D: double-init guard
 
 
 def _get_model():
     global _model
-    if _model is None:
-        from sentence_transformers import SentenceTransformer
-        import torch
-        dev = EMBEDDING_DEVICE
-        if dev == "auto":
-            dev = "cuda" if torch.cuda.is_available() else "cpu"
-        _model = SentenceTransformer(EMBEDDING_MODEL, device=dev)
+    if _model is not None:
+        return _model
+    with _model_lock:
+        # Re-check under lock: another thread may have populated while we waited.
+        if _model is None:
+            from sentence_transformers import SentenceTransformer
+            import torch
+            dev = EMBEDDING_DEVICE
+            if dev == "auto":
+                dev = "cuda" if torch.cuda.is_available() else "cpu"
+            _model = SentenceTransformer(EMBEDDING_MODEL, device=dev)
     return _model
 
 
@@ -54,6 +72,16 @@ def _embed_query(text: str):
 # ---------------------------------------------------------------------
 # MCP server (FastMCP) — tools exposed to Claude
 # ---------------------------------------------------------------------
+from mcp.server.transport_security import TransportSecuritySettings
+
+# FastMCP auto-enables DNS rebinding protection when host is localhost,
+# which breaks when reached via cloudflared/ngrok tunnels. Our Basic Auth
+# middleware is already the gate — disable the Host-based check so a
+# tunnel's random subdomain doesn't get rejected with "Invalid Host header".
+_transport_security = TransportSecuritySettings(
+    enable_dns_rebinding_protection=False,
+)
+
 mcp = FastMCP(
     name="WinServerRAG",
     instructions=(
@@ -67,19 +95,89 @@ mcp = FastMCP(
     # once we mount it under "/mcp" in the main FastAPI, the endpoint is
     # just /mcp (not /mcp/mcp). Trailing slash is also accepted.
     streamable_http_path="/",
+    transport_security=_transport_security,
 )
 
 
-@mcp.tool()
-def list_drives() -> dict:
-    """List the shared drives currently in MCP search scope.
+# Decorator that persists every tool invocation to public.mcp_query_log.
+# Captures the query (for search), the returned drive_id/file_id set when
+# available, latency in ms, and any exception string.
+def _logged_tool(tool_name: str):
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            t0 = time.time()
+            user = _current_user.get()
+            query = kwargs.get("query") or (args[0] if args and tool_name == "search" else None)
+            url = kwargs.get("url") or (args[0] if args and tool_name == "lookup" else None)
+            query_for_log = query if isinstance(query, str) else url if isinstance(url, str) else None
+            err = None
+            result = None
+            try:
+                result = fn(*args, **kwargs)
+                return result
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+                raise
+            finally:
+                latency_ms = int((time.time() - t0) * 1000)
+                returned_count = None
+                returned_ids = None
+                if isinstance(result, dict):
+                    if "count" in result and isinstance(result["count"], int):
+                        returned_count = result["count"]
+                    rs = result.get("results")
+                    if isinstance(rs, list):
+                        returned_ids = [
+                            {"drive_id": r.get("drive_id"),
+                             "title":    (r.get("title") or "")[:80]}
+                            for r in rs[:10]
+                        ]
+                    elif "drives" in result and isinstance(result["drives"], list):
+                        returned_ids = [d.get("drive_id") for d in result["drives"][:20]]
+                try:
+                    conn = db.connect()
+                    try:
+                        db.log_mcp_query(
+                            conn,
+                            username=user, tool_name=tool_name,
+                            query=query_for_log,
+                            returned_count=returned_count,
+                            returned_ids=returned_ids,
+                            latency_ms=latency_ms,
+                            error=err,
+                        )
+                    finally:
+                        conn.close()
+                except Exception as e:
+                    log.warning("mcp query log persist failed: %s", e)
+        return wrapper
+    return deco
 
-    Returns the drive_id, name, and chunk count for every drive the admin
-    has enabled for Claude Cowork access. Empty if the admin hasn't enabled
-    any drive yet.
+
+def _allowed_schemas(conn) -> list[tuple[str, str]]:
+    """Resolve (drive_id, drive_name) pairs currently in MCP search scope.
+
+    As of v0.3 the scope is GLOBAL (fd_registry.search_enabled) — all
+    authenticated MCP users share the same set. The per-user matrix was
+    removed because the complexity didn't earn its keep for a small
+    deployment.
     """
+    return db.search_enabled_schemas(conn)
+
+
+@mcp.tool()
+@_logged_tool("list_drives")
+def list_drives() -> dict:
+    """List shared drives currently in MCP search scope.
+
+    Scope is global — the admin toggles which drives are searchable on the
+    Windows monitor's MCP tab. Empty list means no drive has been enabled yet.
+    """
+    username = _current_user.get()
     conn = db.connect()
     try:
+        allowed_ids = {d for d, _ in _allowed_schemas(conn)}
         fds = db.list_fds(conn)
     finally:
         conn.close()
@@ -91,12 +189,13 @@ def list_drives() -> dict:
             "chunk_count": f["chunk_count"],
             "last_build_at": str(f["last_build_at"]) if f["last_build_at"] else None,
         }
-        for f in fds if f.get("search_enabled")
+        for f in fds if f["drive_id"] in allowed_ids
     ]
-    return {"drives": scoped, "count": len(scoped)}
+    return {"drives": scoped, "count": len(scoped), "user": username}
 
 
 @mcp.tool()
+@_logged_tool("search")
 def search(query: str, n_results: int = 10, owner: Optional[str] = None) -> dict:
     """Semantic search across all MCP-enabled shared drives.
 
@@ -107,23 +206,28 @@ def search(query: str, n_results: int = 10, owner: Optional[str] = None) -> dict
                that person.
     """
     n_results = max(1, min(50, int(n_results)))
+    username = _current_user.get()
+    # When reranking, pull more candidates from the vector search than the
+    # final top-N so the reranker has room to reorder.
+    candidate_k = RERANKER_CANDIDATE_K if ENABLE_RERANKER else n_results
+    candidate_k = max(n_results, candidate_k)
     conn = db.connect()
     try:
-        schemas = db.search_enabled_schemas(conn)
+        schemas = _allowed_schemas(conn)
         if not schemas:
             return {
                 "results": [],
-                "note": ("No drives are in MCP scope. Ask the administrator "
-                         "to enable at least one drive on the Windows monitor "
-                         "MCP tab."),
+                "user": username,
+                "note": ("No drives are in MCP scope. Ask the administrator to "
+                         "enable drives on the Windows monitor MCP tab."),
             }
         emb = _embed_query(query)
-        rows = db.search_across_schemas(conn, emb, schemas, n_results=n_results,
-                                        owner=owner)
+        rows = db.search_across_schemas(conn, emb, schemas,
+                                        n_results=candidate_k, owner=owner)
     finally:
         conn.close()
     drive_names = {d: n for d, n in schemas}
-    results = [
+    candidates = [
         {
             "drive_id":    r["drive_id"],
             "drive_name":  drive_names.get(r["drive_id"], ""),
@@ -140,10 +244,14 @@ def search(query: str, n_results: int = 10, owner: Optional[str] = None) -> dict
         }
         for r in rows
     ]
-    return {"results": results, "count": len(results), "query": query}
+    # Rerank: swaps the order and trims to n_results. Pass-through if disabled.
+    results = _rerank(query, candidates, top_n=n_results, text_key="content")
+    return {"results": results, "count": len(results), "query": query,
+            "reranked": ENABLE_RERANKER}
 
 
 @mcp.tool()
+@_logged_tool("lookup")
 def lookup(url: str) -> dict:
     """Fetch the full indexed content for a specific Google Drive URL.
 
@@ -159,7 +267,7 @@ def lookup(url: str) -> dict:
 
     conn = db.connect()
     try:
-        schemas = db.search_enabled_schemas(conn)
+        schemas = _allowed_schemas(conn)
         if not schemas:
             return {"error": "no drives in MCP scope"}
         # Find which schema contains this file_id.
@@ -212,11 +320,12 @@ def lookup(url: str) -> dict:
 
 
 @mcp.tool()
+@_logged_tool("stats")
 def stats() -> dict:
-    """Global index statistics across MCP-enabled drives."""
+    """Index statistics for the drives this MCP user can search."""
     conn = db.connect()
     try:
-        scoped = db.search_enabled_schemas(conn)
+        scoped = _allowed_schemas(conn)
         by_drive = []
         total_chunks = 0
         total_files = 0
@@ -278,7 +387,12 @@ class BasicAuthMiddleware(BaseHTTPMiddleware):
         if not stored or not verify_password(password, stored):
             return self._challenge()
 
-        return await call_next(request)
+        # Make the username available to tool implementations via contextvar.
+        token = _current_user.set(username)
+        try:
+            return await call_next(request)
+        finally:
+            _current_user.reset(token)
 
     @staticmethod
     def _challenge() -> Response:

@@ -34,6 +34,36 @@ LOCK_PATH = config.LOCK_DIR / "rag_daemon.lock"
 MAX_WORKERS = 10
 MIN_WORKERS = 1
 
+
+# ----- Liveness helpers for DB connections (Fix A) -----------------
+def _conn_alive(conn) -> bool:
+    """Cheap liveness probe. Returns False for a closed or broken conn."""
+    if conn is None:
+        return False
+    try:
+        if getattr(conn, "closed", False):
+            return False
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        return True
+    except Exception:
+        return False
+
+
+def _replace_conn(conn, *, label: str = ""):
+    """Close a broken conn and return a fresh one (or None on fail).
+    Never raises — caller decides whether to retry."""
+    if conn is not None:
+        try: conn.rollback()
+        except Exception: pass
+        try: conn.close()
+        except Exception: pass
+    try:
+        return db.connect()
+    except Exception as e:
+        log.error("%s reopen DB conn failed: %s", label or "conn", e)
+        return None
+
 _stop_flag = False
 _global_stop = threading.Event()
 
@@ -149,17 +179,36 @@ def _process_file(conn, schema: str, drive_id: str, file_info: dict, service) ->
 # ---------------------------------------------------------------------
 # Full build & delta sync — both accept worker_id for live progress
 # ---------------------------------------------------------------------
+# Per-worker context kept in memory so every heartbeat sends the FULL state
+# of the worker — defends against zombie_cleanup DELETEing a row during a
+# long list_files() gap and the next heartbeat INSERTing a partial row.
+_worker_ctx: dict[int, dict] = {}
+_worker_ctx_lock = threading.Lock()
+
+
 def _hb(conn, worker_id: Optional[int], **fields):
-    """heartbeat — no-op when worker_id is None."""
+    """heartbeat — no-op when worker_id is None. Merges `fields` into the
+    per-worker context, then writes the full context to the row so the DB
+    never sees a half-specified INSERT."""
     if worker_id is None:
         return
+    with _worker_ctx_lock:
+        ctx = _worker_ctx.setdefault(worker_id, {})
+        ctx.update(fields)
+        full = dict(ctx)
     try:
-        db.heartbeat_worker(conn, worker_id, **fields)
+        db.heartbeat_worker(conn, worker_id, **full)
     except Exception:
         try:
             conn.rollback()
         except Exception:
             pass
+
+
+def _hb_reset(worker_id: int) -> None:
+    """Clear the in-memory context for a worker (used when it goes idle)."""
+    with _worker_ctx_lock:
+        _worker_ctx.pop(worker_id, None)
 
 
 def build_full(conn, drive_id: str, service, *, worker_id: Optional[int] = None) -> None:
@@ -338,7 +387,12 @@ def sync_delta(conn, drive_id: str, service, *, worker_id: Optional[int] = None)
 # ---------------------------------------------------------------------
 def _worker_loop(wid: int, personal_stop: threading.Event) -> None:
     """One worker thread. Gets its own DB connection and its own Drive
-    service (via dc.get_drive_service()'s thread-local cache)."""
+    service (via dc.get_drive_service()'s thread-local cache).
+
+    Fix B: if the DB connection dies mid-operation, we drop the worker
+    entirely (manager will scale back up automatically). Advisory locks are
+    tied to the conn; closing it releases them — no drive gets stuck.
+    """
     conn = None
     try:
         conn = db.connect()
@@ -349,48 +403,84 @@ def _worker_loop(wid: int, personal_stop: threading.Event) -> None:
         log.info("worker %d started", wid)
 
         while not _global_stop.is_set() and not personal_stop.is_set():
+            # Liveness check before each iteration (Fix B).
+            if not _conn_alive(conn):
+                log.warning("worker %d: conn dead, exiting (manager will respawn)", wid)
+                return  # finally block still runs
+
             try:
                 drive_id = _work_queue.get(timeout=2.0)
             except queue.Empty:
-                db.heartbeat_worker(conn, wid, state="idle",
-                                    drive_id=None, drive_name=None, current_file=None,
-                                    files_done=0, total_files=0, phase=None)
+                _hb_reset(wid)
+                try:
+                    db.heartbeat_worker(conn, wid, state="idle",
+                                        drive_id=None, drive_name=None, current_file=None,
+                                        files_done=0, total_files=0, phase=None,
+                                        last_error=None)
+                except Exception:
+                    try: conn.rollback()
+                    except Exception: pass
+                    if not _conn_alive(conn):
+                        return
                 continue
 
             # Try to claim the drive exclusively across all workers + processes.
-            if not db.try_claim_drive(conn, drive_id):
+            try:
+                claimed = db.try_claim_drive(conn, drive_id)
+            except Exception as e:
+                log.warning("worker %d: try_claim_drive failed: %s", wid, e)
+                try: conn.rollback()
+                except Exception: pass
+                if not _conn_alive(conn):
+                    return
+                continue
+
+            if not claimed:
                 log.info("worker %d: drive %s already claimed, skipping", wid, drive_id)
                 continue
+
+            got_drive = True
             try:
-                db.heartbeat_worker(conn, wid, state="claiming",
-                                    drive_id=drive_id, drive_name=None,
-                                    current_file=None, files_done=0, total_files=0,
-                                    phase=None, last_error=None)
+                row = db.get_fd(conn, drive_id)
+                dname = (row or {}).get("name", "") or ""
+                _hb_reset(wid)
+                _hb(conn, wid, state="claiming",
+                    drive_id=drive_id, drive_name=dname,
+                    current_file=None, files_done=0, total_files=0,
+                    phase=None, last_error=None)
                 try:
                     sync_delta(conn, drive_id, service, worker_id=wid)
                 except Exception as e:
                     log.error("worker %d failed %s: %s\n%s",
                               wid, drive_id, e, traceback.format_exc())
-                    try:
-                        conn.rollback()
-                    except Exception:
-                        pass
+                    # Rollback the poisoned transaction before doing anything
+                    # else on this conn — otherwise set_state / heartbeat /
+                    # release_drive all fail with InFailedSqlTransaction.
+                    try: conn.rollback()
+                    except Exception: pass
+                    if not _conn_alive(conn):
+                        got_drive = False  # lock already released by conn close
+                        return
                     try:
                         db.set_state(conn, drive_id, "error", str(e))
                     except Exception:
-                        try:
-                            conn.rollback()
-                        except Exception:
-                            pass
+                        try: conn.rollback()
+                        except Exception: pass
                     try:
-                        db.heartbeat_worker(conn, wid, state="error", last_error=str(e)[:500])
+                        db.heartbeat_worker(conn, wid, state="error",
+                                            last_error=str(e)[:500])
                     except Exception:
-                        pass
+                        try: conn.rollback()
+                        except Exception: pass
             finally:
-                try:
-                    db.release_drive(conn, drive_id)
-                except Exception:
-                    pass
+                # Release AFTER rollback so the transaction isn't poisoned.
+                # If conn is dead, skip — PG released the lock on conn close.
+                if got_drive and _conn_alive(conn):
+                    try:
+                        db.release_drive(conn, drive_id)
+                    except Exception:
+                        try: conn.rollback()
+                        except Exception: pass
     finally:
         if conn is not None:
             try:
@@ -514,27 +604,37 @@ def main() -> int:
 
         last_enqueue = 0.0
         last_cleanup = 0.0
+        last_events_gc = 0.0
+        last_liveness = 0.0
         while not _stop_flag:
-            # Poll target worker count
-            try:
-                target_s = db.get_config(manager_conn, "worker_count",
-                                         str(config.DAEMON_WORKER_THREADS))
-                target = int(target_s) if target_s else config.DAEMON_WORKER_THREADS
-            except Exception:
-                target = config.DAEMON_WORKER_THREADS
-            target = max(MIN_WORKERS, min(MAX_WORKERS, target))
-            current = _live_worker_count()
-            if target != current:
-                sp, rt = _scale_to(target)
-                log.info("scale: current=%d -> target=%d (+%d/-%d)",
-                         current, target, sp, rt)
-
+            # Reconnect manager_conn if dead (Fix A). Probe every 10s to avoid
+            # wasting round-trips.
             now = time.time()
-            # Garbage-collect zombie worker rows + stuck fd_registry.state.
-            # Runs every 30s — cheap query, cap on blast radius.
+            if now - last_liveness >= 10:
+                if not _conn_alive(manager_conn):
+                    log.warning("manager_conn dead; reconnecting...")
+                    manager_conn = _replace_conn(manager_conn, label="manager")
+                    if manager_conn is None:
+                        # Back off and retry in the next loop tick
+                        for _ in range(5):
+                            if _stop_flag:
+                                break
+                            time.sleep(1)
+                        continue
+                last_liveness = now
+
+            # Worker count is fixed at startup from config.DAEMON_WORKER_THREADS.
+            # The dynamic scale UI was removed; manager just keeps the pool at
+            # the initial size. If workers died (crashed, conn gone), respawn.
+            target = max(MIN_WORKERS, min(MAX_WORKERS, config.DAEMON_WORKER_THREADS))
+            current = _live_worker_count()
+            if current < target:
+                _scale_to(target)
+
+            # Zombie cleanup (stale workers, stuck drives). Every 30s.
             if now - last_cleanup >= 30:
                 try:
-                    gc = db.cleanup_zombies(manager_conn, stale_after_sec=90)
+                    gc = db.cleanup_zombies(manager_conn, stale_after_sec=300)
                     if gc["workers_removed"]:
                         log.warning("zombie cleanup: removed worker rows %s",
                                     gc["workers_removed"])
@@ -544,10 +644,27 @@ def main() -> int:
                     last_cleanup = now
                 except Exception as e:
                     log.error("zombie cleanup failed: %s", e)
-                    try:
-                        manager_conn.rollback()
-                    except Exception:
-                        pass
+                    try: manager_conn.rollback()
+                    except Exception: pass
+
+            # Fix E: daemon_events 30d TTL. Hourly GC so the table doesn't
+            # grow unbounded (tens of thousands of rows/day on busy builds).
+            if now - last_events_gc >= 3600:
+                try:
+                    with manager_conn.cursor() as cur:
+                        cur.execute(
+                            "DELETE FROM public.daemon_events "
+                            "WHERE ts < NOW() - INTERVAL '30 days'"
+                        )
+                        gone = cur.rowcount
+                    manager_conn.commit()
+                    if gone:
+                        log.info("daemon_events TTL: deleted %d rows (>30d)", gone)
+                    last_events_gc = now
+                except Exception as e:
+                    log.warning("daemon_events TTL GC failed: %s", e)
+                    try: manager_conn.rollback()
+                    except Exception: pass
 
             if now - last_enqueue >= config.DAEMON_ROTATE_INTERVAL_SEC:
                 try:

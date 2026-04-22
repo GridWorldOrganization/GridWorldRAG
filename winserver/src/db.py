@@ -489,6 +489,11 @@ def get_mcp_user_hash(conn: psycopg.Connection, username: str) -> Optional[str]:
         return r["password_hash"] if r else None
 
 
+# Per-user drive matrix removed in v0.3 — search_enabled is global. The
+# public.mcp_user_drives table remains in the DB (idempotent IF NOT EXISTS)
+# but no code reads it anymore; left for future reinstatement.
+
+
 def seed_default_mcp_users(conn: psycopg.Connection) -> list[str]:
     """Create tobisako / izumi on first init (pw=admin) if they don't exist.
     Returns the list of usernames that were newly created.
@@ -567,6 +572,40 @@ def log_event(conn: psycopg.Connection, *, drive_id: Optional[str], level: str,
              json.dumps(extra, ensure_ascii=False) if extra else None),
         )
     conn.commit()
+
+
+def log_mcp_query(conn: psycopg.Connection, *, username: Optional[str],
+                  tool_name: str, query: Optional[str],
+                  returned_count: Optional[int], returned_ids: Optional[list],
+                  latency_ms: int, error: Optional[str]) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO public.mcp_query_log
+                (username, tool_name, query, returned_count, returned_ids,
+                 latency_ms, error)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """,
+            (username, tool_name, query,
+             returned_count,
+             json.dumps(returned_ids, ensure_ascii=False) if returned_ids else None,
+             latency_ms, error),
+        )
+    conn.commit()
+
+
+def tail_mcp_query_log(conn: psycopg.Connection, limit: int = 50) -> list[dict]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, ts, username, tool_name, query,
+                   returned_count, returned_ids, latency_ms, error
+            FROM public.mcp_query_log
+            ORDER BY id DESC LIMIT %s
+            """,
+            (limit,),
+        )
+        return cur.fetchall()
 
 
 def tail_events(conn: psycopg.Connection, limit: int = 100,

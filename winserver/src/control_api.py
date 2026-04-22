@@ -52,7 +52,11 @@ _sub_lock = asyncio.Lock()
 
 
 def _get_service():
+    """Return the cached Drive service. Populated at startup (Fix C).
+    Lazy-falls-back to authenticate() on first use if startup pre-auth failed."""
     global _service
+    if _service is not None:
+        return _service
     with _service_lock:
         if _service is None:
             _service = dc.authenticate()
@@ -134,6 +138,17 @@ async def _lifespan(_app):
                 conn.close()
         except Exception as e:
             log.error("startup mcp-user seed failed (non-fatal): %s", e)
+
+        # Fix C: prime the Google Drive service once at startup so requests
+        # don't block on OAuth refresh. _get_service() now just returns the
+        # cached handle.
+        global _service
+        try:
+            _service = await asyncio.to_thread(dc.authenticate)
+            log.info("Drive service pre-authenticated at startup")
+        except Exception as e:
+            log.warning("Drive pre-auth failed (will lazy-retry on demand): %s", e)
+
         # Background pumps
         asyncio.create_task(_event_pump())
         asyncio.create_task(_stats_pump())
@@ -326,29 +341,19 @@ def api_available_drives():
 
 @app.get("/api/workers", dependencies=[Depends(require_token)])
 def api_workers():
-    """Live worker state + target count."""
+    """Live worker state + configured target count (fixed at daemon startup)."""
     conn = db.connect()
     try:
         workers = db.list_workers(conn)
-        try:
-            target_s = db.get_config(conn, "worker_count",
-                                     str(config.DAEMON_WORKER_THREADS))
-            target = int(target_s) if target_s else config.DAEMON_WORKER_THREADS
-        except Exception:
-            target = config.DAEMON_WORKER_THREADS
     finally:
         conn.close()
     return {
-        "target": target,
+        "target": config.DAEMON_WORKER_THREADS,
         "min": 1,
         "max": 10,
         "live": len(workers),
         "workers": workers,
     }
-
-
-class ScalePayload(BaseModel):
-    n: int
 
 
 class UserCreatePayload(BaseModel):
@@ -358,17 +363,6 @@ class UserCreatePayload(BaseModel):
 
 class PasswordPayload(BaseModel):
     password: str
-
-
-@app.post("/api/workers/scale", dependencies=[Depends(require_token)])
-def api_workers_scale(payload: ScalePayload):
-    n = max(1, min(10, int(payload.n)))
-    conn = db.connect()
-    try:
-        db.set_config(conn, "worker_count", str(n))
-    finally:
-        conn.close()
-    return {"ok": True, "target": n}
 
 
 # -------- MCP users (login credentials for Claude Cowork access) --------
@@ -438,6 +432,36 @@ def api_delete_mcp_user(username: str):
     if n == 0:
         raise HTTPException(status_code=404, detail="unknown user")
     return {"ok": True, "username": username}
+
+
+# (per-user drive matrix removed in v0.3 — search_enabled is global now)
+
+
+@app.get("/api/eval", dependencies=[Depends(require_token)])
+def api_eval_last():
+    """Last eval run summary (from daemon_config.eval_last). Null if never run."""
+    conn = db.connect()
+    try:
+        val = db.get_config(conn, "eval_last")
+    finally:
+        conn.close()
+    if not val:
+        return {"score": None, "note": "eval not run yet — see tests/eval/"}
+    try:
+        return json.loads(val)
+    except Exception:
+        return {"score": None, "note": "eval_last unparseable"}
+
+
+@app.get("/api/mcp/query-log", dependencies=[Depends(require_token)])
+def api_mcp_query_log(limit: int = 50):
+    """Recent MCP tool invocations (Cowork queries). Read by the Web UI."""
+    limit = max(1, min(500, int(limit)))
+    conn = db.connect()
+    try:
+        return db.tail_mcp_query_log(conn, limit=limit)
+    finally:
+        conn.close()
 
 
 # --- stats cache: refreshed asynchronously in the background so /api/stats

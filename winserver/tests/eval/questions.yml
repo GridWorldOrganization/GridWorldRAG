@@ -1,0 +1,23 @@
+# WinServerRAG eval questions.
+#
+# 手順:
+#  1) 直近使った Cowork クエリや、社内でよく聞かれる質問を想定
+#  2) `expected_any_of` に、そのクエリで上位 `top_k` に入ってきてほしい
+#     file_id (Google Drive の d/{FILE_ID}/edit の {FILE_ID} 部分) を列挙
+#  3) 1 つでもヒットすれば PASS。複数書けば OR 条件（どれかが上位にあれば OK）
+#
+# 空の状態で run_eval を走らせると "0 questions — skipping" で終わる。
+# まずは 3〜5 問書けば回し始められる。10 問が推奨。
+#
+# 例:
+#   - id: q1
+#     query: "商パト運用ルールは何？"
+#     expected_any_of:
+#       - "1A2b3C4D5e6F7g8H9i"   # 商パト運用マニュアル
+#       - "9Z8y7X6w5V4u3T2s1R"   # 商パト運用スプレッドシート
+#     top_k: 3
+#     notes: "社内の商品開発パトロール運用文書"
+
+version: 1
+top_k_default: 3
+questions: []

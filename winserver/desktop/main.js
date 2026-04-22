@@ -15,7 +15,11 @@ function createWindow() {
     height: 400,
     minWidth: 320,
     minHeight: 320,
+    maxWidth: 560,
+    maxHeight: 700,
     resizable: true,
+    maximizable: false,
+    fullscreenable: false,
     alwaysOnTop: true,
     frame: true,
     title: "WinServerRAG Mini",
@@ -27,6 +31,10 @@ function createWindow() {
     },
   });
   win.setMenuBarVisibility(false);
+  // Belt & suspenders: intercept maximize/fullscreen events in case the OS
+  // window-controls are used to bypass the flags above.
+  win.on("maximize", () => { try { win.unmaximize(); } catch {} });
+  win.on("enter-full-screen", () => { try { win.setFullScreen(false); } catch {} });
   win.loadFile("index.html");
 }
 

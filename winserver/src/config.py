@@ -95,6 +95,14 @@ CHUNK_OVERLAP = _env_int("CHUNK_OVERLAP", 120)
 BATCH_SIZE = _env_int("BATCH_SIZE", 64)
 EMBEDDING_DIM = 768  # multi-qa-mpnet & paraphrase-multilingual-mpnet
 
+# Reranker (cross-encoder) — lifts search quality after cosine retrieval.
+# 0 = disabled, 1 = enabled. Pulls the model on first search; ~500MB.
+ENABLE_RERANKER = _env("ENABLE_RERANKER", "1") == "1"
+RERANKER_MODEL = _env("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
+# How many candidates to retrieve from vector search before reranking.
+# Larger = better recall, more compute. 50 is a sane default.
+RERANKER_CANDIDATE_K = _env_int("RERANKER_CANDIDATE_K", 50)
+
 # --- API retry ---
 API_MAX_RETRIES = _env_int("API_MAX_RETRIES", 6)
 API_BASE_DELAY_SEC = _env_float("API_BASE_DELAY_SEC", 5.0)

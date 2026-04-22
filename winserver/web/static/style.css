@@ -21,9 +21,69 @@ header {
   position: sticky; top: 0; z-index: 5;
   padding: 14px 20px; background: #0a0c12; border-bottom: 1px solid var(--border);
 }
-header h1 { margin: 0 0 8px 0; font-size: 18px; font-weight: 600; }
-.stats-bar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; color: var(--muted); }
-.stats-bar > * { white-space: nowrap; }
+header h1 { margin: 0 0 8px 0; font-size: 18px; font-weight: 600; display: flex; align-items: center; gap: 10px; }
+
+/* Global activity indicator (top-left of title):
+   idle   = dim dot
+   ok     = green pulsing dot (pg/drive OK, no active worker)
+   active = blue rotating ring + filled core (any worker is running)
+   err    = red solid dot
+*/
+.global-indicator {
+  position: relative; width: 20px; height: 20px;
+  display: inline-flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.global-indicator .core {
+  width: 10px; height: 10px; border-radius: 50%; background: var(--muted);
+  transition: background 0.2s;
+}
+.global-indicator.ok  .core { background: var(--ok); animation: gi-pulse 1.6s ease-in-out infinite; }
+.global-indicator.err .core { background: var(--err); }
+.global-indicator.active::before {
+  content: ""; position: absolute; inset: 0;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  border-top-color: var(--accent);
+  border-right-color: var(--accent);
+  animation: gi-spin 0.9s linear infinite;
+}
+.global-indicator.active .core { background: var(--accent); }
+@keyframes gi-spin  { to { transform: rotate(360deg); } }
+@keyframes gi-pulse {
+  0%, 100% { transform: scale(1);   opacity: 1; }
+  50%      { transform: scale(1.4); opacity: 0.55; }
+}
+.stats-bar {
+  display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+  color: var(--muted); justify-content: space-between;
+}
+.stats-left {
+  display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+  color: var(--muted);
+}
+.stats-left > * { white-space: nowrap; }
+.refresh-controls {
+  display: flex; gap: 10px; align-items: center; flex-wrap: nowrap;
+  color: var(--muted); font-size: 12px;
+}
+.interval-slider {
+  display: inline-flex; align-items: center; gap: 8px;
+  background: #11141c; padding: 4px 10px; border-radius: 14px;
+  border: 1px solid var(--border);
+}
+.interval-slider input[type="range"] {
+  width: 140px; margin: 0; accent-color: var(--accent);
+}
+.interval-display {
+  color: var(--accent); font-weight: 600; font-size: 11px;
+  min-width: 52px; text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+#btn-refresh {
+  width: 30px; height: 28px; padding: 0;
+  font-size: 15px; line-height: 1;
+}
 .badge {
   padding: 2px 8px; border-radius: 10px;
   font-size: 12px; background: #1b2030; border: 1px solid var(--border);
@@ -88,6 +148,17 @@ td.empty { text-align: center; color: var(--muted); padding: 30px 0; }
 .tab-pane { display: none; }
 .tab-pane.active { display: block; }
 
+/* Eval card */
+.eval-card {
+  background: #0a0d14; border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 16px; margin-bottom: 14px;
+  display: flex; align-items: center; gap: 10px; font-size: 13px;
+}
+#eval-score { font-size: 16px; font-weight: 600; color: var(--fg); min-width: 50px; }
+#eval-score.ok   { color: var(--ok); }
+#eval-score.warn { color: var(--warn); }
+#eval-score.err  { color: var(--err); }
+
 /* Workers panel */
 .workers-card {
   background: #0a0d14; border: 1px solid var(--border); border-radius: 8px;
@@ -151,6 +222,25 @@ td.empty { text-align: center; color: var(--muted); padding: 30px 0; }
 .progress-fill { height: 100%; background: var(--accent); transition: width 0.3s; }
 .progress-text { color: var(--muted); font-size: 11px; }
 
+/* When the worker is actively running, the fill bar shimmers so you can see
+   the daemon is alive even when percentage moves slowly. */
+.worker-card.building .progress-fill,
+.worker-card.syncing  .progress-fill,
+.worker-card.listing  .progress-fill,
+.worker-card.claiming .progress-fill {
+  background: linear-gradient(90deg, var(--accent) 0%, #a0c9ff 50%, var(--accent) 100%);
+  background-size: 200% 100%;
+  animation: progress-shimmer 1.4s linear infinite;
+}
+@keyframes progress-shimmer {
+  0%   { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* Per-worker state-badge spinner removed (C-4). The title-bar global
+   indicator + per-worker progress-bar shimmer provide enough activity
+   feedback without the animation overload. */
+
 .muted.small { font-size: 11px; }
 
 /* MCP users table + add button */
@@ -162,10 +252,22 @@ code {
   color: var(--accent); font-family: Consolas, "Courier New", monospace; font-size: 90%;
 }
 
-/* MCP search table */
-tbody tr.row-search { cursor: pointer; transition: background 0.1s; }
-tbody tr.row-search:hover { background: #1a1f2e; }
-tbody tr.row-search.search-on { box-shadow: inset 3px 0 0 var(--accent); }
+/* MCP user row — clickable to show detail */
+tbody tr.row-user { cursor: pointer; transition: background 0.1s; }
+tbody tr.row-user:hover { background: #1a1f2e; }
+
+/* MCP user detail — per-user drive scope */
+.detail-header { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+.detail-header h2 { margin: 0; }
+.back-btn {
+  background: #11141c; border: 1px solid var(--border);
+  color: var(--fg); padding: 6px 12px; border-radius: 4px; cursor: pointer;
+  font-size: 12px;
+}
+.back-btn:hover { background: #1a1f2e; }
+tbody tr.row-user-drive { cursor: pointer; transition: background 0.1s; }
+tbody tr.row-user-drive:hover { background: #1a1f2e; }
+tbody tr.row-user-drive.user-on { box-shadow: inset 3px 0 0 var(--accent); }
 
 .actions { text-align: right; white-space: nowrap; }
 .actions button { margin-right: 4px; font-size: 12px; padding: 3px 8px; }

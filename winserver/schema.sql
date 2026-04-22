@@ -43,8 +43,37 @@ CREATE TABLE IF NOT EXISTS public.mcp_users (
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Per-user MCP search scope. A row means the user is allowed to search that
+-- drive. `public.fd_registry.search_enabled` is retained for display only
+-- (as a "any user can search this?" flag) and is not used for authorization.
+CREATE TABLE IF NOT EXISTS public.mcp_user_drives (
+    username    TEXT NOT NULL,
+    drive_id    TEXT NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (username, drive_id),
+    FOREIGN KEY (username) REFERENCES public.mcp_users(username) ON DELETE CASCADE,
+    FOREIGN KEY (drive_id) REFERENCES public.fd_registry(drive_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_mcp_user_drives_username ON public.mcp_user_drives (username);
+
 -- =====================================================================
--- public: runtime config (kv) — used for live worker count (1..10)
+-- public: MCP query log — every tool invocation is recorded here
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS public.mcp_query_log (
+    id              BIGSERIAL PRIMARY KEY,
+    ts              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    username        TEXT,
+    tool_name       TEXT NOT NULL,
+    query           TEXT,
+    returned_count  INTEGER,
+    returned_ids    JSONB,
+    latency_ms      INTEGER,
+    error           TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_mcp_query_log_ts ON public.mcp_query_log (ts DESC);
+
+-- =====================================================================
+-- public: runtime config (kv)
 -- =====================================================================
 CREATE TABLE IF NOT EXISTS public.daemon_config (
     key         TEXT PRIMARY KEY,

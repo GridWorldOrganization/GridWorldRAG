@@ -139,26 +139,37 @@ async function tick() {
         : `${activeWorkers.length} / ${w.live} (target ${w.target})`;
     $("wsummary").textContent = summary;
 
-    const parts = allWorkers.sort((a, b) => a.worker_id - b.worker_id)
-      .map(x => {
-        const stale = isWorkerStale(x, now);
-        const cls = stale ? "stale" : x.state;
-        const label = stale ? "stale" : x.state;
-        // Tooltip shown on mouse-over: which drive the worker is on,
-        // current file, progress, and phase.
-        const tipLines = [
-          `Worker #${x.worker_id}`,
-          `state: ${label}`,
-          x.phase        ? `phase: ${x.phase}`        : null,
-          x.drive_name   ? `drive: ${x.drive_name}`   : "drive: (none)",
-          x.drive_id     ? `drive_id: ${x.drive_id}`  : null,
-          x.current_file ? `file: ${x.current_file}`  : null,
-          x.total_files  ? `progress: ${x.files_done}/${x.total_files}` : null,
-          x.last_error   ? `error: ${String(x.last_error).slice(0,200)}` : null,
-        ].filter(Boolean);
-        const tip = escHtmlAttr(tipLines.join("\n"));
-        return `<span class="w ${cls}" title="${tip}">#${x.worker_id} ${label}</span>`;
-      });
+    // Always show `target` slots so the user sees "this is what you asked
+    // for". Extant workers fill the first slots (sorted by worker_id);
+    // remaining slots show as placeholders.
+    const sortedWorkers = [...allWorkers].sort((a, b) => a.worker_id - b.worker_id);
+    const slots = Math.max(w.target || 0, sortedWorkers.length, 1);
+    const parts = [];
+    for (let i = 0; i < slots; i++) {
+      const x = sortedWorkers[i];
+      if (!x) {
+        const tip = escHtmlAttr(`Worker slot ${i + 1}\nstate: (未起動 — target ${w.target})`);
+        parts.push(
+          `<span class="w idle" title="${tip}">#${i + 1} (待機)</span>`
+        );
+        continue;
+      }
+      const stale = isWorkerStale(x, now);
+      const cls = stale ? "stale" : x.state;
+      const label = stale ? "stale" : x.state;
+      const tipLines = [
+        `Worker #${x.worker_id}`,
+        `state: ${label}`,
+        x.phase        ? `phase: ${x.phase}`        : null,
+        x.drive_name   ? `drive: ${x.drive_name}`   : "drive: (none)",
+        x.drive_id     ? `drive_id: ${x.drive_id}`  : null,
+        x.current_file ? `file: ${x.current_file}`  : null,
+        x.total_files  ? `progress: ${x.files_done}/${x.total_files}` : null,
+        x.last_error   ? `error: ${String(x.last_error).slice(0,200)}` : null,
+      ].filter(Boolean);
+      const tip = escHtmlAttr(tipLines.join("\n"));
+      parts.push(`<span class="w ${cls}" title="${tip}">#${x.worker_id} ${label}</span>`);
+    }
     $("wdetail").innerHTML = parts.join("");
   } catch (_) {
     consecutiveFails++;

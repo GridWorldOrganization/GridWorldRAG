@@ -60,6 +60,7 @@ function setupTabs() {
 async function refreshStats() {
   try {
     const s = await getJSON(`${API}/api/stats`);
+    window.__lastPgOk = !!s.pg_ok;  // fed into updateGlobalIndicator()
     const pg = $("#stat-pg");
     pg.textContent = "PG " + (s.pg_ok ? "OK" : "NG");
     pg.className = "badge " + (s.pg_ok ? "ok" : "err");
@@ -104,6 +105,34 @@ function renderWorkers(data) {
     html.push(renderWorkerCard(i + 1, w));
   }
   $("#workers-body").innerHTML = html.join("");
+
+  // Drive the global indicator from the freshest worker snapshot we have.
+  updateGlobalIndicator(data);
+}
+
+// Stale threshold mirrors the Electron mini's — 120s of no heartbeat means
+// the worker's daemon probably died. Active animation stops in that case.
+const WEB_WORKER_STALE_MS = 120_000;
+
+function isWorkerStale(w, now) {
+  if (!w || !w.heartbeat_at) return false;
+  return (now - new Date(w.heartbeat_at).getTime()) > WEB_WORKER_STALE_MS;
+}
+
+function updateGlobalIndicator(workersPayload) {
+  const el = $("#global-indicator");
+  if (!el) return;
+  const now = Date.now();
+  const all = (workersPayload && workersPayload.workers) || [];
+  const activeStates = new Set(["building", "syncing", "listing", "claiming"]);
+  const freshActive = all.some((w) => activeStates.has(w.state) && !isWorkerStale(w, now));
+  const allStale = all.length > 0 && all.every((w) => isWorkerStale(w, now));
+  // We can't read /api/stats here — use last cached pg_ok via a global.
+  const pgOk = window.__lastPgOk !== false;
+  el.classList.remove("ok", "active", "err");
+  if (allStale || pgOk === false) el.classList.add("err");
+  else if (freshActive)           el.classList.add("active");
+  else if (pgOk)                  el.classList.add("ok");
 }
 
 function renderWorkerCard(slotNum, w) {
@@ -139,17 +168,7 @@ function renderWorkerCard(slotNum, w) {
     </div>`;
 }
 
-async function scaleBy(delta) {
-  if (_lastTarget == null) return;
-  const next = Math.max(1, Math.min(10, _lastTarget + delta));
-  if (next === _lastTarget) return;
-  try {
-    await postJSON(`${API}/api/workers/scale`, { n: next });
-  } catch (e) {
-    alert(`scale failed: ${e.message}`);
-  }
-  await refreshWorkers();
-}
+// scale UI removed — worker count is fixed from config (DAEMON_WORKER_THREADS).
 
 // ---------------- FD tables (build + mcp) ----------------
 async function refreshFDs() {
@@ -159,12 +178,9 @@ async function refreshFDs() {
   } catch (e) {
     $("#fds-build-body").innerHTML =
       `<tr><td colspan="8" class="empty">読み込み失敗: ${escapeHtml(e.message)}</td></tr>`;
-    $("#fds-mcp-body").innerHTML =
-      `<tr><td colspan="6" class="empty">読み込み失敗: ${escapeHtml(e.message)}</td></tr>`;
     return;
   }
   renderBuildTable(rows);
-  renderMcpTable(rows);
 }
 
 // --- BUILD table
@@ -265,24 +281,31 @@ function confirmRebuild(name) {
   return confirm(msg);
 }
 
-// --- MCP table
-function renderMcpTable(rows) {
-  const tbody = $("#fds-mcp-body");
+// --- MCP global search scope ---
+async function refreshMcpScope() {
+  const tbody = $("#mcp-scope-body");
+  let rows;
+  try {
+    rows = await getJSON(`${API}/api/fds`);
+  } catch (e) {
+    tbody.innerHTML = `<tr><td colspan="6" class="empty">取得失敗: ${escapeHtml(e.message)}</td></tr>`;
+    return;
+  }
   if (!rows.length) {
-    tbody.innerHTML = `<tr><td colspan="6" class="empty">ドライブが未登録です。</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="6" class="empty">ドライブが未登録</td></tr>`;
     return;
   }
   tbody.innerHTML = rows.map((r) => {
     const state = (r.state || "idle").toLowerCase();
     const built = r.last_build_at != null || (r.chunk_count ?? 0) > 0;
-    const disabledHint = built ? "" : "（未ビルド — 検索対象にしても結果なし）";
-    const searchClass = r.search_enabled ? "search-on" : "";
+    const hint = built ? "" : "（未ビルド）";
+    const cls = r.search_enabled ? "search-on" : "";
     return `
-      <tr class="row-search ${searchClass}" data-id="${r.drive_id}" data-search="${r.search_enabled ? 1 : 0}">
+      <tr class="row-search ${cls}" data-id="${r.drive_id}" data-search="${r.search_enabled ? 1 : 0}">
         <td class="col-toggle"><input type="checkbox" class="toggle search-toggle" ${r.search_enabled ? "checked" : ""}></td>
         <td title="${escapeHtml(r.drive_id)}">
           ${escapeHtml(r.name || "(no name)")}
-          ${disabledHint ? `<span class="muted small"> ${disabledHint}</span>` : ""}
+          ${hint ? `<span class="muted small"> ${hint}</span>` : ""}
         </td>
         <td><span class="state ${state}">${state}</span></td>
         <td>${(r.file_count ?? 0).toLocaleString()}</td>
@@ -291,33 +314,83 @@ function renderMcpTable(rows) {
       </tr>
     `;
   }).join("");
-  attachMcpRowHandlers();
+  attachScopeHandlers();
 }
 
-function attachMcpRowHandlers() {
-  $$("#fds-mcp-body tr.row-search").forEach((tr) => {
+function attachScopeHandlers() {
+  $$("#mcp-scope-body tr.row-search").forEach((tr) => {
     const id = tr.getAttribute("data-id");
     const toggle = tr.querySelector("input.search-toggle");
 
     tr.addEventListener("click", async (ev) => {
       if (ev.target === toggle) return;
       const on = tr.getAttribute("data-search") !== "1";
-      await toggleSearch(id, on);
+      await toggleScope(id, on);
     });
     toggle.addEventListener("click", async (ev) => {
       ev.stopPropagation();
-      await toggleSearch(id, toggle.checked);
+      await toggleScope(id, toggle.checked);
     });
   });
 }
 
-async function toggleSearch(id, on) {
+async function toggleScope(driveId, on) {
   try {
-    await postJSON(`${API}/api/fds/${id}/${on ? "search-enable" : "search-disable"}`);
+    await postJSON(`${API}/api/fds/${encodeURIComponent(driveId)}/${on ? "search-enable" : "search-disable"}`);
   } catch (e) {
     alert(`失敗: ${e.message}`);
   }
-  await refreshFDs();
+  await refreshMcpScope();
+}
+
+// --- MCP query log ---
+async function refreshMcpQueryLog() {
+  const el = $("#mcp-query-log");
+  try {
+    const rows = await getJSON(`${API}/api/mcp/query-log?limit=50`);
+    if (!rows.length) {
+      el.innerHTML = '<span class="muted">まだクエリはありません</span>';
+      return;
+    }
+    el.innerHTML = rows.map((r) => {
+      const ts = r.ts ? new Date(r.ts).toLocaleString("ja-JP", { hour12: false }) : "";
+      const latency = r.latency_ms != null ? `${r.latency_ms}ms` : "-";
+      const q = r.query ? escapeHtml(r.query) : `<span class="muted">(${escapeHtml(r.tool_name || "?")})</span>`;
+      const err = r.error ? ` <span class="evt-err">× ${escapeHtml(r.error.slice(0, 80))}</span>` : "";
+      return `<span class="evt">
+        <span class="ts">${ts}</span>
+        <span class="lvl info">${escapeHtml(r.tool_name || "?")}</span>
+        <span class="fd">[${escapeHtml(r.username || "?")}]</span>
+        <span class="msg">${q}</span>
+        <span class="muted">${r.returned_count ?? "-"} hits • ${latency}${err}</span>
+      </span>`;
+    }).join("");
+  } catch (e) {
+    el.innerHTML = `<span class="err">取得失敗: ${escapeHtml(e.message)}</span>`;
+  }
+}
+
+// ---------------- Eval score ----------------
+async function refreshEval() {
+  const scoreEl = $("#eval-score");
+  const detailEl = $("#eval-detail");
+  const noteEl = $("#eval-note");
+  try {
+    const r = await getJSON(`${API}/api/eval`);
+    if (r.score == null) {
+      scoreEl.textContent = "—";
+      noteEl.textContent = r.note || "";
+      detailEl.textContent = "";
+    } else {
+      const pct = Math.round(r.score * 100);
+      scoreEl.textContent = `${pct}%`;
+      scoreEl.className = pct >= 80 ? "ok" : pct >= 50 ? "warn" : "err";
+      detailEl.textContent = `(${r.passed}/${r.total} passed${r.reranked ? ", reranked" : ""})`;
+      noteEl.textContent = "";
+    }
+  } catch {
+    scoreEl.textContent = "?";
+  }
 }
 
 // ---------------- MCP users ----------------
@@ -349,6 +422,7 @@ async function refreshMcpUsers() {
 function attachUserRowHandlers() {
   $$("#mcp-users-body tr[data-username]").forEach((tr) => {
     const username = tr.getAttribute("data-username");
+
     tr.querySelectorAll("[data-action]").forEach((btn) => {
       btn.addEventListener("click", async (ev) => {
         ev.stopPropagation();
@@ -407,8 +481,7 @@ $("#btn-discover").addEventListener("click", async () => {
     $("#btn-discover").disabled = false;
   }
 });
-$("#btn-scale-up").addEventListener("click", () => scaleBy(+1));
-$("#btn-scale-down").addEventListener("click", () => scaleBy(-1));
+// (scale UI removed — worker count is fixed)
 
 // ---------------- events stream ----------------
 const eventsEl = $("#events");
@@ -444,12 +517,63 @@ function connectWS() {
 }
 
 // ---------------- init ----------------
+// ---------------- auto-refresh interval (slider) ----------------
+const REFRESH_STORAGE_KEY = "winserverrag.refreshIntervalMs";
+const DEFAULT_REFRESH_MS = 2000;
+const REFRESH_MIN_MS = 100;
+const REFRESH_MAX_MS = 20000;
+let _refreshTimers = [];
+
+function formatInterval(ms) {
+  if (ms < 1000) return `${ms}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+function clearRefreshTimers() {
+  for (const t of _refreshTimers) clearInterval(t);
+  _refreshTimers = [];
+}
+
+function startRefreshTimers(ms) {
+  clearRefreshTimers();
+  _refreshTimers.push(setInterval(() => refreshFDs().catch(() => {}),     ms));
+  _refreshTimers.push(setInterval(() => refreshStats().catch(() => {}),   ms));
+  _refreshTimers.push(setInterval(() => refreshWorkers().catch(() => {}), ms));
+}
+
+function applyInterval(ms) {
+  ms = Math.max(REFRESH_MIN_MS, Math.min(REFRESH_MAX_MS, Math.round(ms / 100) * 100));
+  $("#interval-display").textContent = formatInterval(ms);
+  $("#interval-slider").value = ms;
+  try { localStorage.setItem(REFRESH_STORAGE_KEY, String(ms)); } catch {}
+  startRefreshTimers(ms);
+}
+
+function setupIntervalSlider() {
+  const initial = (() => {
+    try {
+      const v = parseInt(localStorage.getItem(REFRESH_STORAGE_KEY) || "", 10);
+      if (Number.isFinite(v) && v >= REFRESH_MIN_MS && v <= REFRESH_MAX_MS) return v;
+    } catch {}
+    return DEFAULT_REFRESH_MS;
+  })();
+  applyInterval(initial);
+  $("#interval-slider").addEventListener("input", (ev) => {
+    applyInterval(parseInt(ev.target.value, 10));
+  });
+}
+
 (async function init() {
   setupTabs();
-  // refresh MCP users when switching to the MCP tab
+  setupIntervalSlider();
+  // refresh MCP widgets when switching to the MCP tab
   $$(".tab-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
-      if (btn.getAttribute("data-tab") === "mcp") refreshMcpUsers();
+      if (btn.getAttribute("data-tab") === "mcp") {
+        refreshMcpUsers();
+        refreshMcpScope();
+        refreshMcpQueryLog();
+      }
     });
   });
   // Kick off refreshes in parallel — don't let a slow one block the others.
@@ -458,8 +582,9 @@ function connectWS() {
   refreshStats().catch(() => {});
   refreshWorkers().catch(() => {});
   refreshMcpUsers().catch(() => {});
+  refreshMcpScope().catch(() => {});
+  refreshMcpQueryLog().catch(() => {});
+  refreshEval().catch(() => {});
   connectWS();
-  setInterval(() => refreshFDs().catch(() => {}), 5000);
-  setInterval(() => refreshStats().catch(() => {}), 5000);
-  setInterval(() => refreshWorkers().catch(() => {}), 2000);
+  // Interval timers are started by setupIntervalSlider() via applyInterval().
 })();
