@@ -59,6 +59,5 @@ infra/aws/.bridge_secret.tmp
 *.tfvars
 !*.tfvars.example
 
-# Vendored tool binaries
-tools/nssm.exe
-tools/terraform.exe
+# Vendored tool binaries (all local downloads; never committed)
+tools/

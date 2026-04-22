@@ -61,17 +61,19 @@ function fmtTs(s) {
   } catch { return s; }
 }
 function fmtFileCount(r) {
-  // Shows "<actual> / ~<estimate>" when both are known, or just the
-  // available one. Estimate (shaded, with ~) comes from the Drive API
-  // preview pump; actual is the number of files already indexed.
-  const actual = Number(r.file_count) || 0;
+  // "ビルド済 / 総数" 表示。built は file_count (DB 内の実インデックス件数)、
+  // total は file_count_estimate (Drive API の軽量カウント)。
+  // 総数が未取得のうちは "0 / ?" / "N / ?" と出して pump を待つ。
+  const built = Number(r.file_count) || 0;
   const est = r.file_count_estimate;
   const hasEst = est !== null && est !== undefined;
-  if (!actual && !hasEst) return "—";
-  if (!hasEst) return actual.toLocaleString();
-  if (!actual) return `<span class="muted">~${Number(est).toLocaleString()}</span>`;
-  if (Number(est) === actual) return actual.toLocaleString();
-  return `${actual.toLocaleString()} <span class="muted">/ ~${Number(est).toLocaleString()}</span>`;
+  const total = hasEst ? Number(est) : null;
+  if (!built && total === null) return "—";
+  if (total === null) return `${built.toLocaleString()} <span class="muted">/ ?</span>`;
+  const totalStr = total.toLocaleString();
+  if (built === 0)      return `<span class="muted">0 / ${totalStr}</span>`;
+  if (built >= total)   return `${built.toLocaleString()} / ${totalStr}`;
+  return `${built.toLocaleString()} <span class="muted">/ ${totalStr}</span>`;
 }
 
 function escapeHtml(s) {

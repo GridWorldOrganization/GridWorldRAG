@@ -27,30 +27,24 @@ Claude Cowork / Claude Desktop / 任意の MCP クライアントから、
 - Windows モニターの **MCP 検索設定** タブで検索対象ドライブの `search_enabled` を ON にしておく
 - MCP ログインユーザーが `public.mcp_users` に登録済み（`/api/mcp/users` で作成、または `WINSERVERRAG_SEED_USERS="user1:pw1,user2:pw2"` の環境変数で初回 seed）
 
-## 2. 公開トンネルを張る (いずれか一つ)
+## 2. リモート MCP エンドポイント (AWS サーバーレス)
 
-MCP クライアントが Windows 機に届くようにする。無料でおすすめは **Cloudflare Tunnel**（port forwarding 不要）。
+MCP クライアント (Claude Cowork 等) から Windows 機に届くようにする場合、
+本プロジェクトでは **AWS API Gateway + Lambda + SQS** のサーバーレスパイプ
+を採用する。`src/aws_bridge.py` が SQS を long-poll して応答を返す。
 
-### A. Cloudflare Tunnel (推奨)
+- インフラ定義: [infra/aws/](./infra/aws/) (Terraform)
+- 公開 URL: `terraform apply` 出力の `mcp_endpoint`
+- 詳細フロー: [docs/EVOLUTION.md](./docs/EVOLUTION.md) Phase 3 参照
 
-```powershell
-winget install Cloudflare.cloudflared
-cloudflared tunnel --url http://127.0.0.1:17600
-```
+**採用しない方式** (過去の選択肢、今は使わない):
+- ~~Cloudflare Quick Tunnel (`trycloudflare.com` ランダム URL)~~ — 管理
+  API 全体が公開されてしまうため、v0.5 で AWS 経由に切替。
+- ~~Tailscale funnel~~ — 便利だがチーム拡張時に個別招待運用が重い。
 
-出力に `https://<ランダム>.trycloudflare.com` が表示される → これが公開 URL。
-
-恒久運用するなら `cloudflared tunnel create winserverrag` + Named Tunnel 手順を Cloudflare ダッシュボードで実施。
-
-### B. Tailscale (社内・家庭内限定)
-
-```powershell
-winget install Tailscale.Tailscale
-tailscale up
-tailscale funnel 17600
-```
-
-Tailnet 配下からのみアクセス可。`https://<machine-name>.<tailnet>.ts.net/mcp`
+AWS を使わず LAN / 社内限定で公開したい場合は、Tailscale などの
+別 VPN 経由を自分で構成する。その場合も **管理 API (port 17600) を直接
+公開しない** こと (Basic Auth は MCP だけに掛かっている)。
 
 ### C. ngrok (お試し)
 

@@ -67,7 +67,7 @@
             <th>ON</th>
             <th>名前</th>
             <th>状態</th>
-            <th>ファイル</th>
+            <th>ファイル<br><span class="muted">ビルド済/総数</span></th>
             <th>チャンク</th>
             <th>最終同期</th>
             <th>最終ビルド</th>
@@ -87,9 +87,9 @@
     <section class="tab-pane" data-tab="mcp">
       <h2>MCP ログインユーザー</h2>
       <p class="muted">
-        Claude Cowork から MCP に接続する際の認証情報。初期値:
-        <code>tobisako</code> / <code>izumi</code>（PW: <code>admin</code>）。
-        運用時は必ず PW を変更。
+        Claude Cowork から MCP に接続する際の認証情報。初回 seed は
+        環境変数 <code>WINSERVERRAG_SEED_USERS="user1:pw1,user2:pw2"</code>
+        で、以降の追加・PW 変更はこの画面から行う。20 文字以上のランダム推奨。
       </p>
       <table id="mcp-users-table">
         <thead>
@@ -119,7 +119,7 @@
             <th>検索<br>対象</th>
             <th>名前</th>
             <th>ビルド状態</th>
-            <th>ファイル</th>
+            <th>ファイル<br><span class="muted">ビルド済/総数</span></th>
             <th>チャンク</th>
             <th>最終ビルド</th>
           </tr>
