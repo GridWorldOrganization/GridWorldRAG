@@ -568,8 +568,17 @@ def cleanup_zombies(conn: psycopg.Connection, stale_after_sec: int = 90) -> dict
     1) daemon_workers rows with no heartbeat in `stale_after_sec` are deleted
        — they represent workers whose process/thread died without cleanup.
     2) fd_registry rows stuck in 'building' or 'syncing' with no live worker
-       currently working on them are reset to 'idle', so the next sweep
-       re-enqueues them and the work actually restarts.
+       currently working on them AND no recent write to their own per-FD
+       schema are reset to 'idle', so the next sweep re-enqueues them and
+       the work actually restarts.
+
+    The schema-write guard is important under file-level parallelism: when
+    4 workers share a queue across multiple drives, a given drive can have
+    no matching worker.drive_id heartbeat for 60+ sec even though its
+    files are being processed — the workers just happen to be on other
+    drives right now. Without this guard, we reset state to 'idle', the
+    completion-detection path never fires, and commit_build never runs —
+    leaving the schema full of data but fd_registry showing 0/N.
 
     Returns: {"workers_removed": [...], "drives_reset": [...]}
     """
@@ -586,22 +595,71 @@ def cleanup_zombies(conn: psycopg.Connection, stale_after_sec: int = 90) -> dict
         )
         removed_workers = [r["worker_id"] for r in cur.fetchall()]
 
+        # Phase 1: find candidate drives — state=building/syncing with no
+        # matching worker heartbeat. These are the "might be stuck" set.
         cur.execute(
             """
-            UPDATE public.fd_registry f
-               SET state='idle',
-                   updated_at=NOW()
-             WHERE state IN ('building','syncing')
+            SELECT f.drive_id
+              FROM public.fd_registry f
+             WHERE f.state IN ('building','syncing')
                AND NOT EXISTS (
                  SELECT 1 FROM public.daemon_workers w
                   WHERE w.drive_id = f.drive_id
                     AND w.heartbeat_at > NOW() - INTERVAL '60 seconds'
                     AND w.state IN ('claiming','listing','building','syncing')
                )
-            RETURNING drive_id
             """
         )
-        reset_drives = [r["drive_id"] for r in cur.fetchall()]
+        candidates = [r["drive_id"] for r in cur.fetchall()]
+
+        # Phase 2: for each candidate, check whether the per-FD schema has
+        # received a new document row in the last 120 seconds. Recent
+        # writes prove that some worker *is* processing this drive right
+        # now, just not one whose current heartbeat drive_id matches.
+        still_alive: set[str] = set()
+        for did in candidates:
+            schema = schema_for_drive(did)
+            # Safely skip if the schema hasn't been created yet.
+            cur.execute(
+                "SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname=%s",
+                (schema,),
+            )
+            if not cur.fetchone():
+                continue
+            try:
+                cur.execute(
+                    f"SELECT MAX(created_at) AS last_write FROM {_quote_ident(schema)}.documents"
+                )
+                row = cur.fetchone()
+            except Exception:
+                conn.rollback()
+                continue
+            last_write = row and row.get("last_write")
+            if last_write is None:
+                continue
+            # 120 sec is enough to cover one slow PDF / big sheet. If the
+            # schema has seen a row this recently, don't reset.
+            cur.execute(
+                "SELECT (NOW() - %s) < INTERVAL '120 seconds' AS recent",
+                (last_write,),
+            )
+            if cur.fetchone()["recent"]:
+                still_alive.add(did)
+
+        # Phase 3: reset the candidates that don't have recent writes.
+        to_reset = [did for did in candidates if did not in still_alive]
+        if to_reset:
+            cur.execute(
+                """
+                UPDATE public.fd_registry
+                   SET state='idle',
+                       updated_at=NOW()
+                 WHERE drive_id = ANY(%s)
+                RETURNING drive_id
+                """,
+                (to_reset,),
+            )
+            reset_drives = [r["drive_id"] for r in cur.fetchall()]
     conn.commit()
     return {"workers_removed": removed_workers, "drives_reset": reset_drives}
 
