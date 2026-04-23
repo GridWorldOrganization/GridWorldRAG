@@ -22,3 +22,18 @@ variable "basic_pass" {
   type      = string
   sensitive = true
 }
+
+# Multi-user credentials. Preferred way to configure auth: supply a map
+# of {username -> password} so the Lambda can authenticate any matched
+# pair and forward the username to the daemon's per-user scope. When
+# set, takes precedence over the legacy basic_user / basic_pass pair.
+# Example in terraform.tfvars:
+#   basic_users = {
+#     tobisako = "..."
+#     tobi2    = "..."
+#   }
+variable "basic_users" {
+  type      = map(string)
+  default   = {}
+  sensitive = true
+}

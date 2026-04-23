@@ -3,8 +3,13 @@
 Stateless. Uses env vars:
   REQ_QUEUE_URL    SQS queue URL
   RESP_TABLE_NAME  DynamoDB table name
-  BASIC_USER       HTTP Basic Auth username
-  BASIC_PASS       HTTP Basic Auth password
+  BASIC_USERS      "user1:pw1,user2:pw2,..." — MCP accounts this Lambda
+                   accepts. Any matched username is forwarded to the
+                   Akasaka bridge so the daemon's per-user scope kicks
+                   in. Falls back to BASIC_USER/BASIC_PASS (legacy
+                   single-user mode) when BASIC_USERS is not set.
+  BASIC_USER       Legacy single-user username (used if BASIC_USERS empty)
+  BASIC_PASS       Legacy single-user password
   POLL_INTERVAL_MS DynamoDB poll interval in ms (default 200)
   MAX_WAIT_SEC     Max wait for response (default 55)
 """
@@ -22,12 +27,39 @@ sqs = boto3.client("sqs")
 ddb = boto3.resource("dynamodb").Table(os.environ["RESP_TABLE_NAME"])
 
 REQ_QUEUE_URL = os.environ["REQ_QUEUE_URL"]
-BASIC_USER = os.environ["BASIC_USER"]
-BASIC_PASS = os.environ["BASIC_PASS"]
 POLL_INTERVAL_S = int(os.environ.get("POLL_INTERVAL_MS", "200")) / 1000.0
 MAX_WAIT_SEC = int(os.environ.get("MAX_WAIT_SEC", "55"))
 
-EXPECTED_AUTH = "Basic " + base64.b64encode(f"{BASIC_USER}:{BASIC_PASS}".encode()).decode()
+
+def _build_auth_map() -> dict[str, str]:
+    """Parse BASIC_USERS into {expected_auth_header_value: username}. We
+    index by full header value ("Basic <base64>") so the comparison stays
+    constant-time-ish and no password ever leaves this map."""
+    raw = os.environ.get("BASIC_USERS", "").strip()
+    pairs: list[tuple[str, str]] = []
+    if raw:
+        for item in raw.split(","):
+            item = item.strip()
+            if not item or ":" not in item:
+                continue
+            u, _, p = item.partition(":")
+            u, p = u.strip(), p.strip()
+            if u and p:
+                pairs.append((u, p))
+    else:
+        u = os.environ.get("BASIC_USER", "").strip()
+        p = os.environ.get("BASIC_PASS", "").strip()
+        if u and p:
+            pairs.append((u, p))
+
+    out: dict[str, str] = {}
+    for u, p in pairs:
+        header = "Basic " + base64.b64encode(f"{u}:{p}".encode()).decode()
+        out[header] = u
+    return out
+
+
+AUTH_MAP = _build_auth_map()
 
 
 def _unauthorized():
@@ -68,9 +100,12 @@ def handler(event, _context):
     if method != "POST":
         return _json_response(405, {"error": "method_not_allowed"})
 
-    # Basic Auth
+    # Basic Auth — multiple credentials allowed. Match the incoming header
+    # against the precomputed map and remember which MCP user it
+    # represents so the daemon can apply their per-user scope.
     auth = headers.get("authorization", "")
-    if auth != EXPECTED_AUTH:
+    username = AUTH_MAP.get(auth)
+    if not username:
         return _unauthorized()
 
     # Body
@@ -89,12 +124,12 @@ def handler(event, _context):
 
     # Notifications (no id) — ack and drop
     if rpc_id is None:
-        # Fire-and-forget: enqueue anyway so Akasaka sees the notification
         try:
             sqs.send_message(
                 QueueUrl=REQ_QUEUE_URL,
                 MessageBody=json.dumps({
                     "msg_id": str(uuid.uuid4()),
+                    "username": username,
                     "method": rpc_method,
                     "params": rpc_params,
                     "notification": True,
@@ -110,6 +145,7 @@ def handler(event, _context):
         MessageBody=json.dumps({
             "msg_id": msg_id,
             "rpc_id": rpc_id,
+            "username": username,
             "method": rpc_method,
             "params": rpc_params,
         }),

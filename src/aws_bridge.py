@@ -120,8 +120,12 @@ def _build_response(rpc_id: Any, result: dict | None = None, error: dict | None 
     return resp
 
 
-def _dispatch(method: str, params: dict, rpc_id: Any) -> dict:
-    """Return a full JSON-RPC envelope for the given MCP call."""
+def _dispatch(method: str, params: dict, rpc_id: Any,
+              username: str | None = None) -> dict:
+    """Return a full JSON-RPC envelope for the given MCP call.
+    `username` is the authenticated MCP user as forwarded by the Lambda;
+    used to set _current_user so the daemon's per-user scope kicks in.
+    """
     if method == "initialize":
         return _build_response(rpc_id, {
             "protocolVersion": params.get("protocolVersion", "2025-03-26"),
@@ -152,8 +156,13 @@ def _dispatch(method: str, params: dict, rpc_id: Any) -> dict:
             return _build_response(rpc_id, error={
                 "code": -32601, "message": f"tool_not_found: {name}",
             })
-        # Set ContextVar so the tool's _current_user.get() works.
-        token = mcp_server._current_user.set("tobisako")
+        # Set ContextVar so the tool's _current_user.get() works. The
+        # username is propagated by the Lambda from the Basic Auth
+        # header match; if for some reason it's missing (legacy Lambda
+        # running old code), fall back to "tobisako" so we don't 500
+        # on null.
+        effective_user = username or "tobisako"
+        token = mcp_server._current_user.set(effective_user)
         try:
             t0 = time.time()
             data = tool["fn"](**args)
@@ -212,12 +221,13 @@ def main():
             rpc_id = body.get("rpc_id")
             method = body.get("method")
             params = body.get("params") or {}
+            username = body.get("username")  # set by Lambda post-auth
             is_notif = bool(body.get("notification"))
 
-            log.info(f"recv msg_id={msg_id} method={method} notif={is_notif}")
+            log.info(f"recv msg_id={msg_id} user={username} method={method} notif={is_notif}")
 
             try:
-                envelope = _dispatch(method, params, rpc_id)
+                envelope = _dispatch(method, params, rpc_id, username=username)
             except Exception:
                 log.exception("dispatch crashed")
                 envelope = _build_response(rpc_id, error={

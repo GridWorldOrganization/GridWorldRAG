@@ -118,8 +118,14 @@ resource "aws_lambda_function" "mcp_handler" {
     variables = {
       REQ_QUEUE_URL   = aws_sqs_queue.requests.url
       RESP_TABLE_NAME = aws_dynamodb_table.responses.name
+      # Single-user legacy pair (kept for rollback compatibility when
+      # basic_users is not supplied).
       BASIC_USER      = var.basic_user
       BASIC_PASS      = var.basic_pass
+      # Multi-user list consumed by mcp_handler._build_auth_map.
+      # Format: "user1:pw1,user2:pw2". Empty string disables multi-user
+      # mode and falls back to BASIC_USER/BASIC_PASS.
+      BASIC_USERS     = join(",", [for u, p in var.basic_users : "${u}:${p}"])
       POLL_INTERVAL_MS = "200"
       MAX_WAIT_SEC    = "28"
     }
