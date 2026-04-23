@@ -236,6 +236,27 @@ window.addEventListener("DOMContentLoaded", async () => {
   try { API = await window.winsrv.getApiUrl(); } catch {}
   $("api-url").textContent = API.replace(/^https?:\/\//, "");
   $("open-btn").addEventListener("click", () => window.winsrv.openWebUi());
+
+  // Always-on-top checkbox: reflects current BrowserWindow state on load,
+  // flips it via IPC on change. Uses localStorage as an extra memory so the
+  // user's preference survives an Electron restart even before main.js
+  // asks for the persisted value.
+  const aot = $("aot-toggle");
+  if (aot) {
+    try {
+      const current = await window.winsrv.getAlwaysOnTop();
+      const saved = localStorage.getItem("aot");
+      // If we have a saved user preference, honor it over the window default.
+      const desired = saved === null ? !!current : saved === "1";
+      aot.checked = desired;
+      if (desired !== current) window.winsrv.setAlwaysOnTop(desired);
+    } catch {}
+    aot.addEventListener("change", () => {
+      window.winsrv.setAlwaysOnTop(aot.checked);
+      try { localStorage.setItem("aot", aot.checked ? "1" : "0"); } catch {}
+    });
+  }
+
   tick();
   setInterval(tick, 250);
 });

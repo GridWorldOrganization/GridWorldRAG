@@ -54,3 +54,11 @@ ipcMain.on("open-web-ui", () => {
 
 // IPC: give the renderer the API URL so it can fetch /api/stats, /api/workers.
 ipcMain.handle("get-api-url", () => API_URL);
+
+// IPC: toggle always-on-top for the mini window.
+ipcMain.handle("get-always-on-top", () => {
+  return win ? win.isAlwaysOnTop() : false;
+});
+ipcMain.on("set-always-on-top", (_evt, on) => {
+  if (win) win.setAlwaysOnTop(!!on);
+});
