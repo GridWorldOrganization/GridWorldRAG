@@ -434,12 +434,48 @@ function confirmRebuild(name) {
 // --- MCP global search scope ---
 let _lastScopeHash = null;
 
+// Which MCP user is currently being configured. null = no user picked yet,
+// so the scope table stays hidden and a "pick a user" placeholder shows.
+let _selectedMcpUser = null;
+try {
+  _selectedMcpUser = localStorage.getItem("mcp_selected_user");
+} catch {}
+
+function setSelectedMcpUser(username) {
+  _selectedMcpUser = username || null;
+  try {
+    if (username) localStorage.setItem("mcp_selected_user", username);
+    else          localStorage.removeItem("mcp_selected_user");
+  } catch {}
+  _lastScopeHash = null;
+  // Re-render the user table to flip the .selected highlight and then
+  // the scope table for the new user.
+  refreshMcpUsers().catch(() => {});
+  refreshMcpScope().catch(() => {});
+}
+
 const refreshMcpScope = withInflight(async function _refreshMcpScopeImpl() {
   const tbody = $("#mcp-scope-body");
-  if (!tbody) return;
+  const table = $("#mcp-scope-table");
+  const noUser = $("#scope-no-user");
+  const userLabel = $("#scope-user-label");
+  if (!tbody || !table) return;
+
+  if (!_selectedMcpUser) {
+    table.style.display = "none";
+    if (noUser) noUser.style.display = "";
+    if (userLabel) userLabel.textContent = "";
+    return;
+  }
+  table.style.display = "";
+  if (noUser) noUser.style.display = "none";
+  if (userLabel) userLabel.textContent = `— 対象: ${_selectedMcpUser}`;
+
   let rows;
   try {
-    rows = await getJSON(`/api/fds`);
+    rows = await getJSON(
+      `/api/mcp/users/${encodeURIComponent(_selectedMcpUser)}/scope`,
+    );
   } catch (e) {
     console.error("refreshMcpScope failed:", e);
     tbody.innerHTML = `<tr><td colspan="6" class="empty">取得失敗: ${escapeHtml(e.message)}</td></tr>`;
@@ -450,24 +486,29 @@ const refreshMcpScope = withInflight(async function _refreshMcpScopeImpl() {
     tbody.innerHTML = `<tr><td colspan="6" class="empty">ドライブが未登録</td></tr>`;
     return;
   }
-  const h = hashOf(rows);
+  const h = hashOf({ user: _selectedMcpUser, rows });
   if (h === _lastScopeHash) return;
   _lastScopeHash = h;
   tbody.innerHTML = rows.map((r) => {
-    const state = (r.state || "idle").toLowerCase();
+    const state = (r.build_state || "idle").toLowerCase();
     const built = r.last_build_at != null || (r.chunk_count ?? 0) > 0;
     const hint = built ? "" : "（未ビルド）";
-    const cls = r.search_enabled ? "search-on" : "";
+    const cls = r.enabled ? "search-on" : "";
+    // Map API row shape to fmtFileCount's expectations.
+    const countRow = {
+      file_count: r.file_count,
+      file_count_estimate: r.file_count_estimate,
+    };
     return `
       <tr class="row-search ${cls}" tabindex="0"
-          data-id="${escapeHtml(r.drive_id)}" data-search="${r.search_enabled ? 1 : 0}">
-        <td class="col-toggle"><input type="checkbox" class="toggle search-toggle" ${r.search_enabled ? "checked" : ""} aria-label="検索スコープ ON/OFF"></td>
+          data-id="${escapeHtml(r.drive_id)}" data-search="${r.enabled ? 1 : 0}">
+        <td class="col-toggle"><input type="checkbox" class="toggle search-toggle" ${r.enabled ? "checked" : ""} aria-label="検索スコープ ON/OFF"></td>
         <td title="${escapeHtml(r.drive_id)}">
           ${escapeHtml(r.name || "(no name)")}
           ${hint ? `<span class="muted small"> ${hint}</span>` : ""}
         </td>
         <td><span class="state ${state}">${state}</span></td>
-        <td>${fmtFileCount(r)}</td>
+        <td>${fmtFileCount(countRow)}</td>
         <td>${(Number(r.chunk_count) || 0).toLocaleString()}</td>
         <td>${fmtTs(r.last_build_at)}</td>
       </tr>
@@ -503,8 +544,12 @@ function attachScopeHandlers() {
 }
 
 async function toggleScope(driveId, on) {
+  if (!_selectedMcpUser) return;
   try {
-    await postJSON(`/api/fds/${encodeURIComponent(driveId)}/${on ? "search-enable" : "search-disable"}`);
+    await postJSON(
+      `/api/mcp/users/${encodeURIComponent(_selectedMcpUser)}/scope/${encodeURIComponent(driveId)}`,
+      { enabled: !!on },
+    );
   } catch (e) {
     console.error("toggleScope failed:", e);
     alert(`失敗: ${e.message}`);
@@ -595,11 +640,21 @@ const refreshMcpUsers = withInflight(async function _refreshMcpUsersImpl() {
     _lastUsersHash = null;
     return;
   }
-  const h = hashOf(users);
+  // Include the selected user in the render hash so switching selection
+  // flips the .selected highlight even when the underlying user list
+  // hasn't changed.
+  const h = hashOf({ users, sel: _selectedMcpUser });
   if (h === _lastUsersHash) return;
   _lastUsersHash = h;
-  tbody.innerHTML = users.map((u) => `
-    <tr data-username="${escapeHtml(u.username)}">
+  // If the previously selected user was deleted, clear the selection.
+  if (_selectedMcpUser && !users.some((u) => u.username === _selectedMcpUser)) {
+    _selectedMcpUser = null;
+    try { localStorage.removeItem("mcp_selected_user"); } catch {}
+  }
+  tbody.innerHTML = users.map((u) => {
+    const sel = u.username === _selectedMcpUser ? " selected" : "";
+    return `
+    <tr class="row-user${sel}" data-username="${escapeHtml(u.username)}" tabindex="0">
       <td><strong>${escapeHtml(u.username)}</strong></td>
       <td>${fmtTs(u.created_at)}</td>
       <td>${fmtTs(u.updated_at)}</td>
@@ -608,13 +663,30 @@ const refreshMcpUsers = withInflight(async function _refreshMcpUsersImpl() {
         <button data-action="delete-user" class="danger">削除</button>
       </td>
     </tr>
-  `).join("");
+    `;
+  }).join("");
   attachUserRowHandlers();
+  // Scope table depends on selection; keep it in sync.
+  refreshMcpScope().catch(() => {});
 });
 
 function attachUserRowHandlers() {
-  $$("#mcp-users-body tr[data-username]").forEach((tr) => {
+  $$("#mcp-users-body tr.row-user").forEach((tr) => {
     const username = tr.getAttribute("data-username");
+    // Row click (but not on the action buttons) picks this user for
+    // the scope table below.
+    tr.addEventListener("click", (ev) => {
+      if (ev.target.closest(".actions")) return;
+      if (ev.target.closest("button")) return;
+      setSelectedMcpUser(username);
+    });
+    tr.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" || ev.key === " ") {
+        if (ev.target.closest(".actions")) return;
+        ev.preventDefault();
+        setSelectedMcpUser(username);
+      }
+    });
     tr.querySelectorAll("[data-action]").forEach((btn) => {
       btn.addEventListener("click", async (ev) => {
         ev.stopPropagation();

@@ -156,14 +156,19 @@ def _logged_tool(tool_name: str):
 
 
 def _allowed_schemas(conn) -> list[tuple[str, str]]:
-    """Resolve (drive_id, drive_name) pairs currently in MCP search scope.
+    """Resolve (drive_id, drive_name) pairs the caller is allowed to search.
 
-    As of v0.3 the scope is GLOBAL (fd_registry.search_enabled) — all
-    authenticated MCP users share the same set. The per-user matrix was
-    removed because the complexity didn't earn its keep for a small
-    deployment.
+    As of v0.6.2 the scope is PER-USER again. Each MCP user (basic-auth
+    username) has their own row set in public.mcp_user_drives, and the
+    search / list_drives tools filter by _current_user. An authenticated
+    user with no rows in mcp_user_drives sees an empty scope — they can
+    still call the tools, they just get no results until the admin adds
+    drives on the Windows monitor's MCP tab.
     """
-    return db.search_enabled_schemas(conn)
+    username = _current_user.get()
+    if not username:
+        return []
+    return db.search_enabled_schemas_for_user(conn, username)
 
 
 @mcp.tool()

@@ -108,12 +108,15 @@
         <button id="btn-add-mcp-user">+ ユーザー追加</button>
       </div>
 
-      <h2 style="margin-top: 32px">MCP 検索スコープ</h2>
+      <h2 style="margin-top: 32px">MCP 検索スコープ <span class="muted small" id="scope-user-label"></span></h2>
       <p class="muted">
-        MCP 経由で検索可能なドライブ。全 MCP ユーザー共通。
-        行クリックで ON/OFF（ビルド未完のドライブも有効化可、検索は空振り）。
+        まず上の表から対象ユーザーを選び、そのユーザー専用の検索対象ドライブを
+        行クリックで ON/OFF。ユーザーごとに独立したスコープを持つ。
       </p>
-      <table id="mcp-scope-table">
+      <div id="scope-no-user" class="muted" style="padding: 24px; text-align: center; border: 1px dashed var(--border); border-radius: 6px;">
+        上の MCP ログインユーザー表で行をクリックしてユーザーを選択してください
+      </div>
+      <table id="mcp-scope-table" style="display: none">
         <thead>
           <tr>
             <th>検索<br>対象</th>

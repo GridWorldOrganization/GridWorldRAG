@@ -728,9 +728,87 @@ def get_mcp_user_hash(conn: psycopg.Connection, username: str) -> Optional[str]:
         return r["password_hash"] if r else None
 
 
-# Per-user drive matrix removed in v0.3 — search_enabled is global. The
-# public.mcp_user_drives table remains in the DB (idempotent IF NOT EXISTS)
-# but no code reads it anymore; left for future reinstatement.
+# Per-user drive matrix (v0.6.2 reinstatement). Each MCP user has their own
+# set of drives visible via search / list_drives. `fd_registry.search_enabled`
+# remains as a legacy flag but is no longer consulted by the MCP tools.
+
+
+def user_scope(conn: psycopg.Connection, username: str) -> list[dict]:
+    """Return every registered drive along with an `enabled` flag for the
+    given user, merging fd_registry with mcp_user_drives. Used by the Web
+    UI to render the per-user scope table."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT f.drive_id,
+                   f.name,
+                   f.file_count,
+                   f.chunk_count,
+                   f.file_count_estimate,
+                   f.last_build_at,
+                   f.state AS build_state,
+                   (ud.username IS NOT NULL) AS enabled
+              FROM public.fd_registry f
+              LEFT JOIN public.mcp_user_drives ud
+                     ON ud.drive_id = f.drive_id
+                    AND ud.username = %s
+             ORDER BY f.name
+            """,
+            (username,),
+        )
+        return cur.fetchall()
+
+
+def set_user_drive(conn: psycopg.Connection, username: str,
+                   drive_id: str, enabled: bool) -> None:
+    """Add or remove a (username, drive_id) row in mcp_user_drives."""
+    with conn.cursor() as cur:
+        if enabled:
+            cur.execute(
+                """
+                INSERT INTO public.mcp_user_drives (username, drive_id)
+                VALUES (%s, %s)
+                ON CONFLICT (username, drive_id) DO NOTHING
+                """,
+                (username, drive_id),
+            )
+        else:
+            cur.execute(
+                "DELETE FROM public.mcp_user_drives WHERE username=%s AND drive_id=%s",
+                (username, drive_id),
+            )
+    conn.commit()
+
+
+def search_enabled_schemas_for_user(
+    conn: psycopg.Connection, username: str,
+) -> list[tuple[str, str]]:
+    """Same shape as search_enabled_schemas() but scoped to one MCP user.
+    Returns (drive_id, drive_name) pairs the user is allowed to search.
+    Only yields drives whose per-FD schema actually exists, so queries
+    don't blow up on a drive that was added but never built."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT f.drive_id, f.name
+              FROM public.mcp_user_drives ud
+              JOIN public.fd_registry f ON f.drive_id = ud.drive_id
+             WHERE ud.username = %s
+             ORDER BY f.name
+            """,
+            (username,),
+        )
+        rows = cur.fetchall()
+        result: list[tuple[str, str]] = []
+        for r in rows:
+            schema = schema_for_drive(r["drive_id"])
+            cur.execute(
+                "SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname=%s",
+                (schema,),
+            )
+            if cur.fetchone():
+                result.append((r["drive_id"], r["name"]))
+        return result
 
 
 def seed_default_mcp_users(conn: psycopg.Connection) -> list[str]:

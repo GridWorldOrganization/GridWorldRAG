@@ -441,7 +441,46 @@ def api_delete_mcp_user(username: str):
     return {"ok": True, "username": username}
 
 
-# (per-user drive matrix removed in v0.3 — search_enabled is global now)
+# ---------------------------------------------------------------------
+# Per-user MCP search scope (reinstated v0.6.2)
+# ---------------------------------------------------------------------
+@app.get("/api/mcp/users/{username}/scope",
+         dependencies=[Depends(require_token)])
+def api_list_user_scope(username: str):
+    """Return every registered drive along with whether the given user
+    currently has it in scope. Used by the Web UI to render per-user
+    drive toggles."""
+    _validate_username(username)
+    conn = db.connect()
+    try:
+        if db.get_mcp_user_hash(conn, username) is None:
+            raise HTTPException(status_code=404, detail="unknown user")
+        return db.user_scope(conn, username)
+    finally:
+        conn.close()
+
+
+class UserScopeTogglePayload(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/mcp/users/{username}/scope/{drive_id}",
+          dependencies=[Depends(require_token)])
+def api_set_user_scope(username: str, drive_id: str,
+                        payload: UserScopeTogglePayload):
+    """Enable/disable a single drive in the given user's MCP scope."""
+    _validate_username(username)
+    conn = db.connect()
+    try:
+        if db.get_mcp_user_hash(conn, username) is None:
+            raise HTTPException(status_code=404, detail="unknown user")
+        if not db.get_fd(conn, drive_id):
+            raise HTTPException(status_code=404, detail="unknown drive_id")
+        db.set_user_drive(conn, username, drive_id, payload.enabled)
+    finally:
+        conn.close()
+    return {"ok": True, "username": username, "drive_id": drive_id,
+            "enabled": payload.enabled}
 
 
 @app.get("/api/eval", dependencies=[Depends(require_token)])

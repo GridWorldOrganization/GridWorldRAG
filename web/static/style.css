@@ -324,6 +324,13 @@ code {
 /* MCP user row — clickable to show detail */
 tbody tr.row-user { cursor: pointer; transition: background 0.1s; }
 tbody tr.row-user:hover { background: #1a1f2e; }
+tbody tr.row-user.selected {
+  background: #14243d;
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+tbody tr.row-user.selected:hover { background: #19294a; }
+/* Per-user drive scope row — green edge when the drive is in scope */
+tbody tr.row-search.search-on { box-shadow: inset 3px 0 0 var(--ok); }
 
 /* MCP user detail — per-user drive scope */
 .detail-header { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
