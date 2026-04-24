@@ -1,0 +1,35 @@
+# GridWorldRAG コード所有者
+# フォーマット: https://docs.github.com/en/repositories/managing-your-repositories-settings-and-features/customizing-your-repository/about-code-owners
+#
+# PR 作成時に自動的にレビュワーが割り当てられる。
+# パスパターンの下側が優先される（後ろ勝ち）。
+
+# デフォルト所有者
+*                               @tobisako
+
+# コア実装
+/src/                           @tobisako
+/build_parallel.py              @tobisako
+/sync_rotate.py                 @tobisako
+/gridworld-rag-mcp/             @tobisako
+
+# スキーマ・DB 関連（特に注意深くレビュー）
+/schema.sql                     @tobisako
+/src/db.py                      @tobisako
+
+# OS 統合
+/launchd/                       @tobisako
+/scheduler/                     @tobisako
+
+# ドキュメント
+/docs/                          @tobisako
+/README.md                      @tobisako
+/CHANGELOG.md                   @tobisako
+/CONTRIBUTING.md                @tobisako
+/SECURITY.md                    @tobisako
+
+# CI / ワークフロー
+/.github/                       @tobisako
+
+# テスト
+/tests/                         @tobisako

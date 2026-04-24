@@ -1,6 +1,49 @@
+<div align="center">
+
 # GridWorldRAG
 
+**Google Drive × pgvector × MCP — Claude Code 向けセマンティック検索バックエンド**
+
+[![CI](https://github.com/GridWorldOrganization/GridWorldRAG/actions/workflows/lint.yml/badge.svg)](https://github.com/GridWorldOrganization/GridWorldRAG/actions/workflows/lint.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-blue.svg)](https://www.python.org/downloads/)
+[![PostgreSQL 17](https://img.shields.io/badge/PostgreSQL-17-336791.svg)](https://www.postgresql.org/)
+[![pgvector 0.8+](https://img.shields.io/badge/pgvector-0.8%2B-4B8BBE.svg)](https://github.com/pgvector/pgvector)
+[![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Windows%20WSL2%20%7C%20Linux-lightgrey.svg)](#対応-os)
+[![Last Commit](https://img.shields.io/github/last-commit/GridWorldOrganization/GridWorldRAG.svg)](https://github.com/GridWorldOrganization/GridWorldRAG/commits/master)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](./CONTRIBUTING.md)
+
+</div>
+
 Google Drive のドキュメントを PostgreSQL + pgvector にインデックスし、Claude Code から MCP 経由でセマンティック検索するための RAG システム。
+
+<details>
+<summary><b>📖 目次（クリックで展開）</b></summary>
+
+- [類似プロジェクトとの比較](#類似プロジェクトとの比較)
+- [デモ](#デモ)
+- [必要な環境](#必要な環境)
+  - [対応 OS](#対応-os)
+  - [共通コンポーネント](#共通コンポーネント)
+- [セットアップ](#セットアップ)
+- [プロジェクト構成](#プロジェクト構成)
+- [モジュール構成](#モジュール構成)
+- [技術スタック](#技術スタック)
+- [ファイル種別ごとの対応状況](#ファイル種別ごとの対応状況)
+- [PostgreSQL データディレクトリの確認](#postgresql-データディレクトリの確認)
+- [別マシンへの DB 転送](#別マシンへのdb転送)
+- [差分同期の自動化](#差分同期の自動化)
+  - [Mac 版（launchd）](#mac-版launchdの詳細)
+  - [Windows 版（Task Scheduler + WSL2）](#windows-版task-scheduler--wsl2の詳細)
+- [テスト](#テスト)
+- [ドキュメント](#ドキュメント)
+- [コントリビューション](#コントリビューション)
+- [セキュリティ](#セキュリティ)
+- [ロードマップ](#ロードマップ)
+- [謝辞](#謝辞)
+- [ライセンス](#ライセンス)
+
+</details>
 
 ## 類似プロジェクトとの比較
 
@@ -19,17 +62,91 @@ Google Drive + pgvector の RAG システムを目指した公開リポジトリ
 - **pgvector + FastMCP の組み合わせ**（Claude Code から直接検索可能）
 - **権限を JSONB で chunk 単位に保持**（ファイル単位ではなく細粒度の権限管理）
 
+## デモ
+
+### リアルタイムモニター（`./run_build.sh` 実行中）
+
+<!-- docs/images/monitor.gif を配置後、下記コメントを解除 -->
+<!-- ![Monitor demo](./docs/images/monitor.gif) -->
+
+```
+==================== GridWorldRAG Build Monitor ====================
+ Drives: 22     Workers: 8     Tasks: 28/28    Elapsed: 12:34
+
+ W1  GW_LIB_過去PJ実績(1/7)  ████████░░░░░░░░  48%  running
+ W2  GW_PJ(2/3)              ██████░░░░░░░░░░  37%  running
+ W3  GW_マーケティング        完了 (52 ファイル)            done
+ W4  GW_営業                  ████░░░░░░░░░░░░  25%(レート制限待ち)
+ ...
+
+ 処理済み: 12,340   スキップ: 34,002   エラー: 3   チャンク: 95,128
+=====================================================================
+```
+
+### Claude Code からの検索例
+
+<!-- docs/images/mcp_search.png を配置後、下記コメントを解除 -->
+<!-- ![MCP search demo](./docs/images/mcp_search.png) -->
+
+```
+User: 2026年の採用計画の最新資料を教えて
+
+Claude: [MCP: gridworld-rag-mcp.search 実行]
+検索結果:
+1. 2026採用計画_v3.gdoc
+   (更新: 2026-04-15, オーナー: hr@gridworld.co)
+   内容: 2026年度の採用目標は...
+
+2. [シート: エンジニア職] 2026_採用進捗.gsheet
+   (更新: 2026-04-20)
+   内容: エンジニア採用は現在...
+
+3. 採用戦略レビュー議事録_2026Q2.gdoc
+   ...
+```
+
+### 30 秒で試せるクエリ例（MCP 接続後）
+
+```
+# セマンティック検索
+/mcp gridworld-rag-mcp search "今四半期の売上目標"
+
+# URL から直接ルックアップ
+/mcp gridworld-rag-mcp lookup "https://docs.google.com/spreadsheets/d/.../edit?gid=123"
+
+# フォルダツリー再構築
+/mcp gridworld-rag-mcp folder_tree
+
+# 直近の差分同期結果
+/mcp gridworld-rag-mcp recent_changes
+
+# DB 統計
+/mcp gridworld-rag-mcp stats
+```
+
 ## 必要な環境
 
-| コンポーネント | バージョン | インストール |
-|---|---|---|
-| macOS | Apple Silicon (M1/M2) | - |
-| Homebrew (ARM) | `/opt/homebrew` | [brew.sh](https://brew.sh) |
-| Python | 3.12+ | `brew install python@3.12` |
-| PostgreSQL | 17+ | `brew install postgresql@17` |
-| pgvector | 0.8+ | `brew install pgvector` |
+### 対応 OS
 
-> **重要**: Apple Silicon Mac では必ず ARM 版 Homebrew (`/opt/homebrew`) を使用してください。Intel 版 (`/usr/local`) では PyTorch の最新版が利用できません。
+| OS | サポート状況 | 常駐実行 |
+|---|---|---|
+| **macOS (Apple Silicon M1/M2/M3)** | ◎ フル対応 | launchd LaunchAgent |
+| **macOS (Intel)** | △ 動作するが非推奨（PyTorch 最新が入らない） | launchd LaunchAgent |
+| **Windows 10/11** | ◎ WSL2 経由で対応（v0.2.1〜） | Windows Task Scheduler |
+| **Linux (Ubuntu 22.04+)** | ○ 動作確認済（常駐は手動 systemd 設定） | systemd（自前） |
+
+### 共通コンポーネント
+
+| コンポーネント | バージョン | Mac インストール | Windows (WSL) インストール |
+|---|---|---|---|
+| Homebrew (ARM) / apt | - | [brew.sh](https://brew.sh) | `apt-get` |
+| Python | 3.12+ | `brew install python@3.12` | `apt install python3.12` |
+| PostgreSQL | 17+ | `brew install postgresql@17` | `apt install postgresql-17` |
+| pgvector | 0.8+ | `brew install pgvector` | [build from source](https://github.com/pgvector/pgvector#installation) |
+
+> **重要 (Mac)**: Apple Silicon Mac では必ず ARM 版 Homebrew (`/opt/homebrew`) を使用してください。Intel 版 (`/usr/local`) では PyTorch の最新版が利用できません。
+>
+> **重要 (Windows)**: ネイティブ Windows では動作しません。**WSL2 (Ubuntu 22.04+) 必須**。Windows Task Scheduler から WSL 内の `run_sync_rotate.sh` を呼び出す構成です。詳細は [scheduler/windows/README.md](./scheduler/windows/README.md) 参照。
 
 ## セットアップ
 
@@ -368,9 +485,19 @@ claude mcp add gridworld-rag-mcp -- python gridworld-rag-mcp/server.py --db 0
 
 > **注意**: インポート先では `build_parallel.py` や `sync_rotate.py` は不要。MCPサーバーのみ動かせばよい。
 
-## 差分同期の自動化（Mac 版）
+## 差分同期の自動化
 
-`sync_rotate.py` は共有ドライブ単位で独立した Changes API トークンを持ち、**5分間隔の頻回実行で変更があったドライブだけ処理する**ローテーション型差分同期。launchd の LaunchAgent から定期実行する。
+`sync_rotate.py` は共有ドライブ単位で独立した Changes API トークンを持ち、**5分間隔の頻回実行で変更があったドライブだけ処理する**ローテーション型差分同期。OS ごとに以下の方法で定期実行する:
+
+| OS | 仕組み | 設定ファイル |
+|---|---|---|
+| **macOS** | launchd LaunchAgent | `launchd/co.gridworld.gridworldrag.sync.plist` |
+| **Windows (WSL2)** | Windows Task Scheduler → bat → WSL 内 sh | `scheduler/windows/*.bat` |
+| **Linux** | systemd timer（自前設定） | ユーザー定義 |
+
+> **同時運用禁止**: Mac と Windows を同じ Google OAuth クライアント + 同じ共有ドライブに対して両方動かすと、Drive Changes API のトークンが両者で交互に進み変更を取り逃す可能性あり。**どちらか一方のみ** で運用すること。
+
+### Mac 版（launchd）の詳細
 
 ### なぜローテーション型か
 
@@ -455,6 +582,38 @@ tail -f /tmp/gridworldrag_sync.err
 - **`exit 2` で毎回落ちる**: `shutil.disk_usage` がしきい値 (1GB) 未満を検出している可能性。`df -h /opt/homebrew/var/postgresql@17` で確認
 - **`retry_pending` が減らない**: 永続的にエラーを出すファイルが失敗キューに溜まっている。`recent_changes` MCP ツールで確認し、必要なら `psql -d gridworldrag_3 -c "DELETE FROM sync_state WHERE key='failed_files'"` でリセット
 
+### Windows 版（Task Scheduler + WSL2）の詳細
+
+v0.2.1 から Windows Task Scheduler 連携を同梱。WSL2 (Ubuntu 22.04+) 内で `run_sync_rotate.sh` を呼び出す薄い bat shim を Task Scheduler に登録する。
+
+```cmd
+REM 登録（管理者権限不要）
+cd scheduler\windows
+register_sync_rotate_task.bat
+
+REM 削除
+unregister_sync_rotate_task.bat
+```
+
+カスタマイズは `scheduler\windows\run_sync_rotate.bat` の先頭 3 変数（`WSL_DISTRO` / `WSL_USER` / `DB_NUM`）を編集。
+
+**Windows 側動作仕様（デフォルト）:**
+
+| 項目 | 値 |
+|---|---|
+| 間隔 | 1 分（テスト用、本番は 5 分推奨） |
+| Hidden | コンソール非表示 |
+| MultipleInstances | IgnoreNew（前回動作中なら新規起動をスキップ） |
+| ExecutionTimeLimit | 10 分 |
+| RunLevel | Limited（昇格なし） |
+| AllowStartIfOnBatteries | 有効 |
+
+**多重起動ガード（二段階）:**
+1. Windows 側: `MultipleInstances=IgnoreNew`
+2. WSL 側: `/tmp/gridworldrag_rotate.lock`（PID liveness probe, 20 分 stale fallback）
+
+詳細・運用ノートは [scheduler/windows/README.md](./scheduler/windows/README.md) 参照。
+
 ## テスト
 
 純ロジック系の単体テストを `tests/` 配下に配置（DB や Drive API のモック不要）。
@@ -509,6 +668,54 @@ git add -A && git commit -m "update: config.env" && git push
 - `credentials.json` と `token.pickle` は secrets リポに入れない（GCP で再発行・再認証で復元可能なため）
 - OSS 利用者は secrets リポを使わず、`config.env.example` をコピーして自前で設定すれば良い
 
+## ドキュメント
+
+| ドキュメント | 内容 |
+|---|---|
+| [QUICKSTART.md](./QUICKSTART.md) | 5 ステップでのセットアップ |
+| [docs/architecture.md](./docs/architecture.md) | システム全体像・Mermaid 図 |
+| [docs/technical.md](./docs/technical.md) | 詳細な処理フロー・ログ仕様・DB スキーマ |
+| [docs/vectordb.md](./docs/vectordb.md) | VectorDB 設計の背景 |
+| [docs/faq.md](./docs/faq.md) | よくある質問 |
+| [docs/benchmarks.md](./docs/benchmarks.md) | 性能実測値 |
+| [docs/troubleshooting.md](./docs/troubleshooting.md) | トラブルシュート集約 |
+| [docs/roadmap.md](./docs/roadmap.md) | 今後の予定 |
+| [docs/release.md](./docs/release.md) | リリース手順 |
+| [docs/adr/](./docs/adr/) | 技術選定の意思決定記録 |
+| [docs/mac-resident-daemon.md](./docs/mac-resident-daemon.md) | v0.3.0〜v1.0.0 アーキテクチャ計画 |
+| [CHANGELOG.md](./CHANGELOG.md) | 変更履歴 |
+| [CONTRIBUTING.md](./CONTRIBUTING.md) | コントリビューションガイド |
+| [SECURITY.md](./SECURITY.md) | 脆弱性報告の手順 |
+| [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md) | 行動規範 |
+
+## コントリビューション
+
+PR 歓迎。詳細は [CONTRIBUTING.md](./CONTRIBUTING.md) 参照。
+
+## セキュリティ
+
+脆弱性を発見した場合は公開 Issue ではなく [GitHub Security Advisory](https://github.com/GridWorldOrganization/GridWorldRAG/security/advisories/new) でプライベートに報告してください。詳細は [SECURITY.md](./SECURITY.md) 参照。
+
+## ロードマップ
+
+v0.3.0 以降は Mac 常駐デーモン + GUI + MCP 型への移行を計画しています。詳細は [docs/roadmap.md](./docs/roadmap.md) および [docs/mac-resident-daemon.md](./docs/mac-resident-daemon.md) 参照。
+
+## 謝辞
+
+本プロジェクトは以下のオープンソースに依拠しています:
+
+- [pgvector](https://github.com/pgvector/pgvector) — PostgreSQL 向けベクトル拡張
+- [sentence-transformers](https://github.com/UKPLab/sentence-transformers) — 埋め込みモデル
+- [FastMCP](https://github.com/jlowin/fastmcp) — MCP サーバーフレームワーク
+- [google-api-python-client](https://github.com/googleapis/google-api-python-client) — Google Drive API
+- [langchain-text-splitters](https://github.com/langchain-ai/langchain) — テキスト分割
+
+また、設計検討時に参考にしたプロジェクト:
+
+- [donat-konan33/google-drive-agentic-rag](https://github.com/donat-konan33/google-drive-agentic-rag) — OAuth2 認証と GoogleDriveLoader の実装
+- [taylorwilsdon/google_workspace_mcp](https://github.com/taylorwilsdon/google_workspace_mcp) — Google Workspace MCP
+- [getomnico/omni](https://github.com/getomnico/omni) — Drive + pgvector + 権限継承の Rust 実装
+
 ## ライセンス
 
-[MIT License](LICENSE)
+[MIT License](LICENSE) © 2025 GridWorld Organization

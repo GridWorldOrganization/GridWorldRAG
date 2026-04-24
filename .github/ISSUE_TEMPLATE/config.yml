@@ -1,5 +1,8 @@
 blank_issues_enabled: false
 contact_links:
-  - name: Discussion / Q&A
+  - name: 質問・議論 (Discussions)
     url: https://github.com/GridWorldOrganization/GridWorldRAG/discussions
-    about: Questions and general discussion
+    about: 使い方・設計・ベストプラクティス等の質問は Discussions へ
+  - name: セキュリティ脆弱性の報告
+    url: https://github.com/GridWorldOrganization/GridWorldRAG/security/advisories/new
+    about: 脆弱性は公開 Issue ではなく Private Security Advisory で報告してください

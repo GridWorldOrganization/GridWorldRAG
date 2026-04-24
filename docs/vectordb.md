@@ -1,322 +1,243 @@
 # VectorDB 設計メモ
 
-## 参考リポジトリ
-
-- **google-drive-agentic-rag** (donat-konan33)
-  - https://github.com/donat-konan33/google-drive-agentic-rag
-  - Google Drive 自動連携の実装を参考にする（認証・ドキュメント取り込みのみ）
-
-### 参考リポジトリについての補足メモ
-
-- Vector DB は **ChromaDB**（`./chroma_db/` にローカル保存）。GridWorldRAG では pgvector を採用するため不採用。
-- Google Drive 本文はメモリ内処理のみ。ディスクには埋め込みとメタデータのみ保存。
-- LLM（Claude / Mistral / Vertex AI）による回答生成・Gradio UI・FastAPI を含む完結した RAG システム。
-- GridWorldRAG が参考にするのは **OAuth2 認証と GoogleDriveLoader の部分のみ**。LLM 回答生成は Claude Code（MCP 経由）が担うため、それ以外は不採用。
-
-### なぜそのまま使わないか
-
-- **Vector DB が ChromaDB**：SQL・複合フィルタ・将来の構造化データ連携を見据えて pgvector を採用するため不適。
-- **LLM・UI が内蔵**：GridWorldRAG は Claude Code が MCP 経由でアクセスする設計のため、Gradio UI・FastAPI・LLM 回答生成はすべて不要な機能。
-- **用途が違う**：参考リポは「ブラウザから人間が質問する RAG」。GridWorldRAG は「Claude Code がプログラム的に参照するナレッジベース」。
+> このドキュメントは v0.1.0 設計時に書かれた Vector DB 選定メモを、現行実装（v0.2.1）に合わせて更新したもの。
+> 具体的な技術選定の正式記録は [ADR](./adr/) を参照。
 
 ---
 
-## Vector DB 選定経緯
+## 採用: PostgreSQL 17 + pgvector 0.8
 
-### 検討した選択肢
+GridWorldRAG は Google Drive ドキュメントのセマンティック検索バックエンドに
+**PostgreSQL + pgvector** を採用している。
+
+### 選定の観点
 
 | | ChromaDB | **PostgreSQL + pgvector（採用）** |
 |---|---|---|
 | 正体 | Vector DB 専用 | リレーショナル DB + ベクトル検索拡張 |
 | セットアップ | `pip install` のみ | Homebrew で PostgreSQL + 拡張インストール |
-| ベクトル検索 | ◎ 専用設計 | ○ 十分な性能 |
+| ベクトル検索 | ◎ 専用設計 | ○ IVFFlat / HNSW 両対応 |
 | メタデータフィルタ | △ 限定的 | ◎ SQL で自由に |
-| 全文検索との併用 | ✗ | ◎ tsvector と組み合わせ可 |
+| 全文検索との併用 | ✗ | ◎ tsvector と組合せ可 |
 | 構造化データとの共存 | ✗ | ◎ 同じ DB に混在可 |
 | 本番運用実績 | △ | ◎ |
+| Claude Code MCP からの接続 | 要別 adaptor | ◎ psycopg2 で即時 |
 
-### 採用理由：PostgreSQL + pgvector
+### 採用理由
 
-ベクトル検索を中心に使いつつ、SQL 全般の検索機能も持たせることで**長期的に柔軟な運用**を目的とする。
-
-- Google Drive ドキュメントはオーナー・更新日時・種別などリッチなメタデータを持つため、SQL による複合フィルタリングが有効
-- 将来的に構造化データ（スプレッドシート等）との JOIN も可能
-- ChromaDB はベクトル検索専用で柔軟性に欠けるため不採用
+Google Drive のドキュメントはオーナー・更新日時・フォルダパス・権限 (JSONB)
+といった構造化メタデータを多く持つため、**ベクトル類似度 + メタデータフィルタ**
+の複合クエリを SQL で表現できる pgvector が最適だった。
 
 ```sql
--- pgvector を使った複合クエリの例
-SELECT id, title, content, owner, updated_at
+-- 例: 特定オーナーかつ直近1年の文書からセマンティック検索
+SELECT id, title, content, owner, drive_modified_at
 FROM documents
 WHERE owner = 'tobisako@gridworld.co'
-  AND updated_at > '2025-01-01'
-ORDER BY embedding <=> $1  -- ベクトル類似度順
+  AND drive_modified_at > NOW() - INTERVAL '1 year'
+ORDER BY embedding <=> $1     -- cosine 距離
 LIMIT 5;
 ```
 
----
-
-## 開発環境
-
-### 言語・ツール
-
-- **Python 3.12+**
-- **venv**（仮想環境）
-
-### venv セットアップ
-
-```bash
-cd GridWorldRAG
-
-# 仮想環境を作成（初回のみ）
-python -m venv .venv
-
-# 有効化（作業開始時に毎回実行）
-source .venv/bin/activate
-
-# パッケージインストール
-pip install -r requirements.txt
-
-# 依存関係を記録（パッケージ追加時）
-pip freeze > requirements.txt
-```
-
-- `.venv/` は `.gitignore` に追加し Git 管理しない
-- `requirements.txt` のみ Git 管理する
+詳細は [ADR 0001: pgvector を採用した理由](./adr/0001-pgvector-over-chroma.md) 参照。
 
 ---
 
-## システム構成・起動フロー
+## 現行スキーマ（v0.2.1）
 
-### 全体像
+`schema.sql` の正本は repo root にある。本ドキュメントでは設計上のポイントのみ抜粋。
 
-```
-[初回のみ]
-build_index.py
-  └─ Google Drive 全件取得 → 埋め込み生成 → pgvector に一括投入
-     （ファイル数によっては数時間かかる）
+### `documents` テーブル
 
-[常駐デーモン]
-watcher.py
-  ├─ Webhook 受信（リアルタイム）→ 変更ファイルを即 DB 反映
-  └─ ポーリング（30〜60分おき）→ Webhook 漏れをキャッチ
+| カラム | 型 | 説明 |
+|--------|-----|------|
+| `id` | SERIAL PK | 自動採番 |
+| `drive_file_id` | TEXT UNIQUE | `{file_id}_chunk_{n}` または `{file_id}_sheet_{gid}_chunk_{n}` |
+| `title` | TEXT | ファイル名 |
+| `content` | TEXT | チャンクテキスト（NUL 文字除去済み） |
+| `chunk_index` | INTEGER | チャンク番号 |
+| `owner` | TEXT | オーナーのメールアドレス |
+| `source_url` | TEXT | Google Drive の URL |
+| `file_type` | TEXT | MIME タイプ |
+| `drive_modified_at` | TIMESTAMPTZ | Drive 上の更新日時 |
+| `embedding` | VECTOR(768) | 埋め込みベクトル（paraphrase-multilingual-mpnet-base-v2） |
+| `sheet_gid` | TEXT | スプレッドシートのシート ID |
+| `sheet_name` | TEXT | スプレッドシートのシート名 |
+| `permissions` | JSONB | 権限リスト（下記） |
+| `partial_content` | BOOLEAN | テキスト抽出が部分的な場合 TRUE |
+| `folder_path` | TEXT | `Drive / Folder / Sub` |
+| `created_at` | TIMESTAMPTZ | DB 投入日時 |
 
-[MCP サーバー]
-mcp_server.py
-  └─ Claude Code からの検索リクエスト → pgvector に問い合わせ → 結果返却
-```
+### `permissions` JSONB 構造
 
-### 起動手順
-
-```bash
-# 1. 初回のみ：全件インデックス構築
-python build_index.py
-
-# 2. 常駐デーモン起動（以降ずっと起動しておく）
-python watcher.py
-
-# 3. MCP サーバー起動（Claude Code から使えるようにする）
-python mcp_server.py
-```
-
----
-
-## Google Drive 変更監視：ハイブリッド方式
-
-### 方針
-
-Webhook（リアルタイム）とポーリング（安全網）を併用する。
-
-| 方式 | 役割 | 頻度 |
-|---|---|---|
-| **Webhook** | リアルタイム検知・即時反映 | 変更発生時 |
-| **ポーリング** | Webhook 漏れのキャッチ | 30〜60分おき |
-
-### なぜポーリングも必要か
-
-- Google Drive の Webhook（Push通知）は**配信を保証しない**（公式仕様）
-- Mac スリープ中は通知を受け取れず漏れる
-- Webhook チャンネルは**最大7日で失効**→ 再登録が必要
-
-### ポーリングのロジック（Changes API）
-
-「全ファイルをスキャン」はしない。**変更トークン**で差分のみ取得する：
-
-```python
-# 初回：開始トークンを取得・保存
-response = drive_service.changes().getStartPageToken().execute()
-save_token(response['startPageToken'])
-
-# ポーリング時：前回トークン以降の変更のみ取得
-page_token = load_token()
-response = drive_service.changes().list(
-    pageToken=page_token,
-    spaces='drive',
-).execute()
-
-for change in response.get('changes', []):
-    file_id = change['fileId']
-    update_document_in_db(file_id)  # 変更分だけ DB 反映
-
-# トークンを更新して保存
-save_token(response.get('newStartPageToken'))
+```json
+[
+  {"email": "user@example.com", "name": "田中", "role": "writer", "type": "user"},
+  {"email": "example.com", "name": "", "role": "reader", "type": "domain"}
+]
 ```
 
-→ 100万ファイルあっても**変更があったファイルだけ**返るため軽量
+チャンク単位で保持することで、将来的に「閲覧者フィルタ付き検索」に発展できる（現在は記録のみ）。
 
-### Webhook（ngrok でローカル Mac に公開URL付与）
-
-```bash
-# ngrok で Mac の 8507 ポートを公開
-ngrok http 8507
-# → https://xxxx.ngrok.io が発行される
-
-# Google Drive に Webhook チャンネルを登録
-drive_service.files().watch(
-    fileId='root',
-    body={
-        'id': 'channel-001',
-        'type': 'web_hook',
-        'address': 'https://xxxx.ngrok.io/webhook',
-        'expiration': ...,  # 最大7日、定期的に再登録が必要
-    }
-).execute()
-```
-
----
-
-## PostgreSQL + pgvector セットアップ（Mac）
-
-```bash
-# インストール
-brew install postgresql@16
-brew services start postgresql@16
-
-# pgvector 拡張を有効化
-psql -U postgres -c "CREATE EXTENSION IF NOT EXISTS vector;"
-```
-
-### テーブル設計
+### インデックス
 
 ```sql
-CREATE EXTENSION IF NOT EXISTS vector;
-
-CREATE TABLE documents (
-    id          SERIAL PRIMARY KEY,
-    title       TEXT,
-    content     TEXT,
-    owner       TEXT,
-    source_url  TEXT,
-    file_type   TEXT,
-    updated_at  TIMESTAMPTZ,
-    embedding   VECTOR(768),   -- sentence-transformers の次元数
-    created_at  TIMESTAMPTZ DEFAULT NOW()
-);
-
--- ベクトル検索用インデックス（IVFFlat）
+-- ベクトル類似度（IVFFlat）
 CREATE INDEX ON documents USING ivfflat (embedding vector_cosine_ops)
     WITH (lists = 100);
 
--- メタデータ検索用インデックス
+-- メタデータ検索
+CREATE INDEX ON documents (drive_file_id);
 CREATE INDEX ON documents (owner);
-CREATE INDEX ON documents (updated_at);
+CREATE INDEX ON documents (drive_modified_at);
 ```
 
 ---
 
-## Google Drive 自動連携（参考実装からの知見）
+## 埋め込みモデル
 
-### 認証方式
+### 現行: `paraphrase-multilingual-mpnet-base-v2`（v0.2.1〜）
 
-- Google OAuth2 を使用（スコープ: `drive.readonly`）
-- `credentials.json`（Google Cloud Console から取得）をローカルに配置
-- 初回認証後、`token.json` にトークンをキャッシュ → 以降は自動認証
-- OAuth ローカルサーバーがポート **8506** で起動して認証フローを処理
+- **次元数**: 768
+- **Tokenizer**: SentencePiece（多言語対応）
+- **対応言語**: 50+ 言語
+- **ローカル実行**: CPU/GPU（Metal, CUDA）で動作、API 不要
 
-```python
-from langchain_google_community import GoogleDriveLoader
+#### なぜ多言語モデルか（重要）
 
-loader = GoogleDriveLoader(
-    folder_id="<GOOGLE_DRIVE_FOLDER_ID>",
-    token_path="./token.json",
-    credentials_path="./credentials.json",
-    recursive=True,
-    num_results=15,
-    file_types=["pdf", "presentation"],
-)
-documents = loader.load()
+v0.2.0 以前は `multi-qa-mpnet-base-dot-v1` を使用していたが、これは **英語 tokenizer 専用**
+だったため、日本語の熟語漢字を全て `[UNK]`（id=104）に潰していた。結果:
+
+- 「採用計画」「税務申告」のような短い日本語クエリが同一 embedding になる
+- cosine 1.00 の誤ヒット多発（100 クエリ中 17 件が dist=0.000）
+
+`paraphrase-multilingual-mpnet-base-v2` に切替後:
+- 「採用計画 vs 税務申告」cosine 1.00 → 0.36
+- 100 クエリ中 dist=0.000 が 17件 → 0件
+- 768 次元維持のため schema 変更不要
+
+詳細は [CHANGELOG v0.2.1](../CHANGELOG.md#021---2026-04-21) 参照。
+
+### モデル切替時の運用
+
+768 次元を維持する範囲内であれば schema 変更は不要だが、**ベクトルの意味空間が変わるため
+既存 `embedding` 列は再計算が必須**。DB TRUNCATE → 全件再ビルドで対応する。
+
+```bash
+# 再ビルド手順
+psql -d gridworldrag_1 -c "TRUNCATE documents;"
+./run_build.sh
 ```
-
-### セキュリティモデル
-
-- `drive.readonly` スコープのみ → ファイルの作成・変更・削除は不可
-- ファイル内容はメモリ内で処理、ローカルには埋め込みとメタデータのみ保存
-
-### 必要な Google Cloud 設定手順
-
-1. Google Cloud Project を作成
-2. Google Drive API を有効化
-3. OAuth 同意画面を設定（テストユーザーに自分のメールを追加）
-4. OAuth 2.0 クライアント ID を作成 → `credentials.json` をダウンロード
 
 ---
 
-## ドキュメント処理
-
-### テキスト分割
+## テキスト分割
 
 ```python
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 splitter = RecursiveCharacterTextSplitter(
-    chunk_size=600,    # 1チャンクあたり600文字
-    chunk_overlap=120, # 前後20%オーバーラップでコンテキスト損失を防ぐ
+    chunk_size=600,    # 1チャンクあたり 600 文字
+    chunk_overlap=120, # 20% オーバーラップ（文脈損失防止）
 )
-chunks = splitter.split_documents(documents)
 ```
 
-### 埋め込みモデル
-
-- `sentence-transformers/multi-qa-mpnet-base-dot-v1` を使用（次元数: 768）
-- ローカルで動作（API 不要、オフライン対応）
-
-```python
-from sentence_transformers import SentenceTransformer
-
-model = SentenceTransformer("multi-qa-mpnet-base-dot-v1")
-embeddings = model.encode([chunk.page_content for chunk in chunks])
-```
+分割は `src/indexer.py` のヘルパー経由で実施。スプレッドシートはシート単位で
+先に分割してからテキストチャンク化する（シート名を検索ヒット対象にするため）。
 
 ---
 
-## Google Workspace へのアクセス方法
+## 検索のフロー
 
-### 完成コード（Python）
+```
+[クエリ文字列]
+    │
+    ├── URL 含む? ── Yes ──→ lookup_by_url() で直接取得
+    │
+    └── No ──→ SentenceTransformer.encode() → vector
+                              │
+                              ▼
+                  SELECT ... ORDER BY embedding <=> $1 LIMIT N
+                              │
+                              ▼
+                   [結果: title, content, url, score]
+```
 
-完成する Python コード（build_index.py / watcher.py 等）は **`google-api-python-client`** で Google Drive API を直接呼ぶ。MCP は一切使用しない。
-
-- 参考：Google Workspace CLI — https://github.com/googleworkspace/cli
-- Python ライブラリ：`google-api-python-client` + `google-auth-oauthlib`
-- Google Cloud プロジェクト「claude code gcloud cli」（ID: `claude-code-gcloud-cli`）の OAuth 認証情報を使用
-
-### workspace-mcp（開発時の確認用のみ）
-
-- **workspace-mcp** (taylorwilsdon/google_workspace_mcp)
-  - https://github.com/taylorwilsdon/google_workspace_mcp
-  - Claude Code が開発中に Google Drive の内容を確認・検証する目的でのみ使用する
-  - 完成コードには含めない
+実装は `src/db.py` の `search_similar()` と `lookup_by_url()`、
+および `gridworld-rag-mcp/server.py` の `search` / `lookup` ツール。
 
 ---
 
-## GridWorldRAG での方針まとめ
+## データフロー全体
 
-| 項目 | 方針 |
-|---|---|
-| 言語 | Python 3.12+ |
-| 仮想環境 | venv + requirements.txt |
-| Vector DB | PostgreSQL + pgvector（Mac ローカル） |
-| Google Drive 連携 | `google-api-python-client` で Drive API を直接呼ぶ |
-| 変更監視 | Webhook（リアルタイム）+ ポーリング30〜60分（安全網） |
-| Embeddings | sentence-transformers `multi-qa-mpnet-base-dot-v1`（ローカル動作） |
-| LLM | Claude API（Anthropic） |
-| MCP 連携 | pgvector を MCP サーバー経由で Claude Code に公開 |
-| UI | なし（Claude Code から直接 MCP ツールで操作） |
+```
+Google Drive
+    │
+    ├── 初回: build_parallel.py (3 フェーズ並列)
+    │       ├── Phase 1: ファイル一覧取得（FETCH_THREADS=3）
+    │       ├── Phase 2: タスク分割（TASK_SPLIT_THRESHOLD）
+    │       └── Phase 3: テキスト抽出 → チャンク → embedding → INSERT
+    │
+    └── 差分: sync_rotate.py（launchd/Task Scheduler から 5 分間隔）
+            └── Changes API (drive 単位) → 変更ファイルだけ upsert
+
+             ↓ すべて UPSERT（ON CONFLICT DO UPDATE）
+
+[PostgreSQL 17 + pgvector]
+
+             ↑ SELECT ... ORDER BY embedding <=> $1
+
+Claude Code ←→ gridworld-rag-mcp/server.py (FastMCP)
+                └── ツール: search, lookup, stats,
+                            folder_tree, recent_changes, sync_history
+```
+
+詳細は [architecture.md](./architecture.md) 参照。
+
+---
+
+## 運用上の注意
+
+### `.venv/` は git 管理外
+
+- `.gitignore` で除外済
+- `requirements.txt` のみ管理
+
+### Homebrew ARM 必須（Mac）
+
+Apple Silicon Mac では `/opt/homebrew` の ARM 版 Python / PostgreSQL を使うこと。
+Intel 版 (`/usr/local`) では PyTorch 最新版が入らない。詳細は [README.md](../README.md) 冒頭参照。
+
+### `psycopg2` は source build 版
+
+`psycopg2-binary`（バンドル版）は libssl を同梱するため、Python の `_ssl` モジュールと
+二重の OpenSSL がプロセス内に同居し SSL 不安定化を起こす。
+`requirements.txt` では `psycopg2` を指定し、システムの OpenSSL を共有する。
+
+詳細は [ADR 0003: psycopg2 source build](./adr/0003-psycopg2-source-over-binary.md) 参照。
+
+---
+
+## 過去の検討記録（歴史的記述）
+
+### `google-drive-agentic-rag`（参考のみ）
+
+- https://github.com/donat-konan33/google-drive-agentic-rag
+- OAuth2 認証と GoogleDriveLoader の部分を参考にした
+- Vector DB は ChromaDB、LLM 回答生成 (Claude / Mistral / Vertex AI) と Gradio UI を内蔵
+- **不採用**: GridWorldRAG は Claude Code が MCP 経由でアクセスする設計のため、LLM・UI は不要
+
+### Webhook + ポーリング併用案（v0.1.x 検討、不採用）
+
+v0.1.x の初期設計では Google Drive の **Push Notification (Webhook)** を
+ngrok 経由で受ける案も検討したが、以下の理由で採用されず、現在の **Changes API ポーリング方式**
+（`sync_rotate.py`）に落ち着いた:
+
+- Webhook は配信保証がない（Google の公式仕様）
+- Mac スリープ中は受信不能
+- Webhook チャンネルは最大7日で失効 → 再登録運用が面倒
+- ngrok 依存は本番運用に適さない
+
+Changes API は drive 単位でページトークンを持ち、変更ゼロなら 1 API コールで即終了するため、
+5 分間隔で 22 ドライブを一巡しても 7 秒で完了する。Webhook 無しでも実用的なリアルタイム性を
+得られると判断した。
