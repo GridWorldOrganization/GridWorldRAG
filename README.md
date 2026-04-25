@@ -17,6 +17,107 @@
 
 Google Drive のドキュメントを PostgreSQL + pgvector にインデックスし、Claude Code から MCP 経由でセマンティック検索するための RAG システム。
 
+> **Note**: 本リポジトリには 2 つの実装系統が含まれます:
+>
+> | 名称 | 対象 OS | 状態 | 主要コンポーネント |
+> |---|---|---|---|
+> | **GridWorldRAG**（Mac 版） | macOS (Apple Silicon) | v0.2.1 安定版 | `build_parallel.py` + `sync_rotate.py` + launchd + MCP |
+> | **WinServerRAG**（Windows 版） | Windows 11 ネイティブ | v0.6.1 開発中 | `rag_daemon.py` + FastAPI Web UI + Electron ミニモニタ + NSSM |
+>
+> WinServerRAG は別リポジトリではなく、**本リポジトリの Windows 後継実装** です。per-FD スキーマ分離、GPU 埋め込み、常駐 daemon 型アーキテクチャなど Mac 版から大幅に進化しています。
+
+## 設計概要（Windows 版）
+
+本 RAG は **Windows サービス（デーモン）として常駐** し、以下を自動実行する:
+
+1. **Google Drive 共有フォルダのスクリーニング** — ホワイトリスト指定の共有ドライブを Changes API で監視、追加/更新/削除ファイルを検出
+2. **RAG 構築** — 検出ファイルからテキスト抽出 → チャンク分割 → 埋め込み生成 → PostgreSQL + pgvector へ UPSERT
+3. **稼働状況の可視化** — **ミニモニタ**（Electron 製の小型ウィンドウ）でサービスの稼働状況・処理中ファイル・差分同期の最新結果をリアルタイム表示
+
+```
+┌────────────────────────────────────────────────────────────┐
+│ Windows サービス常駐（NSSM 登録）                          │
+│                                                            │
+│  ┌───────────────┐    ┌──────────────┐    ┌────────────┐ │
+│  │ Drive 監視     │ →  │ RAG 構築     │ →  │ pgvector   │ │
+│  │ (Changes API) │    │ (抽出/埋込) │    │ (PG 17)    │ │
+│  └───────┬───────┘    └──────┬───────┘    └─────┬──────┘ │
+│          │                    │                  │         │
+│          └────────────┬───────┴──────────────────┘         │
+│                       ↓                                     │
+│              ┌────────────────┐                            │
+│              │ FastAPI 状態 API│                            │
+│              └────────┬───────┘                            │
+└───────────────────────┼─────────────────────────────────────┘
+                        ↓
+              ┌──────────────────┐
+              │ ミニモニタ       │ ← ユーザー監視
+              │ (Electron)       │
+              └──────────────────┘
+                        ↓
+              ┌──────────────────┐
+              │ Claude Code      │ ← MCP 経由 検索
+              │ (gridworld-rag-mcp)│
+              └──────────────────┘
+```
+
+**主要コンポーネント:**
+
+| 要素 | 実装 | 役割 |
+|---|---|---|
+| サービス常駐 | NSSM (Non-Sucking Service Manager) | Windows サービスとして自動起動・再起動 |
+| Drive 監視 | `drive_client.list_changes()` | 共有ドライブごとに独立トークン、変更ゼロなら即スキップ |
+| RAG 構築 | `rag_daemon.py` + `sentence-transformers` | 768次元 multi-qa-mpnet-base-dot-v1 |
+| 状態 API | FastAPI (localhost) | サービスの稼働状況・進捗を公開 |
+| ミニモニタ | Electron 小型ウィンドウ | 稼働状況・処理中ファイル・最新差分を可視化 |
+| 検索 IF | MCP (FastMCP) | Claude Code から `search` / `lookup` 等で検索 |
+
+**運用ポリシー:**
+
+- Windows サービスとして常駐（PC 起動時に自動開始、Task Scheduler は使わない）
+- ミニモニタは任意起動。閉じてもサービスは動作継続
+- 共有ドライブはホワイトリスト方式（`shared_drives_whitelist.txt`）
+- 認証は OAuth デスクトップアプリ。token は secrets リポで管理
+
+### サービス挙動仕様
+
+本サービスは **バックグラウンドで RAG 構築を行う常駐プロセス** である。ミニモニタとは API 経由で双方向通信し、ユーザー操作で RAG ビルドの開始/停止を制御できる。
+
+**ミニモニタ → サービス（制御）:**
+
+- ミニモニタには **「開始」「停止」ボタン**（トグル式）を配置
+- ボタン押下でサービスへ通知（HTTP POST）:
+  - 「開始」 → `POST /api/daemon/resume` → サービスは新規タスクの取得を再開し RAG ビルドを進める
+  - 「停止」 → `POST /api/daemon/pause` → サービスは新規タスクの取得を停止（in-flight タスクは完走）
+- 停止状態は `daemon_config.paused` フラグとして DB に永続化、サービス再起動後も状態を保持
+
+**サービス → ミニモニタ（状態確認）:**
+
+- ミニモニタは `GET /api/stats`（既存の 250ms ポーリング）で **RAG ビルドの開始状態 / 停止状態** を取得
+- レスポンスに `paused: bool` フィールドを追加
+- ミニモニタは画面上に現在の状態を表示:
+  - **稼働中** — 緑インジケータ + 「停止」ボタン表示
+  - **停止中** — 灰インジケータ + 「開始」ボタン表示
+- ステータス文言・進捗バーも停止中は明示（"停止中（手動停止）"）
+
+**API エンドポイント一覧:**
+
+| メソッド | パス | 用途 |
+|---|---|---|
+| `GET` | `/api/daemon/state` | 現在の稼働/停止状態を取得（`{paused: bool, since: ISO8601}`） |
+| `POST` | `/api/daemon/pause` | RAG ビルド停止（新規タスク取得を止める） |
+| `POST` | `/api/daemon/resume` | RAG ビルド開始（新規タスク取得を再開） |
+| `GET` | `/api/stats` | 統計 + `paused` フラグ（ミニモニタが定期取得） |
+
+**設計上の注意:**
+
+- 「停止」は **ワーク一時停止**であり、Windows サービス自体の停止ではない。FastAPI は稼働継続するためミニモニタの API 接続は維持される
+- 進行中タスクは強制中断せず完走させる（DB 整合性保護）
+- 停止状態でも Drive Changes API のトークンは進めない（次回開始時に取りこぼしなく再開）
+- サービス本体（NSSM 登録の Windows サービス）の停止/再起動は OS の `services.msc` または `nssm stop` から行う（ミニモニタの管轄外）
+
+詳細実装は `C:\claude_code\dev\WinServerRAG\` 配下、設計背景は [docs/architecture.md](./docs/architecture.md) 参照。
+
 <details>
 <summary><b>📖 目次（クリックで展開）</b></summary>
 

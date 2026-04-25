@@ -2,7 +2,25 @@
 
 GridWorldRAG の全体アーキテクチャとデータフロー。実装詳細は [technical.md](./technical.md)、設計選定の理由は [adr/](./adr/) 参照。
 
-## システム全体像
+## 2 つの実装系統
+
+本リポジトリには Mac 版（GridWorldRAG）と Windows 版（WinServerRAG）の 2 系統が存在する。
+
+| | GridWorldRAG（Mac 版） | WinServerRAG（Windows 版） |
+|---|---|---|
+| 対象 OS | macOS (Apple Silicon) | Windows 11 ネイティブ |
+| バージョン | v0.2.1（安定） | v0.6.1（開発中） |
+| インデクサ | `build_parallel.py` + `sync_rotate.py` | `rag_daemon.py`（統合常駐） |
+| 定期実行 | launchd / Windows Task Scheduler (WSL) | NSSM Windows Service |
+| DB スキーマ | 単一 `documents` テーブル | 共有フォルダ別 `fd_<drive_id>` スキーマ |
+| モニター | `monitor.sh`（CLI） | FastAPI Web UI + Electron ミニモニタ |
+| 埋め込み | CPU | GPU 対応 |
+| MCP | stdio（ローカル Claude Code） | HTTP（Cowork 遠隔対応予定） |
+| psycopg | psycopg2 (v2, source build) | psycopg[binary] (v3) |
+
+以下は Mac 版（v0.2.1）のアーキテクチャ図。Windows 版は常駐 daemon 型に進化済み（[mac-resident-daemon.md](./mac-resident-daemon.md) の将来構想を先行実装）。
+
+## システム全体像（Mac 版 v0.2.x）
 
 ```mermaid
 flowchart LR

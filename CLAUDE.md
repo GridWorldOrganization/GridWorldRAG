@@ -1,5 +1,15 @@
 # GridWorldRAG
 
+## GitHub リポジトリ（重要）
+
+- **URL**: https://github.com/GridWorldOrganization/GridWorldRAG
+- **公開リポジトリ**（public）— 現在アクティブに開発中
+- **ローカル開発ディレクトリは 2 つ**:
+  - `C:\claude_code\dev\GridWorldRAG\` — Mac 版起源のコードベース（README / docs / tests / MCP 等）
+  - `C:\claude_code\dev\WinServerRAG\` — Windows 版開発ディレクトリ（daemon / FastAPI / Web UI / Electron ミニモニタ等）
+- **両ディレクトリとも同一リポジトリ** (`origin = GridWorldOrganization/GridWorldRAG`) を指す
+- WinServerRAG は別プロジェクトではない。GridWorldRAG の Windows 後継実装
+
 ## プロジェクト概要
 
 Google Drive（共有ドライブ、ホワイトリスト指定）のドキュメントを PostgreSQL + pgvector にインデックスし、セマンティック検索を提供する RAG システム。

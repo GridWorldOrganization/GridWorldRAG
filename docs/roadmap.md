@@ -1,8 +1,17 @@
 # Roadmap
 
-GridWorldRAG の今後の方向性。v0.2.x 系はバグ修正と小さい改善のみ、v0.3.0 以降は [常駐デーモン型アーキテクチャ](./mac-resident-daemon.md) への段階的移行を予定。
+GridWorldRAG の今後の方向性。
 
-## 現行安定版: v0.2.1
+本リポジトリには **Mac 版**（GridWorldRAG v0.2.x）と **Windows 版**（WinServerRAG v0.6.x）の 2 系統がある。Windows 版は Mac 版の [常駐デーモン型アーキテクチャ](./mac-resident-daemon.md) 構想を先行実装した形になっている。
+
+## Windows 版（WinServerRAG）: v0.6.1 開発中
+
+- 🎯 **Mode**: 常駐 daemon（`rag_daemon.py`）+ FastAPI Web UI + Electron ミニモニタ
+- 📅 **Latest**: v0.6.1
+- 🔧 **状態**: アクティブ開発中
+- 📋 **特徴**: per-FD スキーマ分離、GPU 埋め込み、AWS serverless、マルチユーザー認証、NSSM Windows Service
+
+## Mac 版（GridWorldRAG）: v0.2.1 安定版
 
 - 🎯 **Mode**: バッチ + launchd/Task Scheduler cron
 - 📅 **Released**: 2026-04-21
