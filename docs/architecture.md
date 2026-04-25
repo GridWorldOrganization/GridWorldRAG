@@ -2,25 +2,25 @@
 
 GridWorldRAG の全体アーキテクチャとデータフロー。実装詳細は [technical.md](./technical.md)、設計選定の理由は [adr/](./adr/) 参照。
 
-## 2 つの実装系統
+## 対象プラットフォーム
 
-本リポジトリには Mac 版（GridWorldRAG）と Windows 版（WinServerRAG）の 2 系統が存在する。
+本プロジェクトは **Windows 11 ネイティブの単一系統** で実装されている。
 
-| | GridWorldRAG（Mac 版） | WinServerRAG（Windows 版） |
-|---|---|---|
-| 対象 OS | macOS (Apple Silicon) | Windows 11 ネイティブ |
-| バージョン | v0.2.1（安定） | v0.6.1（開発中） |
-| インデクサ | `build_parallel.py` + `sync_rotate.py` | `rag_daemon.py`（統合常駐） |
-| 定期実行 | launchd / Windows Task Scheduler (WSL) | NSSM Windows Service |
-| DB スキーマ | 単一 `documents` テーブル | 共有フォルダ別 `fd_<drive_id>` スキーマ |
-| モニター | `monitor.sh`（CLI） | FastAPI Web UI + Electron ミニモニタ |
-| 埋め込み | CPU | GPU 対応 |
-| MCP | stdio（ローカル Claude Code） | HTTP（Cowork 遠隔対応予定） |
-| psycopg | psycopg2 (v2, source build) | psycopg[binary] (v3) |
+| 項目 | 仕様 |
+|---|---|
+| 対象 OS | Windows 11 ネイティブ |
+| バージョン | v0.6.1（開発中） |
+| インデクサ | `rag_daemon.py`（常駐 daemon、Drive 監視 + RAG 構築を統合） |
+| サービス常駐 | NSSM Windows Service |
+| DB スキーマ | 共有フォルダ別 `fd_<drive_id>` スキーマ分離 |
+| モニター | FastAPI 状態 API + Electron ミニモニタ |
+| 埋め込み | GPU 対応（CUDA、CPU フォールバック可） |
+| MCP | HTTP（Cowork 遠隔対応予定） |
+| psycopg | psycopg[binary] (v3) |
 
-以下は Mac 版（v0.2.1）のアーキテクチャ図。Windows 版は常駐 daemon 型に進化済み（[mac-resident-daemon.md](./mac-resident-daemon.md) の将来構想を先行実装）。
+> **過去経緯**: 初期 v0.1〜v0.2 系では macOS (Apple Silicon) 上の `build_parallel.py` + `sync_rotate.py` + launchd というバッチ + cron 構成だったが、v0.2.1 を最後に **Mac 版は開発中止**。[mac-resident-daemon.md](./mac-resident-daemon.md) で構想していた常駐 daemon 型を Windows ネイティブで先行実装する形で本系統に一本化された。Mac 版時代のアーキテクチャ図は履歴用に以下に残す。
 
-## システム全体像（Mac 版 v0.2.x）
+## システム全体像（Mac 版 v0.2.x ・ アーカイブ）
 
 ```mermaid
 flowchart LR

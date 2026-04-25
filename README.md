@@ -17,16 +17,9 @@
 
 Google Drive のドキュメントを PostgreSQL + pgvector にインデックスし、Claude Code から MCP 経由でセマンティック検索するための RAG システム。
 
-> **Note**: 本リポジトリには 2 つの実装系統が含まれます:
->
-> | 名称 | 対象 OS | 状態 | 主要コンポーネント |
-> |---|---|---|---|
-> | **GridWorldRAG**（Mac 版） | macOS (Apple Silicon) | v0.2.1 安定版 | `build_parallel.py` + `sync_rotate.py` + launchd + MCP |
-> | **WinServerRAG**（Windows 版） | Windows 11 ネイティブ | v0.6.1 開発中 | `rag_daemon.py` + FastAPI Web UI + Electron ミニモニタ + NSSM |
->
-> WinServerRAG は別リポジトリではなく、**本リポジトリの Windows 後継実装** です。per-FD スキーマ分離、GPU 埋め込み、常駐 daemon 型アーキテクチャなど Mac 版から大幅に進化しています。
+> **対象 OS**: Windows 11 ネイティブのみ。Mac 版（v0.2.1 まで）は開発中止し、本リポジトリは **Windows サービス常駐型 (`rag_daemon.py` + FastAPI + Electron ミニモニタ + NSSM)** に一本化されています。Mac 版時代の運用手順（launchd 等）はリポジトリ履歴・`docs/` の archive に残っていますが、現行サポート対象外です。
 
-## 設計概要（Windows 版）
+## 設計概要
 
 本 RAG は **Windows サービス（デーモン）として常駐** し、以下を自動実行する:
 

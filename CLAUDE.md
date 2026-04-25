@@ -4,11 +4,12 @@
 
 - **URL**: https://github.com/GridWorldOrganization/GridWorldRAG
 - **公開リポジトリ**（public）— 現在アクティブに開発中
-- **ローカル開発ディレクトリは 2 つ**:
-  - `C:\claude_code\dev\GridWorldRAG\` — Mac 版起源のコードベース（README / docs / tests / MCP 等）
-  - `C:\claude_code\dev\WinServerRAG\` — Windows 版開発ディレクトリ（daemon / FastAPI / Web UI / Electron ミニモニタ等）
+- **対象 OS は Windows 11 ネイティブのみの 1 系統**。Mac 版（v0.2.x まで）は開発中止
+- **ローカル開発ディレクトリは 2 つ**（同一リポジトリの 2 ワークツリー）:
+  - `C:\claude_code\dev\GridWorldRAG\` — README / docs / tests / MCP のドキュメント中心の作業ツリー（Mac 版時代のコードがアーカイブとして同居）
+  - `C:\claude_code\dev\WinServerRAG\` — Windows サービス本体の開発ツリー（daemon / FastAPI / Web UI / Electron ミニモニタ等）
 - **両ディレクトリとも同一リポジトリ** (`origin = GridWorldOrganization/GridWorldRAG`) を指す
-- WinServerRAG は別プロジェクトではない。GridWorldRAG の Windows 後継実装
+- WinServerRAG は別プロジェクトではない。本リポジトリの実装本体
 
 ## プロジェクト概要
 
