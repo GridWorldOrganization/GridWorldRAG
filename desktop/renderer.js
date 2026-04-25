@@ -15,10 +15,15 @@ function fmtBytes(n) {
 async function fetchJSON(path, timeoutMs = 1500) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  const slot = path === "/api/stats" ? "statsHttp" : path === "/api/workers" ? "workersHttp" : null;
   try {
     const r = await fetch(API + path, { signal: ctrl.signal });
+    if (slot) DBG[slot] = String(r.status);
     if (!r.ok) throw new Error(r.status);
     return await r.json();
+  } catch (e) {
+    if (slot) DBG[slot] = "ERR " + (e && e.name === "AbortError" ? "timeout" : (e && e.message) || "?");
+    throw e;
   } finally {
     clearTimeout(t);
   }
@@ -28,6 +33,24 @@ let consecutiveFails = 0;
 let lastFilesDoneSum = 0;
 let _inflight = false;  // prevent overlapping fetches if a tick takes longer than 250ms
 let _lastWdetailHash = null;  // gate #wdetail innerHTML writes so we don't flicker
+
+// Debug telemetry — populated every tick, rendered only when the debug
+// overlay is open (so rendering cost is zero during normal operation).
+const DBG = {
+  lastTickAt: null,
+  lastOkAt: null,
+  lastFailAt: null,
+  lastFailReason: null,
+  statsHttp: null,    // "200" | "ERR timeout" | "ERR 500" | null
+  workersHttp: null,
+  statsRaw: null,
+  workersRaw: null,
+  indicator: "idle",
+  daemonDead: false,
+  activeCount: 0,
+  staleCount: 0,
+  workerHb: [],       // [{id, state, age_sec, stale}]
+};
 
 // A worker row is considered stale (its owning daemon died / crashed) if
 // its heartbeat hasn't advanced within this window. Normal sources of gap:
@@ -55,6 +78,7 @@ function setIndicator(kind) {
   const el = $("indicator");
   el.classList.remove("ok", "active", "err");
   if (kind !== "idle") el.classList.add(kind);
+  DBG.indicator = kind;
 }
 
 function flashTick() {
@@ -68,13 +92,23 @@ function flashTick() {
 async function tick() {
   if (_inflight) return;
   _inflight = true;
+  DBG.lastTickAt = new Date();
   try {
     const [s, w] = await Promise.all([
-      fetchJSON("/api/stats").catch(() => null),
-      fetchJSON("/api/workers").catch(() => null),
+      fetchJSON("/api/stats").catch((e) => { DBG.lastFailReason = String(e && e.message || e); return null; }),
+      fetchJSON("/api/workers").catch((e) => { DBG.lastFailReason = String(e && e.message || e); return null; }),
     ]);
-    if (!s || !w) { consecutiveFails++; if (consecutiveFails >= 2) showErr(); return; }
+    if (!s || !w) {
+      consecutiveFails++;
+      DBG.lastFailAt = new Date();
+      if (consecutiveFails >= 2) showErr();
+      if (isDebugOpen()) renderDebug();
+      return;
+    }
     consecutiveFails = 0;
+    DBG.lastOkAt = new Date();
+    DBG.statsRaw = s;
+    DBG.workersRaw = w;
 
     const now = Date.now();
     const allWorkers = w.workers || [];
@@ -90,6 +124,17 @@ async function tick() {
     // Daemon-liveness heuristic: the daemon is presumed dead if every worker
     // row (whatever its state) is stale — the heartbeats stopped arriving.
     const daemonLooksDead = allWorkers.length > 0 && allWorkers.every(x => isWorkerStale(x, now));
+    DBG.daemonDead = daemonLooksDead;
+    DBG.activeCount = activeWorkers.length;
+    DBG.staleCount = staleActiveCount;
+    DBG.workerHb = allWorkers.map(x => {
+      const hb = x.heartbeat_at ? new Date(x.heartbeat_at).getTime() : 0;
+      return {
+        id: x.worker_id, state: x.state,
+        age_sec: hb ? Math.round((now - hb) / 1000) : null,
+        stale: isWorkerStale(x, now),
+      };
+    });
 
     const anyErr = allWorkers.some(x => x.state === "error") || s.pg_ok === false;
     if (daemonLooksDead) setIndicator("err");
@@ -207,12 +252,69 @@ async function tick() {
       _lastWdetailHash = wHtml;
       $("wdetail").innerHTML = wHtml;
     }
-  } catch (_) {
+    if (isDebugOpen()) renderDebug();
+  } catch (e) {
     consecutiveFails++;
+    DBG.lastFailAt = new Date();
+    DBG.lastFailReason = String(e && e.message || e);
     if (consecutiveFails >= 2) showErr();
+    if (isDebugOpen()) renderDebug();
   } finally {
     _inflight = false;
   }
+}
+
+// -------------------- Debug overlay --------------------
+function isDebugOpen() {
+  const p = document.getElementById("debug-panel");
+  return !!(p && p.classList.contains("open"));
+}
+function fmtTs(d) {
+  if (!d) return "-";
+  const pad = n => String(n).padStart(2, "0");
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${String(d.getMilliseconds()).padStart(3,"0")}`;
+}
+function ageSec(d) {
+  if (!d) return "-";
+  return ((Date.now() - d.getTime()) / 1000).toFixed(1) + "s ago";
+}
+function httpBadge(v) {
+  if (v == null) return "-";
+  const cls = v.startsWith("ERR") || /^[45]/.test(v) ? "derr"
+           : v === "200" ? "dok" : "dwarn";
+  return `<span class="${cls}">${v}</span>`;
+}
+function renderDebug() {
+  const set = (id, html) => { const el = document.getElementById(id); if (el) el.innerHTML = html; };
+  set("dbg-api", API);
+  set("dbg-last-tick", fmtTs(DBG.lastTickAt));
+  set("dbg-last-ok",   DBG.lastOkAt   ? `${fmtTs(DBG.lastOkAt)} <span class="dk">(${ageSec(DBG.lastOkAt)})</span>` : "-");
+  set("dbg-last-fail", DBG.lastFailAt
+    ? `<span class="derr">${fmtTs(DBG.lastFailAt)}</span> <span class="dk">(${ageSec(DBG.lastFailAt)})</span> ${DBG.lastFailReason ? '- ' + DBG.lastFailReason : ''}`
+    : "-");
+  const failCls = consecutiveFails >= 2 ? "derr" : consecutiveFails > 0 ? "dwarn" : "dok";
+  set("dbg-fails", `<span class="${failCls}">${consecutiveFails}</span>`);
+  set("dbg-stats-http", httpBadge(DBG.statsHttp));
+  set("dbg-workers-http", httpBadge(DBG.workersHttp));
+  const indCls = DBG.indicator === "err" ? "derr" : DBG.indicator === "active" ? "dwarn" : DBG.indicator === "ok" ? "dok" : "dk";
+  set("dbg-indicator", `<span class="${indCls}">${DBG.indicator}</span>`);
+  set("dbg-dead", DBG.daemonDead ? '<span class="derr">yes</span>' : '<span class="dok">no</span>');
+  set("dbg-active-stale", `${DBG.activeCount} active / ${DBG.staleCount} stale`);
+  const stats = DBG.statsRaw ? JSON.stringify(DBG.statsRaw, null, 2) : "(none)";
+  const workers = DBG.workersRaw ? JSON.stringify(DBG.workersRaw, null, 2) : "(none)";
+  document.getElementById("dbg-stats-raw").textContent = stats;
+  document.getElementById("dbg-workers-raw").textContent = workers;
+  const hb = DBG.workerHb.length
+    ? DBG.workerHb.map(x => `#${x.id} ${x.state.padEnd(10)} ${x.age_sec==null?'(no hb)':x.age_sec+'s'}${x.stale?' STALE':''}`).join("\n")
+    : "(no workers)";
+  document.getElementById("dbg-hb").textContent = hb;
+}
+function toggleDebug(force) {
+  const p = document.getElementById("debug-panel");
+  if (!p) return;
+  const want = force == null ? !p.classList.contains("open") : !!force;
+  p.classList.toggle("open", want);
+  if (want) renderDebug();
 }
 
 function showErr() {
@@ -230,6 +332,13 @@ function showErr() {
   if (gFill) gFill.style.width = "0";
   const gText = $("progress-global-text");
   if (gText) gText.textContent = "—";
+  // Clear metric rows too — otherwise stale values remain visible next
+  // to the "API 接続失敗" badge and look like live data.
+  $("fds").textContent = "-/-";
+  $("files").textContent = "-";
+  $("chunks").textContent = "-";
+  $("dbsize").textContent = "-";
+  lastFilesDoneSum = 0;
 }
 
 window.addEventListener("DOMContentLoaded", async () => {
@@ -256,6 +365,22 @@ window.addEventListener("DOMContentLoaded", async () => {
       try { localStorage.setItem("aot", aot.checked ? "1" : "0"); } catch {}
     });
   }
+
+  // --- Debug overlay wiring
+  const dbgToggle = document.getElementById("debug-toggle");
+  const dbgClose = document.getElementById("debug-close");
+  if (dbgToggle) dbgToggle.addEventListener("click", () => toggleDebug());
+  if (dbgClose) dbgClose.addEventListener("click", () => toggleDebug(false));
+  // Ctrl+Shift+D toggles, Esc closes. Ctrl+Shift+I opens native DevTools
+  // (handled in main.js via a menu accelerator).
+  window.addEventListener("keydown", (e) => {
+    if (e.ctrlKey && e.shiftKey && (e.key === "D" || e.key === "d")) {
+      e.preventDefault();
+      toggleDebug();
+    } else if (e.key === "Escape" && isDebugOpen()) {
+      toggleDebug(false);
+    }
+  });
 
   tick();
   setInterval(tick, 250);

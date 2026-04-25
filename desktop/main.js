@@ -2,7 +2,7 @@
 // A tiny frameless-ish always-on-top window that shows health metrics
 // and has one button to open the full web UI in the default browser.
 
-const { app, BrowserWindow, shell, ipcMain } = require("electron");
+const { app, BrowserWindow, shell, ipcMain, Menu } = require("electron");
 const path = require("path");
 
 const API_URL = process.env.WINSERVERRAG_API_URL || "http://127.0.0.1:17600";
@@ -31,6 +31,19 @@ function createWindow() {
     },
   });
   win.setMenuBarVisibility(false);
+  // Hidden accelerators: menu is not visible but accelerators still fire.
+  // Lets the user pop DevTools / reload / force-refresh when diagnosing the UI.
+  const menu = Menu.buildFromTemplate([{
+    label: "Debug", visible: false, submenu: [
+      { label: "Toggle DevTools", accelerator: "CmdOrCtrl+Shift+I",
+        click: () => { try { win.webContents.toggleDevTools({ mode: "detach" }); } catch {} } },
+      { label: "Reload",          accelerator: "CmdOrCtrl+R",
+        click: () => { try { win.webContents.reload(); } catch {} } },
+      { label: "Force Reload",    accelerator: "CmdOrCtrl+Shift+R",
+        click: () => { try { win.webContents.reloadIgnoringCache(); } catch {} } },
+    ],
+  }]);
+  Menu.setApplicationMenu(menu);
   // Belt & suspenders: intercept maximize/fullscreen events in case the OS
   // window-controls are used to bypass the flags above.
   win.on("maximize", () => { try { win.unmaximize(); } catch {} });

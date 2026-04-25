@@ -104,9 +104,36 @@
       background: #2d2418; color: var(--warn);
       text-decoration: line-through dotted;
     }
-    footer { display: flex; justify-content: flex-end; align-items: center; font-size: 11px; }
+    footer { display: flex; justify-content: space-between; align-items: center; font-size: 11px; gap: 8px; }
     .muted { color: var(--muted); font-size: 11px; }
     .err { color: var(--err); }
+    .debug-link { color: var(--muted); cursor: pointer; user-select: none; font-size: 10px;
+      padding: 1px 4px; border-radius: 3px; }
+    .debug-link:hover { color: var(--accent); background: #14243d; }
+    /* Debug overlay — toggled by the "debug" link or Ctrl+Shift+D.
+       Scrollable, monospaced, shows raw telemetry so the user can diagnose
+       stuck progress, stale workers, connection refusals, etc. */
+    #debug-panel {
+      position: fixed; inset: 0; background: rgba(15,17,21,0.97);
+      color: var(--fg); padding: 10px; overflow: auto; display: none;
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 10px; line-height: 1.35; z-index: 9999;
+      box-sizing: border-box;
+    }
+    #debug-panel.open { display: block; }
+    #debug-panel h2 { margin: 0 0 6px 0; font-size: 11px; font-weight: 600;
+      color: var(--accent); display: flex; justify-content: space-between; }
+    #debug-panel .kv { display: grid; grid-template-columns: 110px 1fr; gap: 2px 8px; margin-bottom: 8px; }
+    #debug-panel .kv .dk { color: var(--muted); }
+    #debug-panel .dsec { margin-top: 8px; border-top: 1px dotted var(--border); padding-top: 6px; }
+    #debug-panel pre { margin: 2px 0; white-space: pre-wrap; word-break: break-all;
+      color: var(--muted); font-size: 10px; }
+    #debug-close { background: none; border: 1px solid var(--border); color: var(--muted);
+      padding: 1px 6px; cursor: pointer; border-radius: 3px; font-size: 10px; }
+    #debug-close:hover { color: var(--fg); border-color: var(--accent); }
+    .dok  { color: var(--ok); }
+    .dwarn{ color: var(--warn); }
+    .derr { color: var(--err); }
   </style>
 </head>
 <body>
@@ -144,7 +171,38 @@
     </div>
     <footer>
       <span class="muted" id="api-url"></span>
+      <span id="debug-toggle" class="debug-link" title="デバッグオーバーレイを開く (Ctrl+Shift+D)">debug</span>
     </footer>
+  </div>
+  <div id="debug-panel">
+    <h2>
+      <span>Mini Monitor Debug</span>
+      <button id="debug-close" title="閉じる (Esc / Ctrl+Shift+D)">close</button>
+    </h2>
+    <div class="kv">
+      <span class="dk">API URL</span><span id="dbg-api">-</span>
+      <span class="dk">last tick</span><span id="dbg-last-tick">-</span>
+      <span class="dk">last OK</span><span id="dbg-last-ok">-</span>
+      <span class="dk">last FAIL</span><span id="dbg-last-fail">-</span>
+      <span class="dk">consec fails</span><span id="dbg-fails">0</span>
+      <span class="dk">stats HTTP</span><span id="dbg-stats-http">-</span>
+      <span class="dk">workers HTTP</span><span id="dbg-workers-http">-</span>
+      <span class="dk">indicator</span><span id="dbg-indicator">-</span>
+      <span class="dk">daemon dead?</span><span id="dbg-dead">-</span>
+      <span class="dk">active / stale</span><span id="dbg-active-stale">-</span>
+    </div>
+    <div class="dsec">
+      <div class="dk">/api/stats (last):</div>
+      <pre id="dbg-stats-raw">(none)</pre>
+    </div>
+    <div class="dsec">
+      <div class="dk">/api/workers (last):</div>
+      <pre id="dbg-workers-raw">(none)</pre>
+    </div>
+    <div class="dsec">
+      <div class="dk">worker heartbeats (age sec):</div>
+      <pre id="dbg-hb">(none)</pre>
+    </div>
   </div>
   <script src="renderer.js"></script>
 </body>
