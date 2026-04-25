@@ -1,0 +1,384 @@
+:root {
+  --bg: #0f1115;
+  --fg: #e7ecf3;
+  --muted: #8a93a6;
+  --accent: #5ea4ff;
+  --ok: #3fbf7f;
+  --warn: #f2b94b;
+  --err: #ff6b6b;
+  --row: #141823;
+  --row-alt: #10131c;
+  --border: #232a3b;
+}
+* { box-sizing: border-box; }
+html, body {
+  margin: 0; padding: 0;
+  background: var(--bg); color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  font-size: 14px; line-height: 1.45;
+}
+header {
+  position: sticky; top: 0; z-index: 5;
+  padding: 14px 20px; background: #0a0c12; border-bottom: 1px solid var(--border);
+}
+header h1 { margin: 0 0 8px 0; font-size: 18px; font-weight: 600; display: flex; align-items: center; gap: 10px; }
+
+/* Global activity indicator (top-left of title):
+   idle   = dim dot
+   ok     = green pulsing dot (pg/drive OK, no active worker)
+   active = blue rotating ring + filled core (any worker is running)
+   err    = red solid dot
+*/
+.global-indicator {
+  position: relative; width: 20px; height: 20px;
+  display: inline-flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.global-indicator .core {
+  width: 10px; height: 10px; border-radius: 50%; background: var(--muted);
+  transition: background 0.2s;
+}
+.global-indicator.ok  .core { background: var(--ok); animation: gi-pulse 1.6s ease-in-out infinite; }
+.global-indicator.err .core { background: var(--err); }
+.global-indicator.active::before {
+  content: ""; position: absolute; inset: 0;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  border-top-color: var(--accent);
+  border-right-color: var(--accent);
+  animation: gi-spin 0.9s linear infinite;
+}
+.global-indicator.active .core { background: var(--accent); }
+@keyframes gi-spin  { to { transform: rotate(360deg); } }
+@keyframes gi-pulse {
+  0%, 100% { transform: scale(1);   opacity: 1; }
+  50%      { transform: scale(1.4); opacity: 0.55; }
+}
+.stats-bar {
+  display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+  color: var(--muted); justify-content: space-between;
+}
+.stats-left {
+  display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+  color: var(--muted);
+}
+.stats-left > * { white-space: nowrap; }
+.refresh-controls {
+  display: flex; gap: 10px; align-items: center; flex-wrap: nowrap;
+  color: var(--muted); font-size: 12px;
+}
+.interval-slider {
+  display: inline-flex; align-items: center; gap: 8px;
+  background: #11141c; padding: 4px 10px; border-radius: 14px;
+  border: 1px solid var(--border);
+}
+.interval-slider input[type="range"] {
+  width: 140px; margin: 0; accent-color: var(--accent);
+}
+.interval-display {
+  color: var(--accent); font-weight: 600; font-size: 11px;
+  min-width: 52px; text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+#btn-refresh {
+  width: 30px; height: 28px; padding: 0;
+  font-size: 15px; line-height: 1;
+}
+.badge {
+  padding: 2px 8px; border-radius: 10px;
+  font-size: 12px; background: #1b2030; border: 1px solid var(--border);
+}
+.badge.ok  { color: var(--ok); border-color: #1f4a36; }
+.badge.err { color: var(--err); border-color: #4d2127; }
+.badge.device-gpu {
+  color: #9af29a; border-color: #2f6a3a; background: #142617;
+  font-variant-numeric: tabular-nums; letter-spacing: 0.02em;
+}
+.badge.device-cpu {
+  color: #aab1c6; border-color: #3a4158; background: #1a1f2c;
+}
+button {
+  background: #1b2030; color: var(--fg); border: 1px solid var(--border);
+  border-radius: 6px; padding: 4px 10px; cursor: pointer; font-size: 13px;
+}
+button:hover { background: #232a3b; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+main { padding: 20px; max-width: 1400px; margin: 0 auto; }
+section { margin-bottom: 28px; }
+h2 { font-size: 15px; font-weight: 600; margin: 0 0 10px 0; color: var(--muted); }
+
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--border); vertical-align: middle; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
+tbody tr:nth-child(odd)  { background: var(--row); }
+tbody tr:nth-child(even) { background: var(--row-alt); }
+tbody tr.running { box-shadow: inset 3px 0 0 var(--accent); }
+tbody tr.row-toggle { cursor: pointer; transition: background 0.1s; }
+tbody tr.row-toggle:hover { background: #1a1f2e; }
+tbody tr.row-toggle.enabled { box-shadow: inset 3px 0 0 var(--ok); }
+tbody tr.row-toggle.enabled.running { box-shadow: inset 3px 0 0 var(--accent); }
+td.col-toggle { width: 48px; text-align: center; }
+td.empty { text-align: center; color: var(--muted); padding: 30px 0; }
+
+.state { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; }
+.state.idle     { color: var(--muted); background: #1b2030; }
+.state.building { color: var(--accent); background: #14243d; }
+.state.syncing  { color: var(--accent); background: #14243d; }
+.state.error    { color: var(--err); background: #33181c; }
+.state.disabled { color: var(--muted); background: #11141c; }
+
+.toggle {
+  appearance: none; width: 36px; height: 20px; background: #2a3044; border-radius: 10px;
+  position: relative; cursor: pointer; transition: background 0.15s;
+  vertical-align: middle;
+}
+.toggle:checked { background: var(--accent); }
+.toggle::before {
+  content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
+  background: #fff; border-radius: 50%; transition: left 0.15s;
+}
+.toggle:checked::before { left: 18px; }
+.toggle:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* Tabs */
+.tabs { margin-top: 10px; display: flex; gap: 2px; border-bottom: 1px solid var(--border); }
+.tab-btn {
+  background: transparent; border: 1px solid transparent; border-bottom: none;
+  color: var(--muted); padding: 8px 18px; cursor: pointer; font-size: 13px;
+  border-radius: 6px 6px 0 0; margin-bottom: -1px;
+}
+.tab-btn:hover { color: var(--fg); }
+.tab-btn.active {
+  background: var(--bg); color: var(--fg);
+  border-color: var(--border); border-bottom-color: var(--bg);
+}
+.tab-pane { display: none; }
+.tab-pane.active { display: block; }
+
+/* Eval card */
+.eval-card {
+  background: #0a0d14; border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 16px; margin-bottom: 14px;
+  display: flex; align-items: center; gap: 10px; font-size: 13px;
+}
+#eval-score { font-size: 16px; font-weight: 600; color: var(--fg); min-width: 50px; }
+#eval-score.ok   { color: var(--ok); }
+#eval-score.warn { color: var(--warn); }
+#eval-score.err  { color: var(--err); }
+
+/* Workers panel */
+.workers-card {
+  background: #0a0d14; border: 1px solid var(--border); border-radius: 8px;
+  padding: 14px 16px; margin-bottom: 24px;
+}
+.workers-header {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 12px;
+}
+.workers-header h2 { margin: 0; color: var(--fg); font-size: 14px; }
+.workers-scale { display: flex; align-items: center; gap: 8px; }
+.workers-scale button {
+  width: 28px; height: 28px; font-size: 16px; font-weight: 600;
+  padding: 0; border-radius: 14px;
+}
+.workers-scale #scale-target { font-size: 18px; font-weight: 600; min-width: 24px; text-align: center; }
+.workers-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 10px;
+}
+.worker-card {
+  background: #11151e; border: 1px solid var(--border); border-radius: 6px;
+  padding: 10px 12px; display: flex; flex-direction: column; gap: 4px;
+  font-size: 12px; min-height: 100px;
+}
+.worker-card.idle      { opacity: 0.55; }
+.worker-card.claiming,
+.worker-card.listing   { border-color: #2a3552; }
+.worker-card.building,
+.worker-card.syncing   { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+.worker-card.error     { border-color: #4d2127; }
+.worker-card.done      { border-color: #1f4a36; }
+
+/* GPU active: red light chasing around the card border.
+   Applied only when an active worker is running and the device reports
+   non-zero CUDA utilization. On CPU runs or when GPU is idle, the card
+   falls back to the blue/green borders above. */
+.worker-card.gpu-active {
+  position: relative;
+  /* transparent to let the animated gradient below show through */
+  border-color: transparent !important;
+  box-shadow: none !important;
+  background: #11151e;
+  background-clip: padding-box;
+}
+.worker-card.gpu-active::before {
+  content: "";
+  position: absolute;
+  inset: -2px;
+  border-radius: 8px;
+  padding: 2px;
+  background:
+    conic-gradient(
+      from var(--gpu-angle, 0deg),
+      rgba(255, 64, 64, 0)   0deg,
+      rgba(255, 64, 64, 0)   240deg,
+      #ff4040                300deg,
+      #ffb0b0                345deg,
+      #ff4040                360deg
+    );
+  /* carve out the inside so only the border-ring shows */
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+          mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+          mask-composite: exclude;
+  animation: gpu-chase 0.9s linear infinite;
+  pointer-events: none;
+  z-index: 1;
+}
+@property --gpu-angle {
+  syntax: "<angle>";
+  inherits: false;
+  initial-value: 0deg;
+}
+@keyframes gpu-chase {
+  to { --gpu-angle: 360deg; }
+}
+/* Fallback for browsers without @property support: still rotate, but
+   via transform on the pseudo-element. */
+@supports not (background: conic-gradient(from 0deg, red, red)) {
+  .worker-card.gpu-active::before {
+    background:
+      linear-gradient(90deg, rgba(255,64,64,0) 0%, #ff4040 50%, rgba(255,64,64,0) 100%);
+    animation: gpu-chase-fallback 0.9s linear infinite;
+  }
+  @keyframes gpu-chase-fallback {
+    0%   { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+  }
+}
+.worker-header {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 2px;
+}
+.worker-id { font-weight: 600; color: var(--accent); font-size: 12px; }
+.wstate {
+  display: inline-block; padding: 1px 7px; border-radius: 8px;
+  font-size: 10px; background: #1b2030; color: var(--muted);
+  text-transform: uppercase; letter-spacing: 0.04em;
+}
+.wstate.building,
+.wstate.syncing  { background: #14243d; color: var(--accent); }
+.wstate.error    { background: #33181c; color: var(--err); }
+.wstate.done     { background: #102b1d; color: var(--ok); }
+.wstate.listing,
+.wstate.claiming { background: #2a2017; color: var(--warn); }
+.worker-drive {
+  font-weight: 600; color: var(--fg); font-size: 13px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  padding: 2px 0;
+}
+.worker-phase { font-size: 10px; margin-top: -2px; }
+.worker-file { color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.worker-err { color: var(--err); font-size: 11px; }
+.worker-placeholder { color: var(--muted); text-align: center; padding: 30px 0; grid-column: 1/-1; }
+.worker-placeholder.err { color: var(--err); }
+
+.progress { height: 4px; background: #1b2030; border-radius: 2px; overflow: hidden; margin-top: 4px; }
+.progress-fill { height: 100%; background: var(--accent); transition: width 0.3s; }
+.progress-text { color: var(--muted); font-size: 11px; }
+
+/* When the worker is actively running, the fill bar shimmers so you can see
+   the daemon is alive even when percentage moves slowly. */
+.worker-card.building .progress-fill,
+.worker-card.syncing  .progress-fill,
+.worker-card.listing  .progress-fill,
+.worker-card.claiming .progress-fill {
+  background: linear-gradient(90deg, var(--accent) 0%, #a0c9ff 50%, var(--accent) 100%);
+  background-size: 200% 100%;
+  animation: progress-shimmer 1.4s linear infinite;
+}
+@keyframes progress-shimmer {
+  0%   { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* Per-worker state-badge spinner removed (C-4). The title-bar global
+   indicator + per-worker progress-bar shimmer provide enough activity
+   feedback without the animation overload. */
+
+.muted.small { font-size: 11px; }
+
+/* MCP users table + add button */
+#mcp-users-table td.actions { text-align: right; }
+.mcp-users-add { margin-top: 8px; }
+.mcp-users-add button { font-size: 13px; padding: 5px 12px; }
+code {
+  background: #11141c; padding: 1px 6px; border-radius: 3px;
+  color: var(--accent); font-family: Consolas, "Courier New", monospace; font-size: 90%;
+}
+
+/* MCP user row — clickable to show detail */
+tbody tr.row-user { cursor: pointer; transition: background 0.1s; }
+tbody tr.row-user:hover { background: #1a1f2e; }
+tbody tr.row-user.selected {
+  background: #14243d;
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+tbody tr.row-user.selected:hover { background: #19294a; }
+/* Per-user drive scope row — green edge when the drive is in scope */
+tbody tr.row-search.search-on { box-shadow: inset 3px 0 0 var(--ok); }
+
+/* MCP user detail — per-user drive scope */
+.detail-header { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+.detail-header h2 { margin: 0; }
+.back-btn {
+  background: #11141c; border: 1px solid var(--border);
+  color: var(--fg); padding: 6px 12px; border-radius: 4px; cursor: pointer;
+  font-size: 12px;
+}
+.back-btn:hover { background: #1a1f2e; }
+tbody tr.row-user-drive { cursor: pointer; transition: background 0.1s; }
+tbody tr.row-user-drive:hover { background: #1a1f2e; }
+tbody tr.row-user-drive.user-on { box-shadow: inset 3px 0 0 var(--accent); }
+
+.actions { text-align: right; white-space: nowrap; }
+.actions button { margin-right: 4px; font-size: 12px; padding: 3px 8px; }
+.actions .danger { color: var(--err); border-color: #4d2127; }
+/* Visual separator between everyday actions and the destructive one. */
+.actions .action-sep {
+  display: inline-block; width: 1px; height: 18px; margin: 0 10px 0 6px;
+  background: var(--border); vertical-align: middle;
+}
+/* Destructive: orange warning tone, smaller hit area, requires deliberate aim. */
+.actions .destructive {
+  color: var(--warn);
+  background: #2a1f10;
+  border-color: #4a3520;
+  font-size: 11px;
+  padding: 2px 8px;
+  opacity: 0.7;
+}
+.actions .destructive:hover {
+  opacity: 1;
+  background: #3b2a14;
+  color: #ffcc70;
+}
+
+.events {
+  background: #07090d; border: 1px solid var(--border); border-radius: 6px;
+  padding: 10px; height: 280px; overflow-y: auto; font-family: Consolas, "Courier New", monospace;
+  font-size: 12px; line-height: 1.5;
+}
+.events .evt { display: block; padding: 1px 0; }
+.events .evt .ts { color: var(--muted); margin-right: 6px; }
+.events .evt .lvl { display: inline-block; width: 44px; text-align: center; margin-right: 6px; border-radius: 3px; font-size: 10px; padding: 1px 0; }
+.events .evt .lvl.info  { color: var(--accent); background: #14243d; }
+.events .evt .lvl.warn  { color: var(--warn); background: #3a2e13; }
+.events .evt .lvl.error { color: var(--err); background: #33181c; }
+.events .evt .fd { color: var(--muted); margin-right: 6px; }
+.events .evt .ev { color: var(--fg); margin-right: 6px; font-weight: 600; }
+.events .evt .msg { color: var(--muted); }

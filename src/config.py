@@ -1,137 +1,128 @@
-"""config.env の読み込みと設定値の管理。"""
+"""Config loader (Windows-native).
+
+UTF-8 is enforced on all file reads (see CLAUDE.md feedback_windows_utf8).
+"""
+from __future__ import annotations
 
 import os
 import sys
 from pathlib import Path
 
-
-class WorkerStatus:
-    """ワーカーの進捗 JSON に書き込む status 値の定数。
-
-    monitor_render.py と build_parallel.py で共有する。
-    JSON は文字列で保存されるため str サブクラスにしない（定数として参照するだけ）。
-
-    一覧:
-        LOADING            : モデル・認証の初期化中
-        RUNNING            : 通常稼働中（ファイル処理中）
-        READY              : タスク待ち（次タスクの開始前）
-        RATE_LIMITED       : API レート制限で一時停止中
-        RATE_LIMITED_RUNNING: 処理継続しつつレート制限待ち
-        DONE               : 全担当タスク完了
-    """
-    LOADING             = "loading"
-    RUNNING             = "running"
-    READY               = "ready"
-    RATE_LIMITED        = "rate_limited"
-    RATE_LIMITED_RUNNING = "rate_limited_running"
-    DONE                = "done"
-
-PROJECT_ROOT = Path(__file__).parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# Config path lookup: prefer the versioned v2 file, fall back to legacy.
+# Both are tried in order; the first that exists is loaded.
+CONFIG_PATH_CANDIDATES = [
+    PROJECT_ROOT / "config" / "config.v2.env",
+    PROJECT_ROOT / "config" / "config.env",
+]
+CONFIG_PATH: Path | None = None  # set by load_config()
 
 
-def load_config():
-    """config.env を読み込んで環境変数にセットする。"""
-    config_path = PROJECT_ROOT / "config.env"
-    if not config_path.exists():
-        print(f"エラー: {config_path} が見つかりません。")
-        print("config.env.example をコピーして config.env を作成してください。")
+def load_config() -> None:
+    global CONFIG_PATH
+    path = next((p for p in CONFIG_PATH_CANDIDATES if p.exists()), None)
+    if path is None:
+        if os.environ.get("WINSERVERRAG_SKIP_CONFIG") == "1":
+            return
+        shown = " / ".join(str(p) for p in CONFIG_PATH_CANDIDATES)
+        print(f"ERROR: no config.env found (looked at: {shown}).",
+              file=sys.stderr)
         sys.exit(1)
-    with open(config_path, encoding="utf-8") as f:
+    CONFIG_PATH = path
+    with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            key, _, value = line.partition("=")
-            os.environ.setdefault(key.strip(), value.strip())
+            k, _, v = line.partition("=")
+            os.environ.setdefault(k.strip(), v.strip())
 
 
-if os.environ.get("GRIDWORLDRAG_SKIP_CONFIG") != "1":
+if os.environ.get("WINSERVERRAG_SKIP_CONFIG") != "1":
     load_config()
 
-    # 必須環境変数のバリデーション
-    _REQUIRED = ["GOOGLE_EMAIL", "GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET"]
-    _missing = [v for v in _REQUIRED if v not in os.environ]
+    # Required env vars. Fail fast with a clear message instead of letting
+    # OAuth/DB calls throw opaque errors later.
+    _REQUIRED = [
+        "GOOGLE_EMAIL",
+        "GOOGLE_OAUTH_CLIENT_ID",
+        "GOOGLE_OAUTH_CLIENT_SECRET",
+        "PGPASSWORD",
+    ]
+    _missing = [k for k in _REQUIRED if not os.environ.get(k)]
     if _missing:
-        print(f"エラー: config.env に以下の値がありません: {', '.join(_missing)}")
+        print(f"ERROR: config.env is missing: {', '.join(_missing)}",
+              file=sys.stderr)
         sys.exit(1)
 
-# Google OAuth
-GOOGLE_EMAIL = os.environ.get("GOOGLE_EMAIL", "")
-GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "")
-GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET", "")
 
-# PostgreSQL
-# DB_INDEX で gridworldrag_0 / gridworldrag_1 ... を切り替える。
-# PGDATABASE を直接指定した場合はそちらが優先される。
-DB_INDEX = int(os.environ.get("GRIDWORLDRAG_DB_INDEX", "0"))
-DB_NAME = os.environ.get("PGDATABASE", f"gridworldrag_{DB_INDEX}")
-DB_USER = os.environ.get("PGUSER", os.getenv("USER", ""))
-DB_HOST = os.environ.get("PGHOST", "localhost")
-DB_PORT = os.environ.get("PGPORT", "5432")
-
-# インデックス対象スコープ
-INDEX_MY_DRIVE = os.environ.get("INDEX_MY_DRIVE", "0") == "1"
-INDEX_SHARED_DRIVES = os.environ.get("INDEX_SHARED_DRIVES", "1") == "1"
-INDEX_IMAGE_OCR = os.environ.get("INDEX_IMAGE_OCR", "0") == "1"
-PARALLEL_WORKERS = int(os.environ.get("PARALLEL_WORKERS", "8"))
-TASK_SPLIT_THRESHOLD = int(os.environ.get("TASK_SPLIT_THRESHOLD", "5000"))
-MONITOR_INTERVAL_MS = int(os.environ.get("MONITOR_INTERVAL_MS", "800"))
-WORKER_START_INTERVAL_SEC = float(os.environ.get("WORKER_START_INTERVAL_SEC", "5"))
-DRIVE_DOWNLOAD_TIMEOUT_SEC = int(os.environ.get("DRIVE_DOWNLOAD_TIMEOUT_SEC", "30"))
-FETCH_THREADS = int(os.environ.get("FETCH_THREADS", "3"))
-
-# build_parallel の /tmp 空き容量プリフライト閾値 (issue #12)
-# taskdata.pkl / filelist.pkl の書き込みが ENOSPC で失敗すると silent data loss を起こすため、
-# 起動時に /tmp の空き容量をチェックして不足時は即 abort する。
-# デフォルト 500MB (大規模ビルドでも taskdata.pkl は数百MB 程度)
-BUILD_MIN_TMP_FREE_BYTES = int(os.environ.get("BUILD_MIN_TMP_FREE_BYTES", str(500 * 1024 * 1024)))
-
-# 埋め込み
-EMBEDDING_MODEL = "paraphrase-multilingual-mpnet-base-v2"
-CHUNK_SIZE = 600
-CHUNK_OVERLAP = 120
-BATCH_SIZE = 100
-# PyTorch デバイス: auto (デフォルト、MPS/CUDA 優先), cpu (強制 CPU, MPS クラッシュ回避), mps, cuda
-# Apple Silicon + PyTorch MPS backend のメモリ破壊バグに遭遇した場合は cpu に設定:
-#   EMBEDDING_DEVICE=cpu   # config.env
-# 参考: https://github.com/pytorch/pytorch/issues?q=MPS+softmax
-EMBEDDING_DEVICE = os.environ.get("EMBEDDING_DEVICE", "auto")
-
-# Google API リトライ設定 (issue #5)
-# _api_call_with_retry のデフォルト挙動を config.env から制御可能にする。
-API_MAX_RETRIES = int(os.environ.get("API_MAX_RETRIES", "6"))
-API_BASE_DELAY_SEC = float(os.environ.get("API_BASE_DELAY_SEC", "5"))
-# シート値取得専用の retry 上限 (メタデータ取得より厳しく設定可能)
-API_SHEET_MAX_RETRIES = int(os.environ.get("API_SHEET_MAX_RETRIES", "6"))
-
-# Telegram 通知設定 (issue #7)
-# retry_pending 数が閾値を超えたら Telegram に直接 HTTPS API で送信する
-# 空文字なら通知無効
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-TELEGRAM_RETRY_PENDING_THRESHOLD = int(os.environ.get("TELEGRAM_RETRY_PENDING_THRESHOLD", "10"))
-# 同じ閾値で連続通知しないためのクールダウン (秒)
-TELEGRAM_NOTIFY_COOLDOWN_SEC = int(os.environ.get("TELEGRAM_NOTIFY_COOLDOWN_SEC", "3600"))
-
-# パス
-TOKEN_PATH = PROJECT_ROOT / os.environ.get("GOOGLE_TOKEN_PATH", "token.pickle")
-SHARED_DRIVES_WHITELIST_PATH = PROJECT_ROOT / "shared_drives_whitelist.txt"
+def _env(name: str, default: str = "") -> str:
+    return os.environ.get(name, default)
 
 
-def load_shared_drives_whitelist():
-    """shared_drives_whitelist.txt からドライブ ID のセットを返す。
+def _env_int(name: str, default: int) -> int:
+    v = os.environ.get(name)
+    return int(v) if v is not None and v != "" else default
 
-    ファイルが存在しない場合は空セット（全共有ドライブ対象外）。
-    """
-    if not SHARED_DRIVES_WHITELIST_PATH.exists():
-        return set()
-    ids = set()
-    with open(SHARED_DRIVES_WHITELIST_PATH, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            drive_id = line.split("\t")[0].split(" ")[0].strip()
-            if drive_id:
-                ids.add(drive_id)
-    return ids
+
+def _env_float(name: str, default: float) -> float:
+    v = os.environ.get(name)
+    return float(v) if v is not None and v != "" else default
+
+
+# --- Google ---
+GOOGLE_EMAIL = _env("GOOGLE_EMAIL")
+GOOGLE_CLIENT_ID = _env("GOOGLE_OAUTH_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = _env("GOOGLE_OAUTH_CLIENT_SECRET")
+TOKEN_PATH = PROJECT_ROOT / _env("GOOGLE_TOKEN_PATH", "config/token.pickle")
+
+# --- PostgreSQL ---
+PG_HOST = _env("PGHOST", "localhost")
+PG_PORT = _env("PGPORT", "5432")
+PG_USER = _env("PGUSER", "postgres")
+PG_PASSWORD = _env("PGPASSWORD", "")
+PG_DATABASE = _env("PGDATABASE", "winserverrag")
+
+# --- Indexing ---
+INDEX_IMAGE_OCR = _env("INDEX_IMAGE_OCR", "0") == "1"
+DRIVE_DOWNLOAD_TIMEOUT_SEC = _env_int("DRIVE_DOWNLOAD_TIMEOUT_SEC", 30)
+
+# --- Embedding ---
+EMBEDDING_MODEL = _env("EMBEDDING_MODEL", "paraphrase-multilingual-mpnet-base-v2")
+EMBEDDING_DEVICE = _env("EMBEDDING_DEVICE", "auto")
+CHUNK_SIZE = _env_int("CHUNK_SIZE", 600)
+CHUNK_OVERLAP = _env_int("CHUNK_OVERLAP", 120)
+BATCH_SIZE = _env_int("BATCH_SIZE", 64)
+EMBEDDING_DIM = 768  # multi-qa-mpnet & paraphrase-multilingual-mpnet
+
+# Reranker (cross-encoder) — lifts search quality after cosine retrieval.
+# 0 = disabled, 1 = enabled. Pulls the model on first search; ~500MB.
+ENABLE_RERANKER = _env("ENABLE_RERANKER", "1") == "1"
+RERANKER_MODEL = _env("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
+# How many candidates to retrieve from vector search before reranking.
+# Larger = better recall, more compute. 50 is a sane default.
+RERANKER_CANDIDATE_K = _env_int("RERANKER_CANDIDATE_K", 50)
+
+# --- API retry ---
+API_MAX_RETRIES = _env_int("API_MAX_RETRIES", 6)
+API_BASE_DELAY_SEC = _env_float("API_BASE_DELAY_SEC", 5.0)
+API_SHEET_MAX_RETRIES = _env_int("API_SHEET_MAX_RETRIES", 6)
+
+# --- Daemon ---
+DAEMON_ROTATE_INTERVAL_SEC = _env_int("DAEMON_ROTATE_INTERVAL_SEC", 300)
+DAEMON_MIN_FREE_BYTES = _env_int("DAEMON_MIN_FREE_BYTES", 1_073_741_824)
+# Parallel worker threads (each builds/syncs one FD at a time).
+# 4 is a reasonable default on a laptop; increase to saturate CPU for CPU-bound
+# embedding, decrease if Google Drive / Sheets quota errors appear.
+DAEMON_WORKER_THREADS = _env_int("DAEMON_WORKER_THREADS", 4)
+
+# --- Control API ---
+API_HOST = _env("API_HOST", "127.0.0.1")
+API_PORT = _env_int("API_PORT", 17600)
+API_BEARER_TOKEN = _env("API_BEARER_TOKEN", "")
+
+# --- Derived paths ---
+LOGS_DIR = PROJECT_ROOT / "logs"
+LOGS_DIR.mkdir(exist_ok=True)
+LOCK_DIR = PROJECT_ROOT / "run"
+LOCK_DIR.mkdir(exist_ok=True)

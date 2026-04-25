@@ -1,353 +1,1266 @@
-"""PostgreSQL + pgvector データベース操作。"""
+"""PostgreSQL + pgvector helpers (psycopg3).
+
+Per-folder-drive architecture: each shared drive gets its own schema
+named `fd_<drive_id>` containing a `documents` table. Public schema
+holds `fd_registry` and `daemon_events`.
+
+LIKE escape: drive_file_id contains underscores (base64url), so all LIKE
+queries must escape `_` / `%` / `\\` and use ESCAPE '\\'.
+"""
+from __future__ import annotations
 
 import json
 import re
-import sys
+from contextlib import contextmanager
+from typing import Iterable, Iterator, Optional
 
-import psycopg2
-from pgvector.psycopg2 import register_vector
+import psycopg
+from psycopg.rows import dict_row
+from pgvector.psycopg import register_vector
 
-from src.config import DB_NAME, DB_USER, DB_HOST, DB_PORT
+from src.config import (
+    PG_DATABASE, PG_HOST, PG_PORT, PG_USER, PG_PASSWORD, EMBEDDING_DIM,
+)
+
+# ---------------------------------------------------------------------
+# drive_id <-> schema name
+# ---------------------------------------------------------------------
+_DRIVE_ID_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
 
 
-def _escape_like_literal(value):
-    """PostgreSQL LIKE のメタ文字 (\\ % _) をエスケープする。
+def schema_for_drive(drive_id: str) -> str:
+    """Derive a safe PostgreSQL identifier from a Google Drive ID.
 
-    Drive file ID は base64url で '_' を含みうるため、生の値を LIKE パターンに
-    埋め込むと '_' がワイルドカードとして解釈されて誤爆する。必ずこれを通すこと。
-    呼び出し側は LIKE ... ESCAPE '\\' を指定すること。
+    Google drive_ids are base64url (contains '-'), which is not valid in
+    unquoted identifiers. We map '-' -> '_' so the schema name can appear
+    unquoted inside composed identifiers like 'idx_<schema>_documents_*'.
+    Collision risk is astronomically low in practice (drive_ids are 19+ chars).
     """
+    if not _DRIVE_ID_RE.match(drive_id):
+        raise ValueError(f"unsafe drive_id: {drive_id!r}")
+    safe = drive_id.replace("-", "_")
+    return f"fd_{safe}"
+
+
+def _quote_ident(name: str) -> str:
+    # psycopg 3 can use sql.Identifier, but we use it explicitly below.
+    if not re.match(r"^[A-Za-z0-9_]+$", name):
+        raise ValueError(f"invalid identifier: {name!r}")
+    return f'"{name}"'
+
+
+# ---------------------------------------------------------------------
+# Connection
+# ---------------------------------------------------------------------
+def connect(dbname: Optional[str] = None, *, autocommit: bool = False) -> psycopg.Connection:
+    conn = psycopg.connect(
+        host=PG_HOST,
+        port=PG_PORT,
+        user=PG_USER,
+        password=PG_PASSWORD,
+        dbname=dbname or PG_DATABASE,
+        autocommit=autocommit,
+        row_factory=dict_row,
+    )
+    try:
+        register_vector(conn)
+    except Exception:
+        # Vector type registration can fail if extension not yet loaded;
+        # re-register after CREATE EXTENSION.
+        pass
+    return conn
+
+
+@contextmanager
+def cursor(conn: psycopg.Connection) -> Iterator[psycopg.Cursor]:
+    cur = conn.cursor()
+    try:
+        yield cur
+    finally:
+        cur.close()
+
+
+# ---------------------------------------------------------------------
+# Database / schema bootstrap
+# ---------------------------------------------------------------------
+def ensure_database() -> None:
+    """Create the target database if it does not exist. Uses postgres db."""
+    admin = psycopg.connect(
+        host=PG_HOST, port=PG_PORT, user=PG_USER, password=PG_PASSWORD,
+        dbname="postgres", autocommit=True,
+    )
+    try:
+        with admin.cursor() as cur:
+            cur.execute("SELECT 1 FROM pg_database WHERE datname=%s", (PG_DATABASE,))
+            if cur.fetchone() is None:
+                cur.execute(f'CREATE DATABASE "{PG_DATABASE}"')
+    finally:
+        admin.close()
+
+
+def apply_global_schema(conn: psycopg.Connection) -> None:
+    """Apply schema.sql (public.fd_registry, public.daemon_events, vector ext).
+
+    Re-registers the pgvector type on this connection after CREATE EXTENSION,
+    so that callers who used connect() on an extension-less DB will now be able
+    to insert VECTOR columns on the same connection.
+    """
+    from pathlib import Path
+    sql_path = Path(__file__).resolve().parent.parent / "schema.sql"
+    with open(sql_path, encoding="utf-8") as f:
+        sql = f.read()
+    with conn.cursor() as cur:
+        cur.execute(sql)
+    conn.commit()
+    try:
+        register_vector(conn)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------
+# Per-FD schema
+# ---------------------------------------------------------------------
+# Two placeholders here on purpose:
+#   {schema_q}   -> quoted identifier for use as a schema reference ("fd_xxx")
+#   {schema_raw} -> raw identifier for composition inside other identifier
+#                   names (idx_<schema_raw>_documents_*) where quotes would
+#                   be invalid SQL syntax.
+_FD_SCHEMA_SQL = """
+CREATE SCHEMA IF NOT EXISTS {schema_q};
+
+CREATE TABLE IF NOT EXISTS {schema_q}.documents (
+    id                BIGSERIAL PRIMARY KEY,
+    drive_file_id     TEXT UNIQUE NOT NULL,
+    title             TEXT,
+    content           TEXT,
+    chunk_index       INTEGER,
+    owner             TEXT,
+    source_url        TEXT,
+    file_type         TEXT,
+    drive_modified_at TIMESTAMPTZ,
+    embedding         VECTOR({dim}),
+    sheet_gid         TEXT,
+    sheet_name        TEXT,
+    permissions       JSONB,
+    partial_content   BOOLEAN NOT NULL DEFAULT FALSE,
+    folder_path       TEXT DEFAULT '',
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_{schema_raw}_documents_embedding
+    ON {schema_q}.documents USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+CREATE INDEX IF NOT EXISTS idx_{schema_raw}_documents_drive_file_id
+    ON {schema_q}.documents (drive_file_id);
+CREATE INDEX IF NOT EXISTS idx_{schema_raw}_documents_owner
+    ON {schema_q}.documents (owner);
+CREATE INDEX IF NOT EXISTS idx_{schema_raw}_documents_modified
+    ON {schema_q}.documents (drive_modified_at);
+CREATE INDEX IF NOT EXISTS idx_{schema_raw}_documents_sheet_gid
+    ON {schema_q}.documents (sheet_gid);
+"""
+
+
+def ensure_fd_schema(conn: psycopg.Connection, drive_id: str) -> str:
+    """Create the per-FD schema + tables + indexes if missing.
+
+    PostgreSQL's `CREATE SCHEMA IF NOT EXISTS` is NOT race-free: concurrent
+    callers can both see "does not exist", both proceed, and one loses with
+    a pg_namespace unique-violation. We detect "already exists" (SQLSTATE
+    42P06 `duplicate_schema` or 23505 `unique_violation` on pg_namespace)
+    and treat it as success. Same for index name collisions (42P07).
+    """
+    schema = schema_for_drive(drive_id)
+    sql = _FD_SCHEMA_SQL.format(
+        schema_q=_quote_ident(schema),
+        schema_raw=schema,
+        dim=EMBEDDING_DIM,
+    )
+    for _attempt in range(3):
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+            conn.commit()
+            return schema
+        except psycopg.errors.DuplicateSchema:
+            conn.rollback()
+            return schema
+        except psycopg.errors.DuplicateTable:
+            conn.rollback()
+            return schema
+        except psycopg.errors.DuplicateObject:
+            # e.g., index already exists from a parallel create
+            conn.rollback()
+            return schema
+        except psycopg.errors.UniqueViolation as e:
+            # Typically pg_namespace_nspname_index race. Re-check existence.
+            conn.rollback()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM information_schema.schemata WHERE schema_name=%s",
+                    (schema,),
+                )
+                if cur.fetchone() is not None:
+                    return schema
+            # Not there after rollback — unexpected, re-raise
+            raise
+        except Exception:
+            conn.rollback()
+            raise
+    return schema
+
+
+def drop_fd_schema(conn: psycopg.Connection, drive_id: str) -> None:
+    schema = schema_for_drive(drive_id)
+    with conn.cursor() as cur:
+        cur.execute(f'DROP SCHEMA IF EXISTS {_quote_ident(schema)} CASCADE')
+    conn.commit()
+
+
+# ---------------------------------------------------------------------
+# fd_registry
+# ---------------------------------------------------------------------
+def list_fds(conn: psycopg.Connection) -> list[dict]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT drive_id, name, enabled, search_enabled, state,
+                   last_sync_at, last_build_at,
+                   file_count, chunk_count,
+                   file_count_estimate, file_count_estimate_at,
+                   rotate_token, pending_rotate_token, total_files_listed,
+                   last_error, created_at, updated_at
+            FROM public.fd_registry
+            ORDER BY name
+            """
+        )
+        return cur.fetchall()
+
+
+def get_fd(conn: psycopg.Connection, drive_id: str) -> Optional[dict]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM public.fd_registry WHERE drive_id=%s",
+            (drive_id,),
+        )
+        return cur.fetchone()
+
+
+def upsert_fd(conn: psycopg.Connection, drive_id: str, name: str,
+              enabled: Optional[bool] = None) -> None:
+    with conn.cursor() as cur:
+        if enabled is None:
+            cur.execute(
+                """
+                INSERT INTO public.fd_registry (drive_id, name)
+                VALUES (%s, %s)
+                ON CONFLICT (drive_id) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    updated_at = NOW()
+                """,
+                (drive_id, name),
+            )
+        else:
+            cur.execute(
+                """
+                INSERT INTO public.fd_registry (drive_id, name, enabled)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (drive_id) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    enabled = EXCLUDED.enabled,
+                    updated_at = NOW()
+                """,
+                (drive_id, name, enabled),
+            )
+    conn.commit()
+
+
+def set_enabled(conn: psycopg.Connection, drive_id: str, enabled: bool) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE public.fd_registry
+               SET enabled=%s,
+                   state = CASE WHEN %s THEN COALESCE(NULLIF(state,'disabled'),'idle') ELSE 'disabled' END,
+                   updated_at = NOW()
+             WHERE drive_id=%s
+            """,
+            (enabled, enabled, drive_id),
+        )
+    conn.commit()
+
+
+def set_search_enabled(conn: psycopg.Connection, drive_id: str, enabled: bool) -> None:
+    """Flip the MCP-search-scope flag for a drive. Independent of build enabled."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE public.fd_registry SET search_enabled=%s, updated_at=NOW() WHERE drive_id=%s",
+            (enabled, drive_id),
+        )
+    conn.commit()
+
+
+def set_state(conn: psycopg.Connection, drive_id: str, state: str,
+              error: Optional[str] = None) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE public.fd_registry
+               SET state=%s,
+                   last_error = CASE WHEN %s='error' THEN %s ELSE NULL END,
+                   updated_at = NOW()
+             WHERE drive_id=%s
+            """,
+            (state, state, error, drive_id),
+        )
+    conn.commit()
+
+
+def touch_sync(conn: psycopg.Connection, drive_id: str, *, built: bool = False) -> None:
+    sql = """
+        UPDATE public.fd_registry
+           SET last_sync_at = NOW(),
+               {maybe_build}
+               updated_at = NOW()
+         WHERE drive_id=%s
+    """.format(maybe_build="last_build_at = NOW()," if built else "")
+    with conn.cursor() as cur:
+        cur.execute(sql, (drive_id,))
+    conn.commit()
+
+
+# ---------------------------------------------------------------------
+# v0.4: build lifecycle helpers for the task-queue daemon
+# ---------------------------------------------------------------------
+def begin_build(conn: psycopg.Connection, drive_id: str,
+                start_token: str, total_files: int) -> None:
+    """Mark a build as in-progress with the start token captured (held in
+    pending_rotate_token) and the total file count recorded. Idempotent."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE public.fd_registry
+               SET state='building',
+                   pending_rotate_token=%s,
+                   total_files_listed=%s,
+                   cancel_requested=FALSE,
+                   last_error=NULL,
+                   updated_at=NOW()
+             WHERE drive_id=%s
+            """,
+            (start_token, total_files, drive_id),
+        )
+    conn.commit()
+
+
+def commit_build(conn: psycopg.Connection, drive_id: str) -> None:
+    """Finalize a build: commit pending_rotate_token → rotate_token,
+    set state='idle', last_build_at=NOW, and recompute file/chunk counts
+    via a single aggregate query on the FD schema."""
+    schema = schema_for_drive(drive_id)
+    with conn.cursor() as cur:
+        # Recompute counts with our double split_part trick
+        # (spreadsheets have {file_id}_sheet_{gid}_chunk_{n} — strip both).
+        cur.execute(
+            f"""
+            SELECT COUNT(DISTINCT split_part(split_part(drive_file_id,'_chunk_',1),
+                                              '_sheet_', 1)) AS files,
+                   COUNT(*) AS chunks
+              FROM {_quote_ident(schema)}.documents
+            """
+        )
+        row = cur.fetchone() or {"files": 0, "chunks": 0}
+        cur.execute(
+            """
+            UPDATE public.fd_registry
+               SET rotate_token = COALESCE(pending_rotate_token, rotate_token),
+                   pending_rotate_token = NULL,
+                   total_files_listed = NULL,
+                   cancel_requested = FALSE,
+                   file_count = %s,
+                   chunk_count = %s,
+                   last_build_at = NOW(),
+                   last_sync_at = NOW(),
+                   state = 'idle',
+                   updated_at = NOW()
+             WHERE drive_id=%s
+            """,
+            (row["files"], row["chunks"], drive_id),
+        )
+    conn.commit()
+
+
+def abort_build(conn: psycopg.Connection, drive_id: str, *,
+                drop_schema: bool = False) -> None:
+    """Clear build state when a cancelled drive is cleaned up. If
+    drop_schema is True, the per-FD schema is also dropped (used when
+    cancel happens during initial full-build where data was partial)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE public.fd_registry
+               SET pending_rotate_token = NULL,
+                   total_files_listed = NULL,
+                   cancel_requested = FALSE,
+                   state = 'idle',
+                   updated_at = NOW()
+             WHERE drive_id=%s
+            """,
+            (drive_id,),
+        )
+    conn.commit()
+    if drop_schema:
+        drop_fd_schema(conn, drive_id)
+
+
+def request_cancel(conn: psycopg.Connection, drive_id: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE public.fd_registry SET cancel_requested=TRUE, updated_at=NOW() WHERE drive_id=%s",
+            (drive_id,),
+        )
+    conn.commit()
+
+
+def is_cancel_requested(conn: psycopg.Connection, drive_id: str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT cancel_requested FROM public.fd_registry WHERE drive_id=%s",
+            (drive_id,),
+        )
+        r = cur.fetchone()
+        return bool(r and r["cancel_requested"])
+
+
+def inflight_workers_on_drive(conn: psycopg.Connection, drive_id: str) -> int:
+    """Workers currently heart-beating on this drive in an active state.
+    Used by the manager to decide whether finalize can be enqueued."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*)::int AS n
+              FROM public.daemon_workers
+             WHERE drive_id = %s
+               AND state IN ('claiming','listing','building','syncing')
+               AND heartbeat_at > NOW() - INTERVAL '60 seconds'
+            """,
+            (drive_id,),
+        )
+        return int((cur.fetchone() or {"n": 0})["n"])
+
+
+def set_file_count_estimate(conn: psycopg.Connection, drive_id: str, count: int) -> None:
+    """Write the drive's cached file-count estimate. Caller does not need to
+    manage transactions — commits on success, rolls back on error."""
+    with conn.cursor() as cur:
+        try:
+            cur.execute(
+                "UPDATE public.fd_registry "
+                "   SET file_count_estimate=%s, file_count_estimate_at=NOW() "
+                " WHERE drive_id=%s",
+                (count, drive_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def set_rotate_token(conn: psycopg.Connection, drive_id: str, token: Optional[str]) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE public.fd_registry SET rotate_token=%s, updated_at=NOW() WHERE drive_id=%s",
+            (token, drive_id),
+        )
+    conn.commit()
+
+
+def update_counts(conn: psycopg.Connection, drive_id: str) -> None:
+    schema = schema_for_drive(drive_id)
+    with conn.cursor() as cur:
+        # drive_file_id layouts (see indexer.make_chunk_entry):
+        #   regular:     {file_id}_chunk_{n}
+        #   spreadsheet: {file_id}_sheet_{gid}_chunk_{n}
+        # Strip the trailing _chunk_N first, then the optional _sheet_GID tail.
+        cur.execute(
+            f"""
+            SELECT COUNT(DISTINCT split_part(split_part(drive_file_id, '_chunk_', 1),
+                                              '_sheet_', 1)) AS files,
+                   COUNT(*) AS chunks
+            FROM {_quote_ident(schema)}.documents
+            """
+        )
+        row = cur.fetchone() or {"files": 0, "chunks": 0}
+        cur.execute(
+            """
+            UPDATE public.fd_registry
+               SET file_count=%s, chunk_count=%s, updated_at=NOW()
+             WHERE drive_id=%s
+            """,
+            (row["files"], row["chunks"], drive_id),
+        )
+    conn.commit()
+
+
+def delete_fd(conn: psycopg.Connection, drive_id: str) -> None:
+    drop_fd_schema(conn, drive_id)
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM public.fd_registry WHERE drive_id=%s", (drive_id,))
+    conn.commit()
+
+
+# ---------------------------------------------------------------------
+# Worker state (live multi-thread progress)
+# ---------------------------------------------------------------------
+def heartbeat_worker(conn: psycopg.Connection, worker_id: int, **fields) -> None:
+    """UPSERT worker state. heartbeat_at is always set to NOW().
+
+    Accepted fields: state, phase, drive_id, drive_name, current_file,
+    files_done, total_files, started_at, last_error.
+    """
+    allowed = {
+        "state", "phase", "drive_id", "drive_name", "current_file",
+        "files_done", "total_files", "started_at", "last_error",
+    }
+    use = {k: v for k, v in fields.items() if k in allowed}
+    cols = ["worker_id", "heartbeat_at"] + list(use.keys())
+    vals: list = [worker_id]
+    placeholders: list[str] = ["%s", "NOW()"]
+    for k in use:
+        placeholders.append("%s")
+        vals.append(use[k])
+    update_parts = [f"{k}=EXCLUDED.{k}" for k in use]
+    update_parts.append("heartbeat_at=NOW()")
+    sql = (
+        f"INSERT INTO public.daemon_workers ({', '.join(cols)}) "
+        f"VALUES ({', '.join(placeholders)}) "
+        f"ON CONFLICT (worker_id) DO UPDATE SET "
+        f"{', '.join(update_parts)}"
+    )
+    with conn.cursor() as cur:
+        cur.execute(sql, vals)
+    conn.commit()
+
+
+def list_workers(conn: psycopg.Connection) -> list[dict]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT worker_id, drive_id, drive_name, state, phase, current_file,
+                   files_done, total_files, started_at, heartbeat_at, last_error
+            FROM public.daemon_workers
+            ORDER BY worker_id
+            """
+        )
+        return cur.fetchall()
+
+
+def clear_workers(conn: psycopg.Connection) -> None:
+    """Truncate worker state — use at daemon startup."""
+    with conn.cursor() as cur:
+        cur.execute("TRUNCATE public.daemon_workers")
+    conn.commit()
+
+
+def cleanup_zombies(conn: psycopg.Connection, stale_after_sec: int = 300) -> dict:
+    """Garbage-collect stale daemon state.
+
+    1) daemon_workers rows with no heartbeat in `stale_after_sec` are deleted
+       — they represent workers whose process/thread died without cleanup.
+    2) fd_registry rows stuck in 'building' or 'syncing' with no live worker
+       currently working on them AND no recent write to their own per-FD
+       schema are reset to 'idle', so the next sweep re-enqueues them and
+       the work actually restarts.
+
+    The schema-write guard is important under file-level parallelism: when
+    4 workers share a queue across multiple drives, a given drive can have
+    no matching worker.drive_id heartbeat for 60+ sec even though its
+    files are being processed — the workers just happen to be on other
+    drives right now. Without this guard, we reset state to 'idle', the
+    completion-detection path never fires, and commit_build never runs —
+    leaving the schema full of data but fd_registry showing 0/N.
+
+    Returns: {"workers_removed": [...], "drives_reset": [...]}
+    """
+    removed_workers: list[int] = []
+    reset_drives: list[str] = []
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM public.daemon_workers
+            WHERE heartbeat_at < NOW() - make_interval(secs => %s)
+            RETURNING worker_id
+            """,
+            (stale_after_sec,),
+        )
+        removed_workers = [r["worker_id"] for r in cur.fetchall()]
+
+        # Phase 1: find candidate drives — state=building/syncing with no
+        # matching worker heartbeat. These are the "might be stuck" set.
+        # The heartbeat window uses the same stale_after_sec the caller
+        # gave us for worker deletion, so the two scales stay in sync.
+        # With huge-file downloads (Drive API pulling 100MB+ exports)
+        # workers can legitimately stay on a single file for minutes
+        # without writing a new heartbeat; 60 sec was far too tight.
+        cur.execute(
+            """
+            SELECT f.drive_id
+              FROM public.fd_registry f
+             WHERE f.state IN ('building','syncing')
+               AND NOT EXISTS (
+                 SELECT 1 FROM public.daemon_workers w
+                  WHERE w.drive_id = f.drive_id
+                    AND w.heartbeat_at > NOW() - make_interval(secs => %s)
+                    AND w.state IN ('claiming','listing','building','syncing')
+               )
+            """,
+            (stale_after_sec,),
+        )
+        candidates = [r["drive_id"] for r in cur.fetchall()]
+
+        # Phase 2: for each candidate, check whether the per-FD schema has
+        # received a new document row in the last 120 seconds. Recent
+        # writes prove that some worker *is* processing this drive right
+        # now, just not one whose current heartbeat drive_id matches.
+        still_alive: set[str] = set()
+        for did in candidates:
+            schema = schema_for_drive(did)
+            # Safely skip if the schema hasn't been created yet.
+            cur.execute(
+                "SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname=%s",
+                (schema,),
+            )
+            if not cur.fetchone():
+                continue
+            try:
+                cur.execute(
+                    f"SELECT MAX(created_at) AS last_write FROM {_quote_ident(schema)}.documents"
+                )
+                row = cur.fetchone()
+            except Exception:
+                conn.rollback()
+                continue
+            last_write = row and row.get("last_write")
+            if last_write is None:
+                continue
+            # 120 sec is enough to cover one slow PDF / big sheet. If the
+            # schema has seen a row this recently, don't reset.
+            cur.execute(
+                "SELECT (NOW() - %s) < INTERVAL '120 seconds' AS recent",
+                (last_write,),
+            )
+            if cur.fetchone()["recent"]:
+                still_alive.add(did)
+
+        # Phase 3: reset the candidates that don't have recent writes.
+        to_reset = [did for did in candidates if did not in still_alive]
+        if to_reset:
+            cur.execute(
+                """
+                UPDATE public.fd_registry
+                   SET state='idle',
+                       updated_at=NOW()
+                 WHERE drive_id = ANY(%s)
+                RETURNING drive_id
+                """,
+                (to_reset,),
+            )
+            reset_drives = [r["drive_id"] for r in cur.fetchall()]
+    conn.commit()
+    return {"workers_removed": removed_workers, "drives_reset": reset_drives}
+
+
+def active_drive_ids(conn: psycopg.Connection) -> set[str]:
+    """Return drive_ids currently being worked on (for de-dup in the enqueue step)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT drive_id FROM public.daemon_workers
+            WHERE drive_id IS NOT NULL
+              AND state IN ('claiming','listing','building','syncing')
+              AND heartbeat_at > NOW() - INTERVAL '60 seconds'
+            """
+        )
+        return {r["drive_id"] for r in cur.fetchall() if r.get("drive_id")}
+
+
+# ---------------------------------------------------------------------
+# MCP login users
+# ---------------------------------------------------------------------
+def list_mcp_users(conn: psycopg.Connection) -> list[dict]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT username, created_at, updated_at FROM public.mcp_users ORDER BY username"
+        )
+        return cur.fetchall()
+
+
+def upsert_mcp_user(conn: psycopg.Connection, username: str, password_hash: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO public.mcp_users (username, password_hash)
+            VALUES (%s, %s)
+            ON CONFLICT (username) DO UPDATE SET
+                password_hash = EXCLUDED.password_hash,
+                updated_at = NOW()
+            """,
+            (username, password_hash),
+        )
+    conn.commit()
+
+
+def delete_mcp_user(conn: psycopg.Connection, username: str) -> int:
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM public.mcp_users WHERE username=%s", (username,))
+        n = cur.rowcount
+    conn.commit()
+    return n
+
+
+def get_mcp_user_hash(conn: psycopg.Connection, username: str) -> Optional[str]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT password_hash FROM public.mcp_users WHERE username=%s",
+            (username,),
+        )
+        r = cur.fetchone()
+        return r["password_hash"] if r else None
+
+
+# Per-user drive matrix (v0.6.2 reinstatement). Each MCP user has their own
+# set of drives visible via search / list_drives. `fd_registry.search_enabled`
+# remains as a legacy flag but is no longer consulted by the MCP tools.
+
+
+def user_scope(conn: psycopg.Connection, username: str) -> list[dict]:
+    """Return every registered drive along with an `enabled` flag for the
+    given user, merging fd_registry with mcp_user_drives. Used by the Web
+    UI to render the per-user scope table."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT f.drive_id,
+                   f.name,
+                   f.file_count,
+                   f.chunk_count,
+                   f.file_count_estimate,
+                   f.last_build_at,
+                   f.state AS build_state,
+                   (ud.username IS NOT NULL) AS enabled
+              FROM public.fd_registry f
+              LEFT JOIN public.mcp_user_drives ud
+                     ON ud.drive_id = f.drive_id
+                    AND ud.username = %s
+             ORDER BY f.name
+            """,
+            (username,),
+        )
+        return cur.fetchall()
+
+
+def set_user_drive(conn: psycopg.Connection, username: str,
+                   drive_id: str, enabled: bool) -> None:
+    """Add or remove a (username, drive_id) row in mcp_user_drives."""
+    with conn.cursor() as cur:
+        if enabled:
+            cur.execute(
+                """
+                INSERT INTO public.mcp_user_drives (username, drive_id)
+                VALUES (%s, %s)
+                ON CONFLICT (username, drive_id) DO NOTHING
+                """,
+                (username, drive_id),
+            )
+        else:
+            cur.execute(
+                "DELETE FROM public.mcp_user_drives WHERE username=%s AND drive_id=%s",
+                (username, drive_id),
+            )
+    conn.commit()
+
+
+def search_enabled_schemas_for_user(
+    conn: psycopg.Connection, username: str,
+) -> list[tuple[str, str]]:
+    """Same shape as search_enabled_schemas() but scoped to one MCP user.
+    Returns (drive_id, drive_name) pairs the user is allowed to search.
+    Only yields drives whose per-FD schema actually exists, so queries
+    don't blow up on a drive that was added but never built."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT f.drive_id, f.name
+              FROM public.mcp_user_drives ud
+              JOIN public.fd_registry f ON f.drive_id = ud.drive_id
+             WHERE ud.username = %s
+             ORDER BY f.name
+            """,
+            (username,),
+        )
+        rows = cur.fetchall()
+        result: list[tuple[str, str]] = []
+        for r in rows:
+            schema = schema_for_drive(r["drive_id"])
+            cur.execute(
+                "SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname=%s",
+                (schema,),
+            )
+            if cur.fetchone():
+                result.append((r["drive_id"], r["name"]))
+        return result
+
+
+def seed_default_mcp_users(conn: psycopg.Connection) -> list[str]:
+    """Seed MCP Basic-Auth users from the environment on first init.
+
+    Reads WINSERVERRAG_SEED_USERS as a comma-separated list of
+    `username:password` pairs, e.g. `alice:s3cret,bob:hunter2`. Each
+    entry is upserted into public.mcp_users only if the username is not
+    already present, so repeat runs are idempotent. If the env var is
+    unset or empty the function is a no-op — callers should create the
+    first user through the admin API (or a one-off script) instead of
+    relying on bundled default credentials.
+
+    Returns the list of usernames that were newly created.
+    """
+    import os
+    from src.mcp_auth import hash_password
+
+    created: list[str] = []
+    raw = os.environ.get("WINSERVERRAG_SEED_USERS", "").strip()
+    if not raw:
+        return created
+
+    pairs: list[tuple[str, str]] = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item or ":" not in item:
+            continue
+        u, _, p = item.partition(":")
+        u, p = u.strip(), p.strip()
+        if u and p:
+            pairs.append((u, p))
+
+    for username, pw in pairs:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM public.mcp_users WHERE username=%s", (username,))
+            if cur.fetchone() is None:
+                cur.execute(
+                    "INSERT INTO public.mcp_users (username, password_hash) VALUES (%s, %s)",
+                    (username, hash_password(pw)),
+                )
+                created.append(username)
+    conn.commit()
+    return created
+
+
+# ---------------------------------------------------------------------
+# Key-value config (daemon_config)
+# ---------------------------------------------------------------------
+def get_config(conn: psycopg.Connection, key: str,
+               default: Optional[str] = None) -> Optional[str]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT value FROM public.daemon_config WHERE key=%s", (key,))
+        r = cur.fetchone()
+        return r["value"] if r else default
+
+
+def set_config(conn: psycopg.Connection, key: str, value: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO public.daemon_config (key, value) VALUES (%s, %s)
+            ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
+            """,
+            (key, value),
+        )
+    conn.commit()
+
+
+# ---------------------------------------------------------------------
+# Per-drive advisory lock (cross-process exclusion for build/sync)
+# ---------------------------------------------------------------------
+def try_claim_drive(conn: psycopg.Connection, drive_id: str) -> bool:
+    """Acquire a pg_advisory_lock keyed on hashtext(drive_id).
+
+    Returns True if the caller now holds the lock, False if another session
+    holds it. Released by release_drive() or on conn close.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_try_advisory_lock(hashtext(%s)) AS got", (drive_id,))
+        r = cur.fetchone()
+        return bool(r and r.get("got"))
+
+
+def release_drive(conn: psycopg.Connection, drive_id: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_unlock(hashtext(%s))", (drive_id,))
+
+
+# ---------------------------------------------------------------------
+# Events (daemon -> monitor)
+# ---------------------------------------------------------------------
+def log_event(conn: psycopg.Connection, *, drive_id: Optional[str], level: str,
+              event: str, message: str = "", extra: Optional[dict] = None) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO public.daemon_events (drive_id, level, event, message, extra)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (drive_id, level, event, message,
+             json.dumps(extra, ensure_ascii=False) if extra else None),
+        )
+    conn.commit()
+
+
+def log_mcp_query(conn: psycopg.Connection, *, username: Optional[str],
+                  tool_name: str, query: Optional[str],
+                  returned_count: Optional[int], returned_ids: Optional[list],
+                  latency_ms: int, error: Optional[str]) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO public.mcp_query_log
+                (username, tool_name, query, returned_count, returned_ids,
+                 latency_ms, error)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """,
+            (username, tool_name, query,
+             returned_count,
+             json.dumps(returned_ids, ensure_ascii=False) if returned_ids else None,
+             latency_ms, error),
+        )
+    conn.commit()
+
+
+def tail_mcp_query_log(conn: psycopg.Connection, limit: int = 50) -> list[dict]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, ts, username, tool_name, query,
+                   returned_count, returned_ids, latency_ms, error
+            FROM public.mcp_query_log
+            ORDER BY id DESC LIMIT %s
+            """,
+            (limit,),
+        )
+        return cur.fetchall()
+
+
+def tail_events(conn: psycopg.Connection, limit: int = 100,
+                drive_id: Optional[str] = None) -> list[dict]:
+    with conn.cursor() as cur:
+        if drive_id:
+            cur.execute(
+                """
+                SELECT id, ts, drive_id, level, event, message, extra
+                FROM public.daemon_events
+                WHERE drive_id=%s
+                ORDER BY id DESC LIMIT %s
+                """,
+                (drive_id, limit),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT id, ts, drive_id, level, event, message, extra
+                FROM public.daemon_events
+                ORDER BY id DESC LIMIT %s
+                """,
+                (limit,),
+            )
+        return list(reversed(cur.fetchall()))
+
+
+# ---------------------------------------------------------------------
+# failed_files retry queue
+# ---------------------------------------------------------------------
+def add_failed_file(conn: psycopg.Connection, drive_id: str, file_id: str,
+                    reason: str) -> None:
+    entry = {"file_id": file_id, "reason": reason[:500]}
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE public.fd_registry
+               SET failed_files = failed_files || %s::jsonb,
+                   updated_at = NOW()
+             WHERE drive_id=%s
+            """,
+            (json.dumps([entry]), drive_id),
+        )
+    conn.commit()
+
+
+def get_failed_files(conn: psycopg.Connection, drive_id: str) -> list[dict]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT failed_files FROM public.fd_registry WHERE drive_id=%s",
+            (drive_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return []
+        return row["failed_files"] or []
+
+
+def clear_failed_file(conn: psycopg.Connection, drive_id: str, file_id: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE public.fd_registry
+               SET failed_files = COALESCE(
+                     (SELECT jsonb_agg(f) FROM jsonb_array_elements(failed_files) f
+                       WHERE f->>'file_id' <> %s),
+                     '[]'::jsonb),
+                   updated_at = NOW()
+             WHERE drive_id=%s
+            """,
+            (file_id, drive_id),
+        )
+    conn.commit()
+
+
+# ---------------------------------------------------------------------
+# Chunk upsert / delete (per FD schema)
+# ---------------------------------------------------------------------
+def _escape_like_literal(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def connect(db_name=None):
-    """PostgreSQL に接続する。db_name を指定すると config の DB_NAME を上書きする。"""
-    try:
-        conn = psycopg2.connect(
-            dbname=db_name or DB_NAME,
-            user=DB_USER,
-            host=DB_HOST,
-            port=DB_PORT,
-        )
-        register_vector(conn)
-        return conn
-    except psycopg2.OperationalError as e:
-        print(f"エラー: PostgreSQL に接続できません: {e}")
-        print("PostgreSQL が起動しているか確認してください:")
-        print("  brew services start postgresql@17")
-        sys.exit(1)
-
-
-def insert_chunks(conn, chunks_data, commit=True):
-    """チャンクデータを DB に一括挿入する（UPSERT）。
-
-    commit=False の場合はトランザクションを閉じずに返す（呼び出し側で commit/rollback を管理）。
-    """
-    cur = conn.cursor()
-    try:
-        for chunk in chunks_data:
-            # PostgreSQL は NUL (0x00) を含む文字列を受け付けない
-            title = (chunk["title"] or "").replace("\x00", "")
-            content = (chunk["content"] or "").replace("\x00", "")
-
-            cur.execute(
-                """
-                INSERT INTO documents
-                    (drive_file_id, title, content, chunk_index, owner,
-                     source_url, file_type, drive_modified_at, embedding,
-                     sheet_gid, sheet_name, permissions, partial_content, folder_path)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (drive_file_id) DO UPDATE SET
-                    title = EXCLUDED.title,
-                    content = EXCLUDED.content,
-                    chunk_index = EXCLUDED.chunk_index,
-                    owner = EXCLUDED.owner,
-                    source_url = EXCLUDED.source_url,
-                    file_type = EXCLUDED.file_type,
-                    drive_modified_at = EXCLUDED.drive_modified_at,
-                    embedding = EXCLUDED.embedding,
-                    sheet_gid = EXCLUDED.sheet_gid,
-                    sheet_name = EXCLUDED.sheet_name,
-                    permissions = EXCLUDED.permissions,
-                    partial_content = EXCLUDED.partial_content,
-                    folder_path = EXCLUDED.folder_path
-                """,
-                (
-                    chunk["drive_file_id"],
-                    title,
-                    content,
-                    chunk["chunk_index"],
-                    chunk["owner"],
-                    chunk["source_url"],
-                    chunk["file_type"],
-                    chunk["drive_modified_at"],
-                    chunk["embedding"],
-                    chunk.get("sheet_gid"),
-                    chunk.get("sheet_name"),
-                    json.dumps(chunk.get("permissions"), ensure_ascii=False) if chunk.get("permissions") else None,
-                    chunk.get("partial_content", False),
-                    chunk.get("folder_path", ""),
-                ),
-            )
-        if commit:
-            conn.commit()
-    except Exception:
-        if commit:
-            conn.rollback()
-        raise
-    finally:
-        cur.close()
-
-
-def _file_id_like_pattern(file_id):
-    r"""file_id が drive_file_id の prefix にマッチするLIKE パターンを生成する。
-
-    drive_file_id の形式 (src/indexer.py:make_chunk_entry 参照):
-      - 通常:       {file_id}_chunk_{N}
-      - シート:     {file_id}_sheet_{gid}_chunk_{N}
-
-    単純な prefix + '%' だと、file_id="ABCDE" のクエリが
-    "ABCDEF_chunk_0" (別ファイル) にも誤ヒットする (prefix 衝突)。
-    それを防ぐため、file_id の直後に必ず literal underscore があることを要求する:
-        {escaped_file_id}\_%
-    ESCAPE '\' で \_ を literal underscore として解釈させる。
-    """
+def _file_id_like_pattern(file_id: str) -> str:
     return _escape_like_literal(file_id) + r"\_%"
 
 
-def delete_by_file_id(conn, drive_file_id_prefix, commit=True):
-    """指定した file_id に紐づく全チャンクを削除する。
-
-    drive_file_id の形式は `{file_id}_chunk_N` または `{file_id}_sheet_gid_chunk_N`。
-    prefix 衝突 (file_id="ABC" が "ABCD_chunk_0" に誤ヒット) を避けるため、
-    _file_id_like_pattern() で literal underscore 境界を強制する。
-    commit=False の場合は呼び出し側でトランザクションを管理する。
+def insert_chunks(conn: psycopg.Connection, schema: str, chunks_data: Iterable[dict],
+                  commit: bool = True) -> None:
+    schema_q = _quote_ident(schema)
+    sql = f"""
+        INSERT INTO {schema_q}.documents
+            (drive_file_id, title, content, chunk_index, owner,
+             source_url, file_type, drive_modified_at, embedding,
+             sheet_gid, sheet_name, permissions, partial_content, folder_path)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (drive_file_id) DO UPDATE SET
+            title = EXCLUDED.title,
+            content = EXCLUDED.content,
+            chunk_index = EXCLUDED.chunk_index,
+            owner = EXCLUDED.owner,
+            source_url = EXCLUDED.source_url,
+            file_type = EXCLUDED.file_type,
+            drive_modified_at = EXCLUDED.drive_modified_at,
+            embedding = EXCLUDED.embedding,
+            sheet_gid = EXCLUDED.sheet_gid,
+            sheet_name = EXCLUDED.sheet_name,
+            permissions = EXCLUDED.permissions,
+            partial_content = EXCLUDED.partial_content,
+            folder_path = EXCLUDED.folder_path
     """
-    cur = conn.cursor()
-    try:
-        pattern = _file_id_like_pattern(drive_file_id_prefix)
-        cur.execute(
-            r"DELETE FROM documents WHERE drive_file_id LIKE %s ESCAPE '\'",
-            (pattern,),
-        )
-        deleted = cur.rowcount
-        if commit:
-            conn.commit()
-        return deleted
-    except Exception:
-        if commit:
-            conn.rollback()
-        raise
-    finally:
-        cur.close()
+    with conn.cursor() as cur:
+        try:
+            for c in chunks_data:
+                # PostgreSQL rejects NUL bytes
+                title = (c.get("title") or "").replace("\x00", "")
+                content = (c.get("content") or "").replace("\x00", "")
+                perms = c.get("permissions")
+                cur.execute(sql, (
+                    c["drive_file_id"], title, content, c["chunk_index"],
+                    c.get("owner"), c.get("source_url"), c.get("file_type"),
+                    c.get("drive_modified_at"), c["embedding"],
+                    c.get("sheet_gid"), c.get("sheet_name"),
+                    json.dumps(perms, ensure_ascii=False) if perms else None,
+                    bool(c.get("partial_content", False)),
+                    c.get("folder_path", ""),
+                ))
+            if commit:
+                conn.commit()
+        except Exception:
+            if commit:
+                conn.rollback()
+            raise
 
 
-def upsert_file_chunks(conn, file_id, chunks):
-    """1ファイル分のチャンクをアトミックに置換する。
+def delete_by_file_id(conn: psycopg.Connection, schema: str, file_id: str,
+                      commit: bool = True) -> int:
+    pattern = _file_id_like_pattern(file_id)
+    with conn.cursor() as cur:
+        try:
+            cur.execute(
+                f"DELETE FROM {_quote_ident(schema)}.documents "
+                r"WHERE drive_file_id LIKE %s ESCAPE '\'",
+                (pattern,),
+            )
+            deleted = cur.rowcount
+            if commit:
+                conn.commit()
+            return deleted
+        except Exception:
+            if commit:
+                conn.rollback()
+            raise
 
-    既存チャンクを削除し新チャンクを挿入する操作を単一トランザクションで実行する。
-    途中で失敗した場合は rollback し、DB 状態は変更されない。
 
-    Returns:
-        "updated": 既存チャンクを上書きした
-        "added":   新規ファイルを追加した
+def upsert_file_chunks(conn: psycopg.Connection, schema: str, file_id: str,
+                       chunks: list[dict]) -> str:
+    """Atomic delete + insert in a single transaction.
+
+    Returns "updated" if chunks already existed, else "added".
     """
-    # 既存チェック（読み取りのみ、commit 不要）
-    cur = conn.cursor()
-    try:
-        pattern = _file_id_like_pattern(file_id)
+    pattern = _file_id_like_pattern(file_id)
+    with conn.cursor() as cur:
         cur.execute(
-            r"SELECT 1 FROM documents WHERE drive_file_id LIKE %s ESCAPE '\' LIMIT 1",
+            f"SELECT 1 FROM {_quote_ident(schema)}.documents "
+            r"WHERE drive_file_id LIKE %s ESCAPE '\' LIMIT 1",
             (pattern,),
         )
         existed = cur.fetchone() is not None
-    finally:
-        cur.close()
 
     try:
-        delete_by_file_id(conn, file_id, commit=False)
-        insert_chunks(conn, chunks, commit=False)
+        delete_by_file_id(conn, schema, file_id, commit=False)
+        insert_chunks(conn, schema, chunks, commit=False)
         conn.commit()
     except Exception:
         conn.rollback()
         raise
-
     return "updated" if existed else "added"
 
 
-def file_exists(conn, file_id):
-    """file_id のチャンクが DB に 1 件でも存在するかを返す。
-
-    prefix 衝突を避けるため literal underscore 境界を要求する。
-    """
-    cur = conn.cursor()
-    try:
-        pattern = _file_id_like_pattern(file_id)
+def file_exists(conn: psycopg.Connection, schema: str, file_id: str) -> bool:
+    pattern = _file_id_like_pattern(file_id)
+    with conn.cursor() as cur:
         cur.execute(
-            r"SELECT 1 FROM documents WHERE drive_file_id LIKE %s ESCAPE '\' LIMIT 1",
+            f"SELECT 1 FROM {_quote_ident(schema)}.documents "
+            r"WHERE drive_file_id LIKE %s ESCAPE '\' LIMIT 1",
             (pattern,),
         )
         return cur.fetchone() is not None
-    finally:
-        cur.close()
 
 
-def extract_file_id_from_url(url):
-    """Google Workspace の URL から FILE_ID を抽出する。
-
-    対応 URL:
-      - https://docs.google.com/spreadsheets/d/{ID}/edit...
-      - https://docs.google.com/document/d/{ID}/edit...
-      - https://docs.google.com/presentation/d/{ID}/edit...
-      - https://drive.google.com/file/d/{ID}/view...
-      - https://drive.google.com/open?id={ID}
-      - https://drive.google.com/drive/folders/{ID}
-    """
-    patterns = [
-        r"/d/([a-zA-Z0-9_-]+)",         # /d/{ID} パターン
-        r"/folders/([a-zA-Z0-9_-]+)",    # /folders/{ID}
-        r"[?&]id=([a-zA-Z0-9_-]+)",     # ?id={ID}
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
+# ---------------------------------------------------------------------
+# URL extraction (reused)
+# ---------------------------------------------------------------------
+def extract_file_id_from_url(url: str) -> Optional[str]:
+    for pattern in (r"/d/([a-zA-Z0-9_-]+)",
+                    r"/folders/([a-zA-Z0-9_-]+)",
+                    r"[?&]id=([a-zA-Z0-9_-]+)"):
+        m = re.search(pattern, url)
+        if m:
+            return m.group(1)
     return None
 
 
-def extract_gid_from_url(url):
-    """スプレッドシート URL から gid（シートID）を抽出する。
-
-    対応 URL:
-      - ...edit?gid=660932359#gid=660932359
-      - ...edit#gid=660932359
-      - ...edit?gid=0
-    """
-    match = re.search(r'[?&#]gid=(\d+)', url)
-    return match.group(1) if match else None
+def extract_gid_from_url(url: str) -> Optional[str]:
+    m = re.search(r"[?&#]gid=(\d+)", url)
+    return m.group(1) if m else None
 
 
-def lookup_by_url(conn, url):
-    """Google Workspace の URL から DB 内の全チャンクを取得する。
-
-    URL から FILE_ID を抽出し、該当ファイルの全チャンクを返す。
-    スプレッドシートで gid が指定されている場合、そのシートのチャンクを優先表示する。
-
-    Returns:
-        dict: {
-            "file_id": str,
-            "title": str,
-            "owner": str,
-            "source_url": str,
-            "file_type": str,
-            "modified_at": str,
-            "target_sheet": {"gid": str, "name": str} or None,
-            "chunks": [{"index": int, "content": str,
-                        "sheet_gid": str|None, "sheet_name": str|None}, ...],
-            "full_text": str,
-        }
-        見つからない場合は None。
-    """
-    file_id = extract_file_id_from_url(url)
-    if not file_id:
-        return None
-
-    target_gid = extract_gid_from_url(url)
-
-    cur = conn.cursor()
-    try:
-        # file_id で始まる全チャンクを取得（_chunk_ と _sheet_ の両方に対応）
-        # LIKE メタ文字をエスケープしてから '_%' を付けて「literal underscore + anything」を表す
-        pattern = _escape_like_literal(file_id) + r"\_%"
+# ---------------------------------------------------------------------
+# Stats
+# ---------------------------------------------------------------------
+def search_enabled_schemas(conn: psycopg.Connection) -> list[tuple[str, str]]:
+    """Return (drive_id, drive_name) pairs for drives with search_enabled=TRUE
+    AND an existing fd_<drive_id> schema. Used by MCP search to know which
+    schemas to query."""
+    with conn.cursor() as cur:
         cur.execute(
-            r"""
-            SELECT title, content, chunk_index, owner, source_url,
-                   file_type, drive_modified_at, sheet_gid, sheet_name
-            FROM documents
-            WHERE drive_file_id LIKE %s ESCAPE '\'
-            ORDER BY
-                CASE WHEN %s IS NOT NULL AND sheet_gid = %s THEN 0 ELSE 1 END,
-                sheet_gid NULLS FIRST,
-                chunk_index
-            """,
-            (pattern, target_gid, target_gid),
+            """
+            SELECT drive_id, name
+              FROM public.fd_registry
+             WHERE search_enabled = TRUE
+             ORDER BY name
+            """
         )
         rows = cur.fetchall()
-    finally:
-        cur.close()
-
-    if not rows:
-        return None
-
-    first = rows[0]
-    chunks = [
-        {
-            "index": r[2],
-            "content": r[1],
-            "sheet_gid": r[7],
-            "sheet_name": r[8],
-        }
-        for r in rows
-    ]
-    full_text = "\n".join(r[1] for r in rows)
-
-    # ターゲットシートの情報
-    target_sheet = None
-    if target_gid:
+        result: list[tuple[str, str]] = []
+        # Confirm the fd_<drive_id> schema actually exists (user may have
+        # toggled search-on a drive whose build was later removed).
         for r in rows:
-            if r[7] == target_gid:
-                target_sheet = {"gid": r[7], "name": r[8]}
-                break
-
-    return {
-        "file_id": file_id,
-        "title": first[0],
-        "owner": first[3],
-        "source_url": first[4],
-        "file_type": first[5],
-        "modified_at": str(first[6]) if first[6] else None,
-        "target_sheet": target_sheet,
-        "chunks": chunks,
-        "full_text": full_text,
-    }
+            drive_id = r["drive_id"]
+            schema = schema_for_drive(drive_id)
+            cur.execute(
+                "SELECT 1 FROM information_schema.schemata WHERE schema_name=%s",
+                (schema,),
+            )
+            if cur.fetchone() is not None:
+                result.append((drive_id, r["name"]))
+        return result
 
 
-def search_similar(conn, embedding, n_results=5, owner=None, since=None):
-    """ベクトル類似度検索。オプションでメタデータフィルタ付き。"""
+def search_across_schemas(conn: psycopg.Connection, embedding,
+                          schemas: list[tuple[str, str]],
+                          n_results: int = 10,
+                          owner: Optional[str] = None) -> list[dict]:
+    """Run a cosine-distance search UNION-ALL across the given fd_* schemas,
+    then take the top N. Each schema has its own documents table so we query
+    each then merge."""
+    if not schemas:
+        return []
     import numpy as np
     if isinstance(embedding, list):
         embedding = np.array(embedding, dtype=np.float32)
 
-    conditions = []
-    filter_params = []
-
+    where = ""
+    filter_params: list = []
     if owner:
-        conditions.append("owner = %s")
+        where = "WHERE owner = %s"
         filter_params.append(owner)
-    if since:
-        conditions.append("drive_modified_at > %s")
-        filter_params.append(since)
 
-    where = "WHERE " + " AND ".join(conditions) if conditions else ""
-
-    # パラメータ順: distance計算用embedding, フィルタ値..., ソート用embedding, LIMIT
-    params = [embedding] + filter_params + [embedding, n_results]
-
-    cur = conn.cursor()
-    try:
-        cur.execute(
+    # Build UNION ALL query referencing each schema.
+    parts: list[str] = []
+    for drive_id, _name in schemas:
+        schema = schema_for_drive(drive_id)
+        parts.append(
             f"""
-            SELECT id, title, content, owner, source_url, file_type,
-                   drive_modified_at, embedding <=> %s AS distance,
-                   sheet_gid, sheet_name
-            FROM documents
-            {where}
-            ORDER BY embedding <=> %s
-            LIMIT %s
-            """,
-            tuple(params),
+            SELECT %s::text AS drive_id, title, content, owner, source_url,
+                   file_type, drive_modified_at, sheet_gid, sheet_name,
+                   folder_path, embedding <=> %s AS distance
+              FROM {_quote_ident(schema)}.documents
+              {where}
+            """
         )
-        results = cur.fetchall()
-        return results
-    finally:
-        cur.close()
+
+    sql = (
+        "SELECT * FROM (\n"
+        + "\nUNION ALL\n".join(parts)
+        + "\n) sub ORDER BY distance ASC LIMIT %s"
+    )
+
+    params: list = []
+    for drive_id, _name in schemas:
+        params.append(drive_id)
+        params.append(embedding)
+        params.extend(filter_params)
+    params.append(n_results)
+
+    with conn.cursor() as cur:
+        cur.execute(sql, tuple(params))
+        return list(cur.fetchall())
+
+
+def global_stats(conn: psycopg.Connection) -> dict:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*)::int AS total_fds,
+                   COUNT(*) FILTER (WHERE enabled)::int AS enabled_fds,
+                   COALESCE(SUM(file_count),0)::int AS total_files,
+                   COALESCE(SUM(chunk_count),0)::int AS total_chunks,
+                   COALESCE(SUM(file_count_estimate),0)::int AS total_files_estimate,
+                   COALESCE(SUM(file_count_estimate)
+                              FILTER (WHERE enabled),0)::int AS enabled_files_estimate
+            FROM public.fd_registry
+            """
+        )
+        row = dict(cur.fetchone())
+        # pg_database_size() walks the on-disk DB directory; under heavy
+        # write load (many concurrent workers) this can take seconds.
+        # Use a tight statement_timeout and fall back to -1 on slow.
+        try:
+            cur.execute("SET LOCAL statement_timeout = '1500ms'")
+            cur.execute("SELECT pg_database_size(current_database())::bigint AS bytes")
+            row["db_size_bytes"] = cur.fetchone()["bytes"]
+        except Exception:
+            conn.rollback()
+            row["db_size_bytes"] = None
+        return row
