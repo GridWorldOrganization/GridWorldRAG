@@ -1,8 +1,70 @@
 # Changelog
 
-All notable changes to WinServerRAG. Format loosely follows
+All notable changes to GridWorldRAG (Windows canonical). Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [v1.0.0] — 2026-04-26
+
+**Theme: Windows-only canonical release — Mac line sunset**
+
+`master` ブランチの tree を `winserver-phase2` (Windows 11 ネイティブ常駐
+daemon の本番コード) と同一化。Mac 版 (v0.2.x) は開発中止、本リポジトリは
+Windows 単一系統に一本化された。両 branch の commit history は merge commit
+(parents: `ebd7dae` + `a3a6cb2`) で保全。
+
+### BREAKING
+- **Mac (macOS) サポート終了**。最終 Mac リリースは v0.2.1 (タグ参照)。
+  以降のバグ修正・機能追加は行わない。
+
+### Added (winserver-phase2 由来)
+- 常駐 daemon `src/rag_daemon.py` — Drive 監視 + RAG 構築を統合実行
+- FastAPI 状態 API + Web 管理画面 (port 17600)
+- Electron ミニモニタ (always-on-top, 500ms 更新, debug overlay Ctrl+Shift+D)
+- per-FD schema 分離 (`fd_<drive_id>.documents`)
+- GPU embedding (CUDA 12.4, `paraphrase-multilingual-mpnet-base-v2`)
+- AWS serverless MCP bridge (Basic Auth + Streamable HTTP)
+- pause/resume API + ミニモニタ toggle button **設計** (実装は v1.1)
+- NSSM Windows サービス化スクリプト (`scripts/install_service.md`)
+
+### Removed (Mac 版コード)
+- `build_parallel.py` / `build_single.py` / `sync_rotate.py`
+- Mac 想定の `src/` モジュール群、`launchd/` plist、`scheduler/windows` (WSL2 経由)
+- `monitor.sh` / `setup.sh` / `run_*.sh`
+- `docs/mac-resident-daemon.md`、Mac 想定の `docs/architecture.md` 他
+- `Dockerfile` / `docker-compose.yml` (Mac 開発環境用)
+- `QUICKSTART.md` / `CONTRIBUTING.md` (Mac セットアップ前提)
+
+### Preserved from old master
+- LICENSE, SECURITY.md, CODE_OF_CONDUCT.md
+- `.github/ISSUE_TEMPLATE/*`, `pull_request_template.md`, `CODEOWNERS`,
+  `dependabot.yml`
+- `.github/workflows/lint.yml`, `codeql.yml`
+  (Windows-latest matrix 化は v1.1 で別 PR 予定)
+
+### Pre-1.0 development (winserver-phase2 internal tags)
+v0.3.0 〜 v0.6.1 は `winserver-phase2` ブランチ上の development tag であり、
+public release は本 v1.0.0 にロールアップされる。下記は内部時系列の主要点:
+
+- **v0.6.1** (2026-04-22): drive_client docstring rewrite、control_api → 0.6.1
+- **v0.6.0** (2026-04-22): GPU embedding (CUDA 12.4)、warm search 3–13s → **840ms**
+- **v0.5.x**: per-user MCP search scope、admin API security hardening
+- **v0.4.x**: Electron mini-monitor、debug overlay、AWS serverless bridge
+- **v0.3.x**: rag_daemon 統合、FastAPI 管理画面、per-FD schema 分離
+
+### Migration
+Mac 版 (v0.2.1) を運用していたユーザーは継続不可。Windows ネイティブ環境に
+切替が必要 (PostgreSQL 17 + pgvector / Python 3.12 / NSSM)。詳細は README
+クイックスタート参照。
+
+## [v0.2.1] — 2026-04-21 (Mac line final)
+
+[v0.2.1 tag](https://github.com/GridWorldOrganization/GridWorldRAG/releases/tag/v0.2.1)
+で参照可能。Mac 版の最終リリース。以降の Mac 版開発は行わない。
+
+---
+
+# 以降は winserver-phase2 ブランチ上の development changelog (v1.0.0 にロールアップ済)
 
 ## [v0.6.1] — 2026-04-22
 
