@@ -103,32 +103,49 @@ try {
 # ---------------------------------------------------------------------
 function Log($msg) { Write-Host "[install-services] $msg" }
 
+# Run a native command (sc.exe / net.exe / nssm.exe / icacls) without
+# letting its stderr abort the script.
+#
+# PowerShell 5.1 wraps non-zero native exits with NON-EMPTY STDERR as a
+# `NativeCommandError` ErrorRecord on the error stream. With
+# $ErrorActionPreference = "Stop" (set at the top of this script), that
+# record becomes a TERMINATING error — even when the script writer
+# clearly intended to handle the case via $LASTEXITCODE.
+#
+# `2>$null` redirects the OUTPUT, but PowerShell still detects "had
+# stderr" before the redirect takes effect, so the Stop preference
+# fires anyway. The only reliable suppression is to lower
+# ErrorActionPreference for the duration of the call.
+#
+# v1.3.2: PR #37 changed `2>&1` to `2>$null > $null` thinking that fixed
+# it. It only fixed the sc.exe case (sc writes "service not found" to
+# STDOUT, not stderr). Group-Exists kept throwing on net.exe's
+# "システム エラー 1376". This helper closes both holes.
+function Invoke-Native {
+    param([scriptblock]$Cmd)
+    $saved = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $Cmd 2>$null | Out-Null
+        return $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $saved
+    }
+}
+
 function Service-Exists($name) {
-    # NOTE: do NOT use `2>&1` here — sc.exe / net.exe / nssm.exe write
-    # error text to stderr, and `2>&1` redirects native-command stderr
-    # through the PowerShell error stream. With $ErrorActionPreference =
-    # "Stop", any record on the error stream becomes a terminating error
-    # — even though the function itself was supposed to gracefully
-    # handle the "doesn't exist" case via $LASTEXITCODE. v1.3.2 hotfix.
-    & sc.exe query $name 2>$null > $null
-    return $LASTEXITCODE -eq 0
+    return (Invoke-Native { sc.exe query $name }) -eq 0
 }
 
 function Group-Exists($name) {
-    # See comment in Service-Exists. `net.exe localgroup` writes
-    # "システム エラー 1376 が発生しました" (group not found) to stderr;
-    # with `2>&1` + ErrorAction=Stop, the script throws here even though
-    # the whole point of this function is to detect missing groups
-    # without throwing.
-    & net.exe localgroup $name 2>$null > $null
-    return $LASTEXITCODE -eq 0
+    return (Invoke-Native { net.exe localgroup $name }) -eq 0
 }
 
 function Stop-IfRunning($name) {
     if (Service-Exists $name) {
         Log "Stopping $name (if running)..."
-        & sc.exe stop $name 2>$null > $null
-        # Best-effort: don't error if already stopped.
+        $null = Invoke-Native { sc.exe stop $name }
+        # Best-effort: don't error if already stopped (1062).
     }
 }
 
@@ -153,15 +170,15 @@ if ($Uninstall) {
     Stop-IfRunning $ServiceApi
     if (Service-Exists $ServiceDaemon) {
         Log "Removing $ServiceDaemon..."
-        & $NssmExe remove $ServiceDaemon confirm *>$null
+        $null = Invoke-Native { & $NssmExe remove $ServiceDaemon confirm }
     }
     if (Service-Exists $ServiceApi) {
         Log "Removing $ServiceApi..."
-        & $NssmExe remove $ServiceApi confirm *>$null
+        $null = Invoke-Native { & $NssmExe remove $ServiceApi confirm }
     }
     if (Group-Exists $OperatorGroup) {
         Log "Removing local group $OperatorGroup..."
-        & net.exe localgroup $OperatorGroup /delete *>$null
+        $null = Invoke-Native { net.exe localgroup $OperatorGroup /delete }
     }
     Log "Uninstall complete."
     try { Stop-Transcript | Out-Null } catch {}
@@ -215,7 +232,7 @@ foreach ($svc in @($ServiceDaemon, $ServiceApi)) {
         # not have stopped them first.
         Stop-IfRunning $svc
         Start-Sleep -Seconds 2
-        & $NssmExe remove $svc confirm *>$null
+        $null = Invoke-Native { & $NssmExe remove $svc confirm }
         if (Service-Exists $svc) {
             Log "Warning: $svc still exists after nssm remove; install path will update params in place instead."
         } else {
@@ -248,25 +265,25 @@ foreach ($d in @($ConfigDir, $LogDir)) {
 #
 # Logs and backup dirs stay user-readable/writable (no secrets there).
 Log "Hardening config dir ACL: $ConfigDir"
-$null = & icacls.exe $ConfigDir /inheritance:r /Q 2>$null
-if ($LASTEXITCODE -ne 0) {
-    Write-Warning "icacls /inheritance:r failed (exit $LASTEXITCODE) — config dir may still allow Users:read"
+$ec = Invoke-Native { icacls.exe $ConfigDir /inheritance:r /Q }
+if ($ec -ne 0) {
+    Write-Warning "icacls /inheritance:r failed (exit $ec) — config dir may still allow Users:read"
 }
-$null = & icacls.exe $ConfigDir /grant:r 'Administrators:(OI)(CI)F' /Q 2>$null
-if ($LASTEXITCODE -ne 0) {
-    Write-Warning "icacls grant Administrators failed (exit $LASTEXITCODE)"
+$ec = Invoke-Native { icacls.exe $ConfigDir /grant:r 'Administrators:(OI)(CI)F' /Q }
+if ($ec -ne 0) {
+    Write-Warning "icacls grant Administrators failed (exit $ec)"
 }
-$null = & icacls.exe $ConfigDir /grant:r 'SYSTEM:(OI)(CI)F' /Q 2>$null
-if ($LASTEXITCODE -ne 0) {
-    Write-Warning "icacls grant SYSTEM failed (exit $LASTEXITCODE)"
+$ec = Invoke-Native { icacls.exe $ConfigDir /grant:r 'SYSTEM:(OI)(CI)F' /Q }
+if ($ec -ne 0) {
+    Write-Warning "icacls grant SYSTEM failed (exit $ec)"
 }
 
 # 3. Local Operators group — create-if-missing, idempotent.
 if (-not (Group-Exists $OperatorGroup)) {
     Log "Creating local group: $OperatorGroup"
-    & net.exe localgroup $OperatorGroup /add /comment:"Members can start/query the WinServerRAG services without UAC." *>$null
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to create local group $OperatorGroup (exit $LASTEXITCODE)"
+    $ec = Invoke-Native { net.exe localgroup $OperatorGroup /add /comment:"Members can start/query the WinServerRAG services without UAC." }
+    if ($ec -ne 0) {
+        throw "Failed to create local group $OperatorGroup (exit $ec)"
     }
 } else {
     Log "Local group already exists: $OperatorGroup"
@@ -277,8 +294,8 @@ if (-not $OperatorUser) { $OperatorUser = $env:USERNAME }
 if ($OperatorUser) {
     Log "Adding user '$OperatorUser' to '$OperatorGroup' (if not already)..."
     # `net localgroup ... /add` returns 2 if the user is already a member;
-    # not an error in our context. Suppress.
-    & net.exe localgroup $OperatorGroup $OperatorUser /add *>$null
+    # not an error in our context.
+    $null = Invoke-Native { net.exe localgroup $OperatorGroup $OperatorUser /add }
 }
 
 # 5. Install API service — idempotent. If it exists, fall through to
@@ -289,8 +306,8 @@ function Install-NssmService($name, $exe) {
         Log "Service exists, will update params: $name"
     } else {
         Log "Installing service: $name -> $exe"
-        & $NssmExe install $name $exe *>$null
-        if ($LASTEXITCODE -ne 0) { throw "nssm install $name failed: $LASTEXITCODE" }
+        $ec = Invoke-Native { & $NssmExe install $name $exe }
+        if ($ec -ne 0) { throw "nssm install $name failed: $ec" }
     }
 }
 
@@ -311,22 +328,22 @@ Install-NssmService $ServiceDaemon $DaemonExe
 # Threads phases stay short (5s each) — by the time we're there, the
 # graceful path failed and we want to escalate.
 function Set-NssmParams($name, $appDir, $logBase, $env, $depends, $stopTimeoutMs) {
-    & $NssmExe set $name AppDirectory       $appDir         *>$null
-    & $NssmExe set $name AppStdout          "$LogDir\$logBase.out.log" *>$null
-    & $NssmExe set $name AppStderr          "$LogDir\$logBase.err.log" *>$null
-    & $NssmExe set $name AppRotateFiles     1               *>$null
-    & $NssmExe set $name AppRotateBytes     10485760        *>$null
-    & $NssmExe set $name AppRotateOnline    1               *>$null  # rotate without restart
-    & $NssmExe set $name AppEnvironmentExtra "WINSERVERRAG_CONFIG_DIR=$ConfigDir" *>$null
-    & $NssmExe set $name Start              SERVICE_AUTO_START *>$null
+    $null = Invoke-Native { & $NssmExe set $name AppDirectory       $appDir }
+    $null = Invoke-Native { & $NssmExe set $name AppStdout          "$LogDir\$logBase.out.log" }
+    $null = Invoke-Native { & $NssmExe set $name AppStderr          "$LogDir\$logBase.err.log" }
+    $null = Invoke-Native { & $NssmExe set $name AppRotateFiles     1 }
+    $null = Invoke-Native { & $NssmExe set $name AppRotateBytes     10485760 }
+    $null = Invoke-Native { & $NssmExe set $name AppRotateOnline    1 }  # rotate without restart
+    $null = Invoke-Native { & $NssmExe set $name AppEnvironmentExtra "WINSERVERRAG_CONFIG_DIR=$ConfigDir" }
+    $null = Invoke-Native { & $NssmExe set $name Start              SERVICE_AUTO_START }
     # Stop sequence — graceful shutdown budget.
-    & $NssmExe set $name AppStopMethodSkip    0          *>$null  # try all 4 phases
-    & $NssmExe set $name AppStopMethodConsole $stopTimeoutMs *>$null
-    & $NssmExe set $name AppStopMethodWindow  5000       *>$null
-    & $NssmExe set $name AppStopMethodThreads 5000       *>$null
-    & $NssmExe set $name AppKillProcessTree   1          *>$null  # kill children with main
+    $null = Invoke-Native { & $NssmExe set $name AppStopMethodSkip    0 }  # try all 4 phases
+    $null = Invoke-Native { & $NssmExe set $name AppStopMethodConsole $stopTimeoutMs }
+    $null = Invoke-Native { & $NssmExe set $name AppStopMethodWindow  5000 }
+    $null = Invoke-Native { & $NssmExe set $name AppStopMethodThreads 5000 }
+    $null = Invoke-Native { & $NssmExe set $name AppKillProcessTree   1 }  # kill children with main
     if ($depends) {
-        & $NssmExe set $name DependOnService $depends *>$null
+        $null = Invoke-Native { & $NssmExe set $name DependOnService $depends }
     }
 }
 
@@ -336,8 +353,8 @@ Set-NssmParams $ServiceApi    (Split-Path $ApiExe)    "api"    $ConfigDir $null 
 Set-NssmParams $ServiceDaemon (Split-Path $DaemonExe) "daemon" $ConfigDir $ServiceApi  30000
 
 # 7. Set descriptions (cosmetic, services.msc).
-& $NssmExe set $ServiceApi    Description "WinServerRAG control API + web monitor (FastAPI on :17600)" | Out-Null
-& $NssmExe set $ServiceDaemon Description "WinServerRAG indexer daemon (rag_daemon multi-threaded)"   | Out-Null
+$null = Invoke-Native { & $NssmExe set $ServiceApi    Description "WinServerRAG control API + web monitor (FastAPI on :17600)" }
+$null = Invoke-Native { & $NssmExe set $ServiceDaemon Description "WinServerRAG indexer daemon (rag_daemon multi-threaded)" }
 
 # 8. SDDL relaxation — the v1.3 piece. Grant SERVICE_QUERY_STATUS +
 #    SERVICE_START to the Operators group, NOT to Authenticated Users.
@@ -389,7 +406,14 @@ foreach ($svc in @($ServiceApi, $ServiceDaemon)) {
 
 Log "Install complete. Services registered with auto-start."
 Log "Operator group '$OperatorGroup' has SERVICE_START + SERVICE_QUERY_STATUS only (no SERVICE_STOP)."
-Log "Members: $((& net.exe localgroup $OperatorGroup 2>$null) -join ', ')"
+# Member listing is cosmetic; if it errors (rare), don't fail the whole install.
+$savedAEP = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    $members = (& net.exe localgroup $OperatorGroup 2>$null) -join ', '
+} catch { $members = "(could not list)" }
+$ErrorActionPreference = $savedAEP
+Log "Members: $members"
 
 }
 catch {
