@@ -25,6 +25,10 @@ jobs:
         run: pip install flake8
 
       - name: Run flake8
+        # Force bash on every OS so the `\` line-continuation works
+        # consistently. PowerShell (the windows-latest default) treats `\`
+        # at end of line as a unary operator and fails the parse.
+        shell: bash
         run: |
           flake8 src/ \
             --max-line-length=120 \
