@@ -1,0 +1,146 @@
+name: Installer
+
+# Builds the WinServerRAG installer (.exe) on a clean Windows runner and
+# attaches it to the GitHub Release.
+#
+# Why GitHub Actions, not local builds:
+#   - The Akasaka dev box has CUDA-enabled torch in the venv; PyInstaller
+#     bundles ALL of it, producing 4 GB exes / 16 GB raw output. A clean
+#     CI runner installs CPU-only torch by default, which keeps the
+#     final installer at ~500-700 MB.
+#   - electron-builder's winCodeSign extraction needs symlink-create
+#     permission, which on Windows requires Developer Mode or admin.
+#     GitHub-hosted runners run as an admin user, so symlinks Just Work.
+#   - Reproducibility: the build is pinned to a specific runner image +
+#     tag, so anyone can audit how the released exe was produced.
+#
+# Triggers:
+#   - workflow_dispatch: manual run (e.g., to rebuild for a draft Release).
+#   - release.published: every time a Release is published, build and
+#     upload the installer as a Release asset.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version baked into the installer filename (e.g. 1.3.0)"
+        required: true
+        default: "1.3.0"
+      release_tag:
+        description: "Existing Release tag to upload to (e.g. v1.3.0). Leave blank to skip upload."
+        required: false
+        default: ""
+  release:
+    types: [published]
+
+permissions:
+  contents: write   # gh release upload
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Python deps + PyInstaller
+        # Use a clean side-by-side venv (.venv) so the build doesn't
+        # accidentally reuse cached state from a prior run. requirements.txt
+        # pulls CPU torch by default — this is what we want here.
+        shell: bash
+        run: |
+          python -m venv .venv
+          ./.venv/Scripts/pip install --upgrade pip
+          ./.venv/Scripts/pip install -r requirements.txt
+          ./.venv/Scripts/pip install pyinstaller
+
+      - name: Install Inno Setup 6 via choco
+        shell: pwsh
+        # Chocolatey is preinstalled on windows-latest runners. innosetup
+        # ends up at "C:\Program Files (x86)\Inno Setup 6\" which build.ps1
+        # already probes for.
+        run: |
+          choco install innosetup --no-progress --yes
+          # Verify
+          if (-not (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) {
+            Write-Error "ISCC.exe not found after install"
+            exit 1
+          }
+
+      - name: Install NSSM via choco (cached)
+        shell: pwsh
+        # nssm.cc has been flaky (503s). Choco mirror is reliable. The
+        # installer/build.ps1 will pick up nssm.exe from the choco-installed
+        # location via its winget-cache probe (we drop a copy at the
+        # expected path below).
+        run: |
+          choco install nssm --no-progress --yes
+          $nssm = (Get-Command nssm -ErrorAction SilentlyContinue).Source
+          if (-not $nssm) {
+            Write-Error "nssm not found after install"
+            exit 1
+          }
+          New-Item -ItemType Directory -Force -Path "installer/inno/assets" | Out-Null
+          Copy-Item -Force $nssm "installer/inno/assets/nssm.exe"
+          Write-Host "Copied $nssm -> installer/inno/assets/nssm.exe"
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            # Strip leading "v" from the tag (v1.3.0 → 1.3.0).
+            VER="${{ github.event.release.tag_name }}"
+            VER="${VER#v}"
+          else
+            VER="${{ github.event.inputs.version }}"
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $VER"
+
+      - name: Build installer (PyInstaller + electron-builder + Inno Setup)
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -ExecutionPolicy Bypass -File installer/build.ps1 -Version "${{ steps.ver.outputs.version }}"
+
+      - name: Show installer size
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem dist/WinServerRAG-Setup-*.exe | Select-Object -First 1
+          if (-not $exe) { Write-Error "No installer .exe in dist/"; exit 1 }
+          Write-Host "Built: $($exe.FullName)"
+          Write-Host "Size:  $([math]::Round($exe.Length / 1MB, 1)) MB"
+
+      - name: Upload artifact (always, even on workflow_dispatch)
+        uses: actions/upload-artifact@v4
+        with:
+          name: WinServerRAG-Setup-${{ steps.ver.outputs.version }}
+          path: dist/WinServerRAG-Setup-*.exe
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload to GitHub Release (release event or explicit tag)
+        if: github.event_name == 'release' || github.event.inputs.release_tag != ''
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = if ("${{ github.event_name }}" -eq "release") {
+            "${{ github.event.release.tag_name }}"
+          } else {
+            "${{ github.event.inputs.release_tag }}"
+          }
+          $exe = (Get-ChildItem dist/WinServerRAG-Setup-*.exe | Select-Object -First 1).FullName
+          Write-Host "Uploading $exe to release $tag..."
+          gh release upload $tag $exe --clobber
