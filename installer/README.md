@@ -132,6 +132,54 @@ For a full wipe:
 Remove-Item -Recurse -Force "$env:ProgramData\WinServerRAG"
 ```
 
+## Known issues
+
+### 1. Bundle size much larger than target (~4 GB per exe) on a CUDA venv
+
+PyInstaller bundles whatever is in `.venv\Lib\site-packages`. If the venv
+has CUDA torch installed (per the GPU-acceleration steps in the README),
+the api / daemon / dbinit exes balloon to ~4 GB each because torch's
+CUDA `lib/` ships ~3.6 GB of `.dll`s. Final installer would be ~3 GB
+compressed — way past the ~500MB-1GB design target.
+
+**Workaround** (until v1.2.1): build with a CPU-only torch venv:
+
+```powershell
+# Side-by-side build venv (does not disturb the dev/runtime CUDA venv)
+python -m venv .venv-build
+.\.venv-build\Scripts\activate
+pip install -r requirements.txt   # CPU torch by default
+pip install pyinstaller
+# Override $VenvPython in build.ps1 to point at .venv-build, then:
+pwsh installer\build.ps1
+```
+
+A future build.ps1 will accept `-BuildVenv .venv-build` to switch transparently.
+
+### 2. electron-builder fails with "Cannot create symbolic link"
+
+`electron-builder` extracts `winCodeSign-2.6.0.7z` which contains
+macOS `.dylib` symlinks. Windows refuses to create them in non-elevated
+shells, so the extract dies mid-run.
+
+**Workaround**: enable Windows Developer Mode once:
+
+```
+Settings → Privacy & security → For developers → Developer Mode = ON
+```
+
+Then re-run `installer\build.ps1`. After Developer Mode is on, symlinks
+work without admin in any shell session.
+
+Alternative: run `pwsh` as Administrator for the duration of the build.
+
+### 3. AWS bridge not in installer
+
+`src/aws_bridge.py` is a service in the legacy install_service.md but
+v1.2 installer does not register it. If you need remote Cowork access,
+register it manually after install (see `scripts/install_service.md`).
+v1.3 will integrate it.
+
 ## Troubleshooting
 
 - **PyInstaller "ModuleNotFoundError: ..." at runtime** — add the missing
@@ -144,6 +192,9 @@ Remove-Item -Recurse -Force "$env:ProgramData\WinServerRAG"
   running, or `config.v2.env` has wrong PG password.
 - **`PyInstaller` AV false-positive** — also expected for unsigned exes.
   Add an exclusion for `%ProgramFiles%\WinServerRAG\` in Defender.
+- **NSSM download fails (nssm.cc 503)** — build.ps1 falls back to the
+  winget cache. Run `winget install --id NSSM.NSSM --silent` once before
+  the build if your environment cannot reach nssm.cc.
 
 ## See also
 

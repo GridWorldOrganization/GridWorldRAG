@@ -69,7 +69,20 @@ All notable changes to GridWorldRAG (Windows canonical). Format loosely follows
 ### Build prereqs (ビルドマシン側)
 - Python 3.12 + venv + PyInstaller (`pip install pyinstaller`)
 - Node.js 20+ (electron-builder)
-- Inno Setup 6 (<https://jrsoftware.org/isdl.php>)
+- Inno Setup 6 (<https://jrsoftware.org/isdl.php>) または `winget install JRSoftware.InnoSetup`
+- NSSM 2.24 (build.ps1 が winget キャッシュから自動取得、または `winget install NSSM.NSSM`)
+- Windows Developer Mode 有効化 (electron-builder の symlink 抽出に必要)
+
+### 既知の制約 (v1.2.0)
+- **bundle size**: 開発 venv に CUDA torch (3.6GB) が install されている場合、
+  PyInstaller --onedir 出力が各 ~4GB に膨らむ (target 500MB-1GB 超過)。
+  v1.2.1 で `.venv-build/` 別 venv (CPU torch のみ) 対応の `-BuildVenv` 切替を予定。
+  当面は手動で `.venv-build` を作成して `installer/build.ps1` の
+  `$VenvPython` を書き換える [installer/README.md](./installer/README.md) 参照
+- **electron-builder symlink エラー**: Windows Developer Mode 未有効だと
+  winCodeSign 抽出時に dylib symlink 作成失敗。一回 ON すれば以降 OK
+- **nssm.cc 503**: build.ps1 は winget キャッシュ (`NSSM.NSSM`) を fallback。
+  `winget install NSSM.NSSM` を一回実行すれば nssm.cc 不要
 
 詳細: [installer/README.md](./installer/README.md)
 
