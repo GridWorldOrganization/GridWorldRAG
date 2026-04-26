@@ -115,10 +115,18 @@ async def _lifespan(_app):
                 created = db.seed_default_mcp_users(conn)
                 if created:
                     log.info("seeded default MCP users: %s", ", ".join(created))
+                # Bootstrap pause state into _stats_cache so /api/stats has
+                # the right value immediately, not 5s after startup. Without
+                # this, the mini-monitor would briefly show ⏸ for a daemon
+                # that's actually paused (or vice versa) right after restart.
+                paused, since = db.is_paused(conn)
+                with _stats_lock:
+                    _stats_cache["paused"] = paused
+                    _stats_cache["paused_since"] = since.isoformat() if since else None
             finally:
                 conn.close()
         except Exception as e:
-            log.error("startup mcp-user seed failed (non-fatal): %s", e)
+            log.error("startup mcp-user seed / pause bootstrap failed (non-fatal): %s", e)
 
         # Fix C: prime the Google Drive service once at startup so requests
         # don't block on OAuth refresh. _get_service() now just returns the
@@ -517,6 +525,13 @@ _stats_cache: dict = {
     "total_files_estimate": 0, "enabled_files_estimate": 0,
     "db_size_bytes": None, "pg_ok": False, "drive_ok": True,
     "last_updated": None,
+    # Manual pause state (daemon_config['paused']). Bootstrapped from DB on
+    # lifespan startup, kept in sync by the pause/resume endpoints (which
+    # write _stats_cache synchronously after a successful DB commit) and by
+    # the 5s _stats_pump as a periodic re-confirm. Mini-monitor reads this
+    # via /api/stats and toggles the ⏸/▶ button accordingly.
+    "paused": False,
+    "paused_since": None,
     # Device info (GPU vs CPU). Static fields are probed once at startup;
     # dynamic VRAM / util are refreshed in _stats_pump via nvidia-smi.
     "device": {
@@ -588,7 +603,11 @@ async def _stats_pump():
             def _fetch():
                 conn = db.connect()
                 try:
-                    return db.global_stats(conn)
+                    stats = db.global_stats(conn)
+                    paused, since = db.is_paused(conn)
+                    stats["paused"] = paused
+                    stats["paused_since"] = since.isoformat() if since else None
+                    return stats
                 finally:
                     conn.close()
             row = await _a.to_thread(_fetch)
@@ -613,6 +632,91 @@ async def _stats_pump():
 def api_stats():
     with _stats_lock:
         return dict(_stats_cache)
+
+
+# ---------------------------------------------------------------------
+# Daemon pause/resume control (manual operator override).
+#
+# Spec (README "## サービス挙動仕様"): pausing stops the daemon from
+# picking up new tasks; in-flight tasks are allowed to complete. State
+# persists across restarts via daemon_config['paused'] (single JSON).
+#
+# The endpoints write the DB *and* synchronously update _stats_cache, so
+# the mini-monitor's button flips on the very next 250ms poll instead of
+# waiting up to 5s for _stats_pump to catch up. daemon_events insertion
+# is wrapped in try/except — event-table failures must never break a
+# successful state change.
+# ---------------------------------------------------------------------
+def _push_pause_to_cache(state: dict) -> None:
+    """Mirror a successful DB pause/resume into _stats_cache. Called from
+    the API handler thread after the DB commit succeeds."""
+    with _stats_lock:
+        _stats_cache["paused"] = bool(state.get("paused", False))
+        _stats_cache["paused_since"] = state.get("since")
+
+
+def _try_log_event(conn, *, drive_id, level, event, message, extra=None):
+    """Best-effort event log. A daemon_events insert failure must not
+    fail the control-plane API."""
+    try:
+        db.log_event(conn, drive_id=drive_id, level=level, event=event,
+                     message=message, extra=extra)
+    except Exception as e:
+        log.warning("daemon_events insert failed for event=%s (non-fatal): %s",
+                    event, e)
+
+
+@app.post("/api/daemon/pause", dependencies=[Depends(require_token)])
+def api_daemon_pause():
+    """Stop the daemon from picking up new tasks. In-flight tasks complete.
+    Idempotent: POST when already paused returns the original since timestamp."""
+    conn = db.connect()
+    try:
+        prev_paused, _ = db.is_paused(conn)
+        state = db.set_paused(conn, paused=True)
+        _push_pause_to_cache(state)
+        if not prev_paused:
+            log.info("daemon paused via API at %s", state["since"])
+            _try_log_event(conn, drive_id=None, level="info",
+                           event="daemon_paused",
+                           message="daemon paused via API",
+                           extra={"since": state["since"]})
+        return state
+    finally:
+        conn.close()
+
+
+@app.post("/api/daemon/resume", dependencies=[Depends(require_token)])
+def api_daemon_resume():
+    """Resume new-task pickup. Idempotent."""
+    conn = db.connect()
+    try:
+        prev_paused, _ = db.is_paused(conn)
+        state = db.set_paused(conn, paused=False)
+        _push_pause_to_cache(state)
+        if prev_paused:
+            log.info("daemon resumed via API")
+            _try_log_event(conn, drive_id=None, level="info",
+                           event="daemon_resumed",
+                           message="daemon resumed via API",
+                           extra=None)
+        return state
+    finally:
+        conn.close()
+
+
+@app.get("/api/daemon/state", dependencies=[Depends(require_token)])
+def api_daemon_state():
+    """Return current pause state. Read directly from DB (cheap KV lookup)."""
+    conn = db.connect()
+    try:
+        paused, since = db.is_paused(conn)
+        return {
+            "paused": paused,
+            "since": since.isoformat() if since else None,
+        }
+    finally:
+        conn.close()
 
 
 # --- file_count_estimate pump --------------------------------------------

@@ -74,11 +74,61 @@ function escHtmlAttr(s) {
 }
 
 function setIndicator(kind) {
-  // kind: 'idle' | 'ok' | 'active' | 'err'
+  // kind: 'idle' | 'ok' | 'active' | 'err' | 'paused'
+  // 'paused' overrides 'active' — when the operator manually paused the
+  // service, in-flight workers may still be finishing, but the dominant
+  // user-visible state is "stopped on purpose".
   const el = $("indicator");
-  el.classList.remove("ok", "active", "err");
+  el.classList.remove("ok", "active", "err", "paused");
   if (kind !== "idle") el.classList.add(kind);
   DBG.indicator = kind;
+}
+
+// --- Pause/resume button state machine ---------------------------------
+// `null` = unknown (waiting for first /api/stats response). `true` = paused.
+// We track this so the button stays in sync with the API and so a click
+// can be optimistically reflected before the next 250ms poll lands.
+let _pausedState = null;
+let _pauseInflight = false;
+
+function setPauseUI(paused) {
+  const btn = $("pause-btn");
+  if (!btn) return;
+  if (paused) {
+    btn.textContent = "▶";
+    btn.title = "サービスを再開する";
+    btn.classList.add("paused");
+  } else {
+    btn.textContent = "⏸";
+    btn.title = "サービスを一時停止する (新規タスク取得を止める。進行中タスクは完走)";
+    btn.classList.remove("paused");
+  }
+  btn.disabled = _pauseInflight;
+}
+
+async function togglePause() {
+  if (_pauseInflight || _pausedState == null) return;
+  const target = !_pausedState;
+  const path = target ? "/api/daemon/pause" : "/api/daemon/resume";
+  _pauseInflight = true;
+  setPauseUI(_pausedState);  // re-render with disabled=true
+  try {
+    const r = await fetch(API + path, { method: "POST" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const state = await r.json();
+    _pausedState = !!state.paused;
+    setPauseUI(_pausedState);
+  } catch (e) {
+    // Revert: keep the previous state on error. The next /api/stats poll
+    // will reconcile if the DB was actually updated. Surface the error
+    // in the debug overlay (Ctrl+Shift+D) so the operator can see why.
+    DBG.lastFailReason = `pause-toggle: ${e && e.message || e}`;
+    DBG.lastFailAt = new Date();
+    if (isDebugOpen()) renderDebug();
+  } finally {
+    _pauseInflight = false;
+    setPauseUI(_pausedState);
+  }
 }
 
 function flashTick() {
@@ -136,12 +186,24 @@ async function tick() {
       };
     });
 
+    // Reflect manual pause state from /api/stats. When paused, the button
+    // shows ▶ and the indicator goes gray — overriding "active" even if
+    // workers are still finishing in-flight tasks (spec: "in-flight tasks
+    // complete" means we promised to drain, not to hide the pause state).
+    const stillFlightingInflight = activeWorkers.length > 0;  // for status text
+    if (_pausedState !== !!s.paused) {
+      _pausedState = !!s.paused;
+      setPauseUI(_pausedState);
+    }
+
     const anyErr = allWorkers.some(x => x.state === "error") || s.pg_ok === false;
-    if (daemonLooksDead) setIndicator("err");
-    else if (anyErr)                 setIndicator("err");
-    else if (activeWorkers.length > 0) setIndicator("active");
-    else if (s.pg_ok)                setIndicator("ok");
-    else                             setIndicator("idle");
+    // Indicator priority: err > paused > active > ok > idle
+    if (daemonLooksDead)                  setIndicator("err");
+    else if (anyErr)                       setIndicator("err");
+    else if (s.paused)                     setIndicator("paused");
+    else if (activeWorkers.length > 0)     setIndicator("active");
+    else if (s.pg_ok)                      setIndicator("ok");
+    else                                   setIndicator("idle");
 
     // --- top aggregate progress (sum PER DRIVE, not per worker).
     // 4 workers on one drive all report total_files = the drive's total, so
@@ -165,11 +227,22 @@ async function tick() {
     if (total > 0) {
       const pct = (done / total) * 100;
       fill.style.width = pct.toFixed(1) + "%";
-      label.textContent = `${done.toLocaleString()} / ${total.toLocaleString()} files (${pct.toFixed(1)}%)`;
-      agg.classList.add("active");
+      // Spec (README:149) requires "停止中（手動停止）" when paused. Keep
+      // the bar visible so the user sees in-flight work draining, but
+      // augment the text so it's clear the daemon is stopped on purpose.
+      const suffix = s.paused ? " — 停止中（手動停止）" : "";
+      label.textContent = `${done.toLocaleString()} / ${total.toLocaleString()} files (${pct.toFixed(1)}%)${suffix}`;
+      // Don't shimmer when paused — the bar should look dormant even if
+      // a worker is still finishing the current file.
+      if (s.paused) agg.classList.remove("active");
+      else agg.classList.add("active");
     } else {
       fill.style.width = "0";
-      label.textContent = activeWorkers.length ? "リスト取得中…" : "アイドル";
+      if (s.paused) {
+        label.textContent = "停止中（手動停止）";
+      } else {
+        label.textContent = activeWorkers.length ? "リスト取得中…" : "アイドル";
+      }
       agg.classList.remove("active");
     }
     // Blink the tick whenever files_done advances — gives a visible heartbeat
@@ -345,6 +418,13 @@ window.addEventListener("DOMContentLoaded", async () => {
   try { API = await window.winsrv.getApiUrl(); } catch {}
   $("api-url").textContent = API.replace(/^https?:\/\//, "");
   $("open-btn").addEventListener("click", () => window.winsrv.openWebUi());
+
+  // Pause/resume toggle. Initial label is set to ⏸ in HTML; the first
+  // /api/stats response will flip it to ▶ if the service is actually paused.
+  const pauseBtn = $("pause-btn");
+  if (pauseBtn) {
+    pauseBtn.addEventListener("click", () => togglePause());
+  }
 
   // Always-on-top checkbox: reflects current BrowserWindow state on load,
   // flips it via IPC on change. Uses localStorage as an extra memory so the

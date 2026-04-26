@@ -86,6 +86,17 @@ _workers_lock = threading.Lock()
 _workers: dict[int, dict] = {}  # wid -> {thread, stop_event, conn}
 _next_worker_id = 1
 
+# Daemon pause flag. Refreshed by the manager loop (every 5s) from
+# daemon_config['paused']. Workers consume this cached flag — they don't
+# hit the DB on every task. Pause semantics:
+#   - paused=True → manager skips new enqueues, AND workers drop any
+#     queued list_full/list_delta tasks (defense-in-depth: a list task
+#     enqueued just before pause must not start a new build).
+#   - file / file_delete / finalize tasks always run, even while paused
+#     (spec: "in-flight tasks complete").
+# 5s staleness is acceptable per spec.
+_paused_flag = threading.Event()
+
 
 def _signal_handler(signum, frame):
     global _stop_flag
@@ -460,6 +471,17 @@ def _worker_loop(wid: int, personal_stop: threading.Event) -> None:
             _mark_consumed(task)
 
             kind = task[0]
+
+            # Defense-in-depth: a list_full / list_delta task may have been
+            # enqueued by a previous manager iter just before pause was
+            # activated. Drop it instead of starting a new build/sync.
+            # file / file_delete / finalize tasks always run — they are
+            # in-flight work that the spec promises will complete.
+            if kind in ("list_full", "list_delta") and _paused_flag.is_set():
+                log.info("worker %d: paused — dropping %s task for %s",
+                         wid, kind, task[1])
+                continue
+
             try:
                 if kind == "list_full":
                     _handle_list(conn, wid, task[1], mode="full")
@@ -558,9 +580,26 @@ def _drain_queue_for_drive(drive_id: str) -> int:
 
 def _manager_iter(manager_conn) -> None:
     """Single iteration of the manager loop."""
+    # Refresh the worker-visible pause flag once per iteration. Workers
+    # read this without hitting the DB. Pause has up to ~5s of latency
+    # to take effect (matches manager cadence) which is acceptable.
+    try:
+        paused, _since = db.is_paused(manager_conn)
+    except Exception as e:
+        # If we can't read pause state, keep the last known value.
+        # Manager iter will retry next round.
+        log.warning("paused-state read failed (keeping last value): %s", e)
+        paused = _paused_flag.is_set()
+    if paused:
+        _paused_flag.set()
+    else:
+        _paused_flag.clear()
+
     fds = db.list_fds(manager_conn)
 
-    # Respect cancel: set flag, drain queue entries for cancelled drives
+    # Respect cancel: set flag, drain queue entries for cancelled drives.
+    # Cancel/drain runs even while paused — disabling a drive must always
+    # take effect, paused or not.
     for row in fds:
         if not row.get("enabled") and row.get("state") == "building":
             drive_id = row["drive_id"]
@@ -574,29 +613,35 @@ def _manager_iter(manager_conn) -> None:
     # Re-read after cancel writes
     fds = db.list_fds(manager_conn)
 
-    # Enqueue new work for enabled+idle drives
-    for row in fds:
-        if not row.get("enabled"):
-            continue
-        drive_id = row["drive_id"]
-        state = row.get("state")
+    # Enqueue new work for enabled+idle drives.
+    # SKIPPED while paused — this is the primary pause mechanism. Workers
+    # provide defense-in-depth by dropping any list_* tasks already queued
+    # at the moment pause was set.
+    if not paused:
+        for row in fds:
+            if not row.get("enabled"):
+                continue
+            drive_id = row["drive_id"]
+            state = row.get("state")
 
-        # Skip if already building or if queue has pending work for it
-        if state == "building":
-            continue
-        if _pending_for_drive(drive_id) > 0:
-            continue
-        if db.inflight_workers_on_drive(manager_conn, drive_id) > 0:
-            continue
+            # Skip if already building or if queue has pending work for it
+            if state == "building":
+                continue
+            if _pending_for_drive(drive_id) > 0:
+                continue
+            if db.inflight_workers_on_drive(manager_conn, drive_id) > 0:
+                continue
 
-        # Decide full vs delta
-        if row.get("rotate_token"):
-            _enqueue(("list_delta", drive_id))
-        else:
-            _enqueue(("list_full", drive_id))
+            # Decide full vs delta
+            if row.get("rotate_token"):
+                _enqueue(("list_delta", drive_id))
+            else:
+                _enqueue(("list_full", drive_id))
 
     # Completion detection: for drives in state='building' with no pending
-    # work and no inflight workers, enqueue finalize.
+    # work and no inflight workers, enqueue finalize. This MUST run even
+    # while paused, so an in-flight build that finishes its current files
+    # can still commit and exit "building" cleanly.
     for row in fds:
         if row.get("state") != "building":
             continue
