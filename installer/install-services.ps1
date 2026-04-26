@@ -104,19 +104,30 @@ try {
 function Log($msg) { Write-Host "[install-services] $msg" }
 
 function Service-Exists($name) {
-    $r = & sc.exe query $name 2>&1
+    # NOTE: do NOT use `2>&1` here — sc.exe / net.exe / nssm.exe write
+    # error text to stderr, and `2>&1` redirects native-command stderr
+    # through the PowerShell error stream. With $ErrorActionPreference =
+    # "Stop", any record on the error stream becomes a terminating error
+    # — even though the function itself was supposed to gracefully
+    # handle the "doesn't exist" case via $LASTEXITCODE. v1.3.2 hotfix.
+    & sc.exe query $name 2>$null > $null
     return $LASTEXITCODE -eq 0
 }
 
 function Group-Exists($name) {
-    $r = & net.exe localgroup $name 2>&1
+    # See comment in Service-Exists. `net.exe localgroup` writes
+    # "システム エラー 1376 が発生しました" (group not found) to stderr;
+    # with `2>&1` + ErrorAction=Stop, the script throws here even though
+    # the whole point of this function is to detect missing groups
+    # without throwing.
+    & net.exe localgroup $name 2>$null > $null
     return $LASTEXITCODE -eq 0
 }
 
 function Stop-IfRunning($name) {
     if (Service-Exists $name) {
         Log "Stopping $name (if running)..."
-        & sc.exe stop $name 2>&1 | Out-Null
+        & sc.exe stop $name 2>$null > $null
         # Best-effort: don't error if already stopped.
     }
 }
@@ -142,15 +153,15 @@ if ($Uninstall) {
     Stop-IfRunning $ServiceApi
     if (Service-Exists $ServiceDaemon) {
         Log "Removing $ServiceDaemon..."
-        & $NssmExe remove $ServiceDaemon confirm 2>&1 | Out-Null
+        & $NssmExe remove $ServiceDaemon confirm *>$null
     }
     if (Service-Exists $ServiceApi) {
         Log "Removing $ServiceApi..."
-        & $NssmExe remove $ServiceApi confirm 2>&1 | Out-Null
+        & $NssmExe remove $ServiceApi confirm *>$null
     }
     if (Group-Exists $OperatorGroup) {
         Log "Removing local group $OperatorGroup..."
-        & net.exe localgroup $OperatorGroup /delete 2>&1 | Out-Null
+        & net.exe localgroup $OperatorGroup /delete *>$null
     }
     Log "Uninstall complete."
     try { Stop-Transcript | Out-Null } catch {}
@@ -192,7 +203,7 @@ foreach ($svc in @($ServiceDaemon, $ServiceApi)) {
         # not have stopped them first.
         Stop-IfRunning $svc
         Start-Sleep -Seconds 2
-        & $NssmExe remove $svc confirm 2>&1 | Out-Null
+        & $NssmExe remove $svc confirm *>$null
         if (Service-Exists $svc) {
             Log "Warning: $svc still exists after nssm remove; install path will update params in place instead."
         } else {
@@ -212,7 +223,7 @@ foreach ($d in @($ConfigDir, $LogDir)) {
 # 3. Local Operators group — create-if-missing, idempotent.
 if (-not (Group-Exists $OperatorGroup)) {
     Log "Creating local group: $OperatorGroup"
-    & net.exe localgroup $OperatorGroup /add /comment:"Members can start/query the WinServerRAG services without UAC." 2>&1 | Out-Null
+    & net.exe localgroup $OperatorGroup /add /comment:"Members can start/query the WinServerRAG services without UAC." *>$null
     if ($LASTEXITCODE -ne 0) {
         throw "Failed to create local group $OperatorGroup (exit $LASTEXITCODE)"
     }
@@ -226,7 +237,7 @@ if ($OperatorUser) {
     Log "Adding user '$OperatorUser' to '$OperatorGroup' (if not already)..."
     # `net localgroup ... /add` returns 2 if the user is already a member;
     # not an error in our context. Suppress.
-    & net.exe localgroup $OperatorGroup $OperatorUser /add 2>&1 | Out-Null
+    & net.exe localgroup $OperatorGroup $OperatorUser /add *>$null
 }
 
 # 5. Install API service — idempotent. If it exists, fall through to
@@ -237,7 +248,7 @@ function Install-NssmService($name, $exe) {
         Log "Service exists, will update params: $name"
     } else {
         Log "Installing service: $name -> $exe"
-        & $NssmExe install $name $exe 2>&1 | Out-Null
+        & $NssmExe install $name $exe *>$null
         if ($LASTEXITCODE -ne 0) { throw "nssm install $name failed: $LASTEXITCODE" }
     }
 }
@@ -295,17 +306,28 @@ $Sddl = "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)" `
 
 foreach ($svc in @($ServiceApi, $ServiceDaemon)) {
     Log "Applying SDDL to $svc (Operators get LIST + START only)..."
-    $r = & sc.exe sdset $svc $Sddl 2>&1
-    if ($LASTEXITCODE -ne 0) {
+    # We WANT stderr text here for the warning. `2>&1` would re-engage
+    # ErrorActionPreference=Stop on a sc.exe non-zero exit. Drop the
+    # preference for this one call so the warning path can fire instead
+    # of throwing.
+    $saved = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $r = & sc.exe sdset $svc $Sddl 2>&1
+        $ec = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $saved
+    }
+    if ($ec -ne 0) {
         # Don't crash — the service still works for admins. Just warn.
         # Common cause: SDDL syntax mismatch on an oddly-configured host.
-        Write-Warning "sc sdset $svc failed: $r (exit $LASTEXITCODE) — Operators group will not have non-admin start rights"
+        Write-Warning "sc sdset $svc failed: $r (exit $ec) — Operators group will not have non-admin start rights"
     }
 }
 
 Log "Install complete. Services registered with auto-start."
 Log "Operator group '$OperatorGroup' has SERVICE_START + SERVICE_QUERY_STATUS only (no SERVICE_STOP)."
-Log "Members: $((& net.exe localgroup $OperatorGroup) -join ', ')"
+Log "Members: $((& net.exe localgroup $OperatorGroup 2>$null) -join ', ')"
 
 }
 catch {
