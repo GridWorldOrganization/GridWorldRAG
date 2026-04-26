@@ -170,6 +170,37 @@ foreach ($p in @($NssmExe, $ApiExe, $DaemonExe)) {
     }
 }
 
+# 1.5 v1.3.2: upgrade-clean re-register.
+#
+# If we're running on top of an older WinServerRAG, the services already
+# exist with the prior version's NSSM config in the registry. Inno
+# Setup's PrepareToInstall (in the .iss [Code] section) has already
+# stopped them so [Files] could overwrite the bundled exes — but the
+# SCM entries themselves still point at the OLD AppDirectory and may
+# carry stale AppParameters / AppEnvironmentExtra from the previous
+# version. `nssm set` updates fields in-place but cannot remove a
+# field that the new install no longer needs.
+#
+# Cleanest fix: remove the services here, fall through to the
+# `Install-NssmService` calls below which re-create them fresh.
+# Falls back to update-in-place if `nssm remove` doesn't take.
+foreach ($svc in @($ServiceDaemon, $ServiceApi)) {
+    if (Service-Exists $svc) {
+        Log "Existing service detected, removing for clean re-register: $svc"
+        # PrepareToInstall already stopped these, but be defensive — a
+        # user invoking this script manually as a "repair" step might
+        # not have stopped them first.
+        Stop-IfRunning $svc
+        Start-Sleep -Seconds 2
+        & $NssmExe remove $svc confirm 2>&1 | Out-Null
+        if (Service-Exists $svc) {
+            Log "Warning: $svc still exists after nssm remove; install path will update params in place instead."
+        } else {
+            Log "Removed $svc."
+        }
+    }
+}
+
 # 2. Make sure the writable dirs exist.
 foreach ($d in @($ConfigDir, $LogDir)) {
     if (-not (Test-Path $d)) {

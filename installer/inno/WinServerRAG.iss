@@ -62,6 +62,13 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 ; UninstallDisplayIcon={app}\mini\{#AppExeMini}   ; needs an .ico — Mini Monitor exe is not a .ico
 ChangesEnvironment=no
+; v1.3.2: graceful upgrade — close any running Mini Monitor before
+; [Files] tries to overwrite mini\WinServerRAG Mini.exe. `force` =
+; kill if the user ignores the prompt. Daemon/API services are
+; stopped separately in PrepareToInstall (Code section) since they
+; aren't owned by a foreground window.
+CloseApplications=force
+RestartApplications=no
 
 [Languages]
 Name: "japanese"; MessagesFile: "compiler:Languages\Japanese.isl"
@@ -201,5 +208,79 @@ begin
       'Continue installation anyway?',
       mbConfirmation, MB_YESNO);
     Result := (Resp = IDYES);
+  end;
+end;
+
+// v1.3.2: graceful upgrade support.
+//
+// If a previous WinServerRAG is installed and its services are running,
+// the daemon/API exes are locked by NSSM-spawned processes. [Files]
+// would fail to overwrite them. We stop the services in PrepareToInstall
+// (the documented Inno hook for "do this before [Files]"), wait for
+// SCM to confirm STOPPED, and let install proceed. install-services.ps1
+// then sees existing services and `nssm remove`s them for a clean
+// re-register (drops any stale AppParameters / AppEnvironmentExtra).
+
+function ServiceExists(const SvcName: String): Boolean;
+var
+  ResultCode: Integer;
+begin
+  Exec(ExpandConstant('{cmd}'),
+       '/C sc query "' + SvcName + '" >NUL 2>&1',
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Result := (ResultCode = 0);
+end;
+
+function ServiceIsStopped(const SvcName: String): Boolean;
+var
+  ResultCode: Integer;
+begin
+  // findstr exit 0 means "STOPPED" line was found in `sc query` output.
+  Exec(ExpandConstant('{cmd}'),
+       '/C sc query "' + SvcName + '" | findstr /C:"STATE" | findstr /C:"STOPPED" >NUL 2>&1',
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Result := (ResultCode = 0);
+end;
+
+function StopServiceAndWait(const SvcName: String): Boolean;
+var
+  ResultCode, WaitCount: Integer;
+begin
+  Result := True;
+  if not ServiceExists(SvcName) then Exit; // Fresh install — nothing to do.
+
+  // sc stop is best-effort; if already stopped it returns 1062 which is fine.
+  Exec(ExpandConstant('{cmd}'),
+       '/C sc stop "' + SvcName + '" >NUL 2>&1',
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+
+  // Poll for STOPPED state, up to 30s. NSSM's stop-method default is
+  // graceful-then-kill at 5s, so 30s is plenty even for a stuck daemon.
+  WaitCount := 0;
+  while WaitCount < 30 do
+  begin
+    if ServiceIsStopped(SvcName) then Exit;
+    Sleep(1000);
+    WaitCount := WaitCount + 1;
+  end;
+  Result := False; // Timeout.
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := '';
+  // Stop daemon FIRST — it depends on API, so the API stop won't take
+  // effect cleanly while the daemon is still hitting it.
+  if not StopServiceAndWait('{#ServiceDaemon}') then
+  begin
+    Result := '{#ServiceDaemon} did not reach STOPPED state within 30 seconds. ' +
+              'Stop it manually via services.msc and re-run the installer.';
+    Exit;
+  end;
+  if not StopServiceAndWait('{#ServiceApi}') then
+  begin
+    Result := '{#ServiceApi} did not reach STOPPED state within 30 seconds. ' +
+              'Stop it manually via services.msc and re-run the installer.';
+    Exit;
   end;
 end;
