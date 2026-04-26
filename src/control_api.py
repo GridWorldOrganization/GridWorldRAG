@@ -22,8 +22,7 @@ import asyncio
 import json
 import threading
 import time as _time
-from datetime import datetime, timezone
-from pathlib import Path
+from datetime import datetime
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request, Depends
@@ -467,7 +466,7 @@ class UserScopeTogglePayload(BaseModel):
 @app.post("/api/mcp/users/{username}/scope/{drive_id}",
           dependencies=[Depends(require_token)])
 def api_set_user_scope(username: str, drive_id: str,
-                        payload: UserScopeTogglePayload):
+                       payload: UserScopeTogglePayload):
     """Enable/disable a single drive in the given user's MCP scope."""
     _validate_username(username)
     conn = db.connect()
@@ -732,6 +731,7 @@ async def _count_estimate_pump():
 async def api_refresh_count(drive_id: str):
     """Manually re-count files for one drive. Returns the new estimate."""
     import asyncio as _a
+
     def _work():
         conn = db.connect()
         try:

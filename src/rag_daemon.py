@@ -56,7 +56,7 @@ import sys
 import threading
 import time
 import traceback
-from typing import Optional, Tuple
+from typing import Optional
 
 from src import config, db, drive_client as dc
 from src.embedding import embed_batch

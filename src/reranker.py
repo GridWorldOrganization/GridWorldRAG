@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Optional
 
 from src.config import ENABLE_RERANKER, RERANKER_MODEL, EMBEDDING_DEVICE
 

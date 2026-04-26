@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import threading
-from typing import Optional
 
 from src.config import EMBEDDING_MODEL, EMBEDDING_DEVICE, BATCH_SIZE
 

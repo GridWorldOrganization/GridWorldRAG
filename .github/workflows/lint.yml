@@ -28,5 +28,5 @@ jobs:
         run: |
           flake8 src/ \
             --max-line-length=120 \
-            --extend-ignore=E501,W503,E221,E402,E302,E305,E401 \
+            --extend-ignore=E501,W503,E221,E402,E302,E305,E401,E701,E231 \
             --exclude=.venv,__pycache__

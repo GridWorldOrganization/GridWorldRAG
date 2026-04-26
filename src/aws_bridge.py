@@ -17,7 +17,6 @@ Task Scheduler registration is forbidden per the project policy.
 from __future__ import annotations
 
 import json
-import logging
 import os
 import signal
 import sys
