@@ -139,10 +139,22 @@ Filename: "powershell.exe"; \
 ; auto-run it during install because PostgreSQL might not be ready yet
 ; on a fresh box (newly installed, not yet started).
 
-; -- Optional: launch mini-monitor at the end --
-Filename: "{app}\mini\{#AppExeMini}"; \
-  Description: "{cm:LaunchProgram,{#AppName} Mini Monitor}"; \
-  Flags: nowait postinstall skipifsilent
+; -- v1.3.2: Mini Monitor is NOT auto-launched at install end. --
+;
+; v1.3.0/1 fired Mini via `Flags: nowait postinstall skipifsilent`.
+; Two problems with that:
+;   1. The installer fires-and-forgets, so a Mini crash during init
+;      (e.g. asar missing service-control.js — the PR #34 bug) orphans
+;      Electron's GPU/utility helper subprocesses with no cleanup.
+;      Repeated install attempts accumulated 3+ orphan processes.
+;   2. Showing Mini before the user has confirmed install success is
+;      awkward — the Inno Setup "Finish" page should be the success
+;      signal, not a popup window racing it.
+;
+; Mini Monitor is now Start-Menu / desktop-shortcut launch only.
+; Defense-in-depth: desktop/main.js also has uncaughtException +
+; require-guard handlers (v1.3.2) so any future Mini crash exits cleanly
+; instead of leaking helper processes.
 
 [UninstallRun]
 ; v1.3: delegate to install-services.ps1 -Uninstall, which stops both
