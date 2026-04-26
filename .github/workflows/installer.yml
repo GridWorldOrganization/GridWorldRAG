@@ -58,12 +58,17 @@ jobs:
         # Use a clean side-by-side venv (.venv) so the build doesn't
         # accidentally reuse cached state from a prior run. requirements.txt
         # pulls CPU torch by default — this is what we want here.
+        #
+        # `python -m pip install --upgrade pip` (NOT `pip install --upgrade pip`):
+        # on Windows, pip refuses to overwrite its own running .exe, but
+        # the `python -m pip` form invokes pip via the interpreter so the
+        # rename-on-replace works.
         shell: bash
         run: |
           python -m venv .venv
-          ./.venv/Scripts/pip install --upgrade pip
-          ./.venv/Scripts/pip install -r requirements.txt
-          ./.venv/Scripts/pip install pyinstaller
+          ./.venv/Scripts/python.exe -m pip install --upgrade pip
+          ./.venv/Scripts/python.exe -m pip install -r requirements.txt
+          ./.venv/Scripts/python.exe -m pip install pyinstaller
 
       - name: Install Inno Setup 6 via choco
         shell: pwsh
