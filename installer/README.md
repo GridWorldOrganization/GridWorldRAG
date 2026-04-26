@@ -49,11 +49,30 @@ installer/
 
 ## Build
 
+### Recommended: GitHub Actions (clean, reproducible)
+
+The `.github/workflows/installer.yml` workflow builds the installer on
+a Windows runner with CPU-only torch and admin-mode symlink permissions
+(both of which dodge the local-build pitfalls the v1.2 known-issues
+section calls out). Triggers:
+
+- **Manual**: Actions → Installer → Run workflow → enter version + tag
+- **Automatic**: every Release publish triggers a build that uploads
+  `WinServerRAG-Setup-<version>.exe` as a Release asset
+
+### Local build (optional, for fast iteration)
+
 ```powershell
 pwsh installer\build.ps1
 ```
 
 Output: `dist\WinServerRAG-Setup-1.2.0.exe` (~600 MB).
+
+> **Heads up**: a local build inherits the dev venv. If your venv has
+> CUDA torch (`pip install torch ... --index-url .../cu124`), the bundle
+> balloons to ~4 GB per exe. See "Known issues" below. The CI workflow
+> always uses a clean CPU-torch venv, so `dist/` from CI is the size
+> the operator should see.
 
 ### Switches
 
