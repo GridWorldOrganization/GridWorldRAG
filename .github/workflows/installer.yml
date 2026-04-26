@@ -85,20 +85,64 @@ jobs:
 
       - name: Install NSSM via choco (cached)
         shell: pwsh
-        # nssm.cc has been flaky (503s). Choco mirror is reliable. The
-        # installer/build.ps1 will pick up nssm.exe from the choco-installed
-        # location via its winget-cache probe (we drop a copy at the
-        # expected path below).
+        # nssm.cc has been flaky (503s). Choco mirror is reliable.
+        #
+        # CRITICAL: `Get-Command nssm` returns Chocolatey's SHIM at
+        # C:\ProgramData\chocolatey\bin\nssm.exe. The shim is a tiny
+        # (~60KB) wrapper that delegates to the real binary at
+        # C:\ProgramData\chocolatey\lib\NSSM\tools\win64\nssm.exe at
+        # runtime. If we copy the SHIM into the installer, it ends up
+        # at C:\Program Files\WinServerRAG\bin\nssm.exe and tries to
+        # find ..\lib\NSSM\tools\nssm.exe — which doesn't exist on the
+        # operator's machine. Result: every `nssm install` and
+        # `nssm set` returns exit -1, services never register.
+        #
+        # This was the root cause of the v1.3.0 install failure chain.
+        # The Group-Exists / NativeCommandError fixes (PR #37, #41)
+        # were real bugs but downstream symptoms — install would have
+        # failed at the next nssm call regardless.
+        #
+        # Fix: copy the REAL nssm.exe from the choco lib subtree.
+        # Verify size > 200KB (real nssm-2.24 win64 is ~370KB; shim
+        # is ~60KB) so a future packaging change doesn't silently
+        # regress.
         run: |
           choco install nssm --no-progress --yes
-          $nssm = (Get-Command nssm -ErrorAction SilentlyContinue).Source
+          $candidates = @(
+            "C:\ProgramData\chocolatey\lib\NSSM\tools\win64\nssm.exe",
+            "C:\ProgramData\chocolatey\lib.installed\NSSM\tools\win64\nssm.exe"
+          )
+          $nssm = $null
+          foreach ($p in $candidates) {
+            if (Test-Path $p) { $nssm = $p; break }
+          }
           if (-not $nssm) {
-            Write-Error "nssm not found after install"
+            # Last-resort scan
+            $nssm = Get-ChildItem -Path "C:\ProgramData\chocolatey" -Recurse `
+              -Filter "nssm.exe" -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match "win64" -and $_.Length -gt 200000 } |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $nssm) {
+            Write-Error "Real nssm.exe not found in choco lib subtree"
+            exit 1
+          }
+          $size = (Get-Item $nssm).Length
+          if ($size -lt 200000) {
+            Write-Error "nssm.exe at $nssm is only $size bytes — likely a shim, not the real binary"
+            exit 1
+          }
+          # Verify it's not a shim by checking VersionInfo. The shim has
+          # FileDescription containing "Chocolatey Shim". Real nssm
+          # has FileDescription "the Non-Sucking Service Manager".
+          $vi = (Get-Item $nssm).VersionInfo.FileDescription
+          if ($vi -match "Shim") {
+            Write-Error "nssm.exe at $nssm is a Chocolatey shim ($vi). Use the real binary."
             exit 1
           }
           New-Item -ItemType Directory -Force -Path "installer/inno/assets" | Out-Null
           Copy-Item -Force $nssm "installer/inno/assets/nssm.exe"
-          Write-Host "Copied $nssm -> installer/inno/assets/nssm.exe"
+          Write-Host "Copied REAL nssm.exe ($size bytes, '$vi') from $nssm"
 
       - name: Resolve version
         id: ver
