@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import re
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import Iterable, Iterator, Optional
 
 import psycopg
@@ -876,6 +877,74 @@ def set_config(conn: psycopg.Connection, key: str, value: str) -> None:
             (key, value),
         )
     conn.commit()
+
+
+# ---------------------------------------------------------------------
+# Daemon pause/resume (single JSON value at daemon_config['paused'])
+#
+# Storage shape (single key, race-free UPSERT):
+#   key   = 'paused'
+#   value = '{"paused": true,  "since": "2026-04-26T17:30:00+00:00"}'
+#         | '{"paused": false, "since": null}'
+#         | (key absent)  → treat as not paused
+#
+# Transition-only `since`: only updated on state change. Idempotent calls
+# preserve the original transition timestamp so the UI's "paused for X
+# minutes" display is honest.
+# ---------------------------------------------------------------------
+def is_paused(conn: psycopg.Connection) -> tuple[bool, Optional[datetime]]:
+    """Read pause state. Returns (paused, since_timestamp_or_None).
+
+    Malformed JSON (corrupted row) silently degrades to (False, None).
+    Missing key (fresh install) returns (False, None).
+    """
+    raw = get_config(conn, "paused", default=None)
+    if not raw:
+        return False, None
+    try:
+        obj = json.loads(raw)
+        paused = bool(obj.get("paused", False))
+        since_str = obj.get("since")
+        since = None
+        if since_str:
+            try:
+                # tolerate "...Z" suffix (some serializers emit it)
+                since = datetime.fromisoformat(since_str.replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                since = None
+        return paused, since
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return False, None
+
+
+def set_paused(conn: psycopg.Connection, paused: bool) -> dict:
+    """Atomic transition-only update. Returns the new state dict.
+
+    Result shape: {"paused": bool, "since": ISO8601 str | None}
+
+    On idempotent call (target state == current state), the existing
+    `since` is preserved. On true transition (running→paused or
+    paused→running), `since` is set to NOW() / cleared to None.
+    """
+    cur_paused, cur_since = is_paused(conn)
+
+    if cur_paused == paused:
+        return {
+            "paused": cur_paused,
+            "since": cur_since.isoformat() if cur_since else None,
+        }
+
+    new_since = datetime.now(timezone.utc) if paused else None
+    payload = json.dumps({
+        "paused": paused,
+        "since": new_since.isoformat() if new_since else None,
+    })
+    set_config(conn, "paused", payload)
+
+    return {
+        "paused": paused,
+        "since": new_since.isoformat() if new_since else None,
+    }
 
 
 # ---------------------------------------------------------------------

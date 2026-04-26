@@ -37,6 +37,31 @@ def db_conn():
 
 
 @pytest.fixture
+def restore_pause_state(db_conn):
+    """Snapshot daemon_config['paused'] before a test, restore after.
+
+    Pause-state tests mutate the same row the live service reads, so they
+    must not leak. snapshot=None means "key was absent before the test"
+    and we DELETE it on teardown.
+    """
+    with db_conn.cursor() as cur:
+        cur.execute("SELECT value FROM public.daemon_config WHERE key='paused'")
+        r = cur.fetchone()
+        snapshot = r["value"] if r else None
+    yield
+    with db_conn.cursor() as cur:
+        if snapshot is None:
+            cur.execute("DELETE FROM public.daemon_config WHERE key='paused'")
+        else:
+            cur.execute(
+                "INSERT INTO public.daemon_config (key, value) VALUES ('paused', %s)"
+                " ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()",
+                (snapshot,),
+            )
+    db_conn.commit()
+
+
+@pytest.fixture
 def fresh_schema(db_conn):
     """Create a unique test schema, yield its name, drop it at teardown."""
     import uuid
