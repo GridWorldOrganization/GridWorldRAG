@@ -325,18 +325,23 @@ end;
 
 function FileAgeMinutes(const Path: String): Integer;
 var
-  Modified: TDateTime;
-  NowTs: TDateTime;
+  Modified: Double;
+  NowTs: Double;
+  Stamp: Longint;
 begin
+  // Inno Setup's Pascal Script does NOT expose TDateTime as a declarable
+  // variable type even though `Now` and `FileDateToDateTime` return one.
+  // TDateTime is a Double where integer part = days; declare as Double
+  // to make the parser happy. v1.3.2 first build failed with
+  // "Unknown type 'TDateTime'" at compile time.
   Result := -1;
   if not FileExists(Path) then Exit;
+  Stamp := FileAge(Path);
+  if Stamp = -1 then Exit;
   try
-    Modified := FileDateToDateTime(FileAge(Path));
-    // Inno Setup's Pascal Script exposes `Now` from SysUtils-equivalents.
-    // TDateTime is a Double where integer part = days. (Now - Modified)
-    // is a fractional day count; *24*60 → minutes.
+    Modified := FileDateToDateTime(Stamp);
     NowTs := Now;
-    Result := Round((NowTs - Modified) * 24 * 60);
+    Result := Round((NowTs - Modified) * 1440); // days → minutes (24*60)
   except
     Result := -1;
   end;
