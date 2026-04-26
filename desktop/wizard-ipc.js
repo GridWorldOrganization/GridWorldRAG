@@ -88,13 +88,20 @@ async function prereqCheck() {
 // Falls back to "no test, just save" if psql isn't on PATH.
 // ---------------------------------------------------------------------
 function testPgConnection(params) {
-  const { host, port, user, password, database } = params || {};
+  const { host, port, user, password } = params || {};
   return new Promise((resolve) => {
     // v1.3.2 fix B8: minimal env to the child. Forwarding the full
     // process.env leaks anything the wizard process picked up
     // (WINSERVERRAG_API_BEARER_TOKEN if set, OAuth tokens, etc.).
     // psql only needs PG* vars + SystemRoot/Path for DLL resolution
     // on Windows.
+    //
+    // v1.3.3 fix B-PG: hardcode PGDATABASE='postgres' for the connection
+    // test. The target DB (user-entered, default 'winserverrag') doesn't
+    // exist yet — db_init creates it later. The form's hint already says
+    // 'db_init 実行時に作成されます (まだ無くて OK)' but the test was
+    // still using the target DB and silently failing on every fresh
+    // install. 'postgres' is the always-existing system database.
     const env = {
       SystemRoot: process.env.SystemRoot || "C:\\Windows",
       PATH: process.env.PATH || process.env.Path || "",
@@ -105,7 +112,7 @@ function testPgConnection(params) {
       PGPORT: port || "5432",
       PGUSER: user || "postgres",
       PGPASSWORD: password || "",
-      PGDATABASE: database || "postgres",
+      PGDATABASE: "postgres",
     };
     // psql is usually at C:\Program Files\PostgreSQL\<ver>\bin\psql.exe.
     const candidates = [
@@ -118,9 +125,17 @@ function testPgConnection(params) {
     execFile(psql, ["-c", "SELECT 1"], { env, timeout: 5000, windowsHide: true },
       (err, stdout, stderr) => {
         if (err) {
+          // v1.3.3 fix: prefer psql's stderr ("FATAL: password authentication
+          // failed for user", "database X does not exist", etc) over Node's
+          // generic "Command failed" wrapper. stderr is what the operator
+          // needs to fix the problem.
+          const stderrText = String(stderr || "").trim();
+          const errorText = stderrText.length > 0
+            ? stderrText
+            : String((err && err.message) || err);
           resolve({
             ok: false,
-            error: String((err && err.message) || stderr || err).slice(0, 500),
+            error: errorText.slice(0, 500),
           });
           return;
         }
