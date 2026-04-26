@@ -46,7 +46,16 @@ $BuildCache = Join-Path $RepoRoot "build"
 $NssmDir    = Join-Path $InstallerDir "inno\assets"
 $NssmExe    = Join-Path $NssmDir "nssm.exe"
 $VenvPython = Join-Path $RepoRoot ".venv\Scripts\python.exe"
-$IsccExe    = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+
+# ISCC.exe lives in different places depending on whether the user
+# installed Inno Setup machine-wide ($Program Files) or user-mode
+# (LocalAppData via winget). Probe both.
+$IsccCandidates = @(
+    "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+    "C:\Program Files\Inno Setup 6\ISCC.exe",
+    (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe")
+)
+$IsccExe = $IsccCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 
 function Section { param($msg) Write-Host "`n=== $msg ===" -ForegroundColor Cyan }
 function Ok      { param($msg) Write-Host "  [ok] $msg" -ForegroundColor Green }
@@ -62,8 +71,14 @@ if (-not (Test-Path $VenvPython)) {
 }
 Ok "venv: $VenvPython"
 
-if (-not (Test-Path $IsccExe)) {
-    Fail "Inno Setup 6 not found at $IsccExe. Install from https://jrsoftware.org/isdl.php (default location), then re-run."
+if (-not $IsccExe) {
+    Fail @"
+Inno Setup 6 not found. Tried:
+$(($IsccCandidates | ForEach-Object { "  - $_" }) -join "`n")
+
+Install from https://jrsoftware.org/isdl.php, or:
+    winget install --id JRSoftware.InnoSetup --silent
+"@
 }
 Ok "Inno Setup: $IsccExe"
 
@@ -93,15 +108,39 @@ Section "NSSM"
 
 if (-not (Test-Path $NssmExe)) {
     New-Item -ItemType Directory -Force -Path $NssmDir | Out-Null
-    $NssmZip = Join-Path $NssmDir "nssm.zip"
-    Write-Host "  downloading nssm 2.24..."
-    Invoke-WebRequest -Uri "https://nssm.cc/release/nssm-2.24.zip" -OutFile $NssmZip
-    Expand-Archive -Path $NssmZip -DestinationPath $NssmDir -Force
-    Copy-Item -Path (Join-Path $NssmDir "nssm-2.24\win64\nssm.exe") -Destination $NssmExe -Force
-    Remove-Item -Recurse -Force (Join-Path $NssmDir "nssm-2.24")
-    Remove-Item -Force $NssmZip
+
+    # Source 1: winget cache (preferred — nssm.cc has been flaky).
+    $WingetCache = Get-ChildItem -ErrorAction SilentlyContinue -Recurse `
+        -Path (Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Packages") `
+        -Filter "nssm.exe" |
+        Where-Object { $_.FullName -match "win64" } |
+        Select-Object -First 1
+
+    if ($WingetCache) {
+        Write-Host "  using NSSM from winget cache: $($WingetCache.FullName)"
+        Copy-Item -Path $WingetCache.FullName -Destination $NssmExe -Force
+    } else {
+        # Source 2: try nssm.cc download. Falls through to a clear error if
+        # the site is down (it occasionally returns 503).
+        Write-Host "  no winget NSSM found — falling back to https://nssm.cc/release/..."
+        $NssmZip = Join-Path $NssmDir "nssm.zip"
+        try {
+            Invoke-WebRequest -Uri "https://nssm.cc/release/nssm-2.24.zip" -OutFile $NssmZip -ErrorAction Stop
+        } catch {
+            Fail @"
+NSSM download failed: $_
+
+Install via winget instead and re-run:
+    winget install --id NSSM.NSSM --silent
+"@
+        }
+        Expand-Archive -Path $NssmZip -DestinationPath $NssmDir -Force
+        Copy-Item -Path (Join-Path $NssmDir "nssm-2.24\win64\nssm.exe") -Destination $NssmExe -Force
+        Remove-Item -Recurse -Force (Join-Path $NssmDir "nssm-2.24")
+        Remove-Item -Force $NssmZip
+    }
 }
-Ok "nssm.exe present"
+Ok "nssm.exe present ($([math]::Round((Get-Item $NssmExe).Length / 1KB)) KB)"
 
 # ----------------------------------------------------------------------
 # Step 3 — PyInstaller (4 specs)

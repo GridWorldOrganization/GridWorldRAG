@@ -19,8 +19,14 @@ from pathlib import Path
 # `__file__` is not defined when PyInstaller exec's a spec, but the
 # specs all live next to this module, so resolving via SPECPATH works.
 # Caller passes SPECPATH; we derive PROJECT_ROOT from there.
+#
+# PyInstaller sets SPECPATH to the *directory* containing the spec, not
+# the spec file path itself. So 2 .parent hops bring us to the repo root:
+#   SPECPATH = .../WinServerRAG/installer/pyinstaller
+#   .parent  = .../WinServerRAG/installer
+#   .parent  = .../WinServerRAG          ← project root
 def project_root_from_specpath(specpath: str) -> str:
-    return str(Path(specpath).resolve().parent.parent.parent)
+    return str(Path(specpath).resolve().parent.parent)
 
 
 # Hidden imports — modules PyInstaller's static analyser misses because
