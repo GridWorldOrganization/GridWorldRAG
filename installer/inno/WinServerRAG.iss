@@ -25,7 +25,13 @@
 ; warning on first run is acceptable.
 
 #define AppName        "WinServerRAG"
-#define AppVersion     "1.2.0"
+; AppVersion can be overridden from the command line via
+;   ISCC.exe /DAppVersion=1.3.0 ...
+; That's how build.ps1 + the GitHub Actions workflow pass the version.
+; The hardcoded value here is the fallback when no -D is provided.
+#ifndef AppVersion
+  #define AppVersion   "1.3.0"
+#endif
 #define AppPublisher   "GridJapan"
 #define AppURL         "https://github.com/GridWorldOrganization/GridWorldRAG"
 #define AppExeMini     "WinServerRAG Mini.exe"
