@@ -108,6 +108,8 @@
     .row .v.accent { color: var(--accent); }
     .row .v.err    { color: var(--err); }
     .row .v.ok     { color: var(--ok); }
+    .row .v.warn   { color: var(--warn); }
+    .row .v.muted  { color: var(--muted); }
     .workers-mini { font-size: 11px; color: var(--muted); max-height: 60px; overflow-y: auto; }
     .workers-mini .w { display: inline-block; margin-right: 6px; padding: 1px 6px;
       background: #14243d; color: var(--accent); border-radius: 8px; }
@@ -175,6 +177,14 @@
       </div>
     </div>
     <div class="rows">
+      <!-- High-priority operator-facing status — at the very top so it's the
+           first thing the eye lands on after the header. "サービス" tells
+           the operator whether the daemon is the NSSM-registered Windows
+           service (production deploy) or a manually-launched venv process
+           (dev mode); "ビルド" tells them whether RAG indexing is live,
+           paused on purpose, or just idle (no work to do). -->
+      <div class="row"><span class="k">サービス</span><span class="v" id="service-status">-</span></div>
+      <div class="row"><span class="k">ビルド</span><span class="v" id="build-status">-</span></div>
       <div class="row"><span class="k">PG / Drive</span><span class="v" id="conns">- / -</span></div>
       <div class="row"><span class="k">FDs enabled</span><span class="v" id="fds">-/-</span></div>
       <div class="row"><span class="k">Files</span><span class="v accent" id="files">-</span></div>

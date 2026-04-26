@@ -269,6 +269,51 @@ async function tick() {
     }
 
     // --- rows
+    // Service registration row — most important operator-facing status.
+    // Tells the operator at a glance whether the running daemon is the
+    // production NSSM-registered Windows service or an ad-hoc venv-
+    // launched dev process. /api/stats.service_managed_by ∈
+    // {"nssm","partial","manual"} based on `sc query` results for
+    // WinServerRAG-API and WinServerRAG-Daemon.
+    const svcEl = $("service-status");
+    const managed = s.service_managed_by;
+    if (managed === "nssm") {
+      svcEl.textContent = "● 登録済 (NSSM)";
+      svcEl.className = "v ok";
+    } else if (managed === "partial") {
+      // Exactly one service registered — usually means a half-uninstall
+      // or a manual NSSM tweak. Worth flagging so the operator notices.
+      svcEl.textContent = "▲ 一部登録 (要確認)";
+      svcEl.className = "v warn";
+    } else {
+      // "manual" or undefined — venv-launched dev mode is normal here.
+      svcEl.textContent = "○ 未登録 (手動起動)";
+      svcEl.className = "v muted";
+    }
+
+    // Build status row — explicit text label for indexing state. Mirrors
+    // the indicator color logic but spells it out so a glance at the row
+    // alone tells you "実行中" / "停止中" / "アイドル" without having to
+    // decode an indicator dot. Priority matches setIndicator() above:
+    //   error/dead daemon → 障害
+    //   paused=true       → 停止中（手動停止）
+    //   activeWorkers > 0 → 実行中 (N workers)
+    //   else              → アイドル
+    const buildEl = $("build-status");
+    if (daemonLooksDead || anyErr) {
+      buildEl.textContent = "✕ 障害 (詳細はログ)";
+      buildEl.className = "v err";
+    } else if (s.paused) {
+      buildEl.textContent = "⏸ 停止中（手動停止）";
+      buildEl.className = "v muted";
+    } else if (activeWorkers.length > 0) {
+      buildEl.textContent = `⚙ 実行中 (${activeWorkers.length} workers)`;
+      buildEl.className = "v ok";
+    } else {
+      buildEl.textContent = "💤 アイドル";
+      buildEl.className = "v";
+    }
+
     const pgVal = s.pg_ok ? "PG" : "PG ×";
     const drvVal = s.drive_ok ? "Drive" : "Drive ×";
     const connsEl = $("conns");
@@ -411,6 +456,14 @@ function showErr() {
   $("files").textContent = "-";
   $("chunks").textContent = "-";
   $("dbsize").textContent = "-";
+  // Service / build status: API down means we can't tell either, so
+  // surface that honestly rather than freezing the last known good value.
+  const svcEl = $("service-status");
+  svcEl.textContent = "? (API 不通)";
+  svcEl.className = "v err";
+  const buildEl = $("build-status");
+  buildEl.textContent = "? (API 不通)";
+  buildEl.className = "v err";
   lastFilesDoneSum = 0;
 }
 
