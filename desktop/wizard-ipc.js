@@ -200,7 +200,17 @@ function copyCredentials(srcPath) {
       const dst = path.join(_ctx.configCheck.configDir(), "credentials.json");
       fs.mkdirSync(path.dirname(dst), { recursive: true });
       fs.copyFileSync(srcPath, dst);
-      resolve({ ok: true, dest: dst });
+      // v1.3.3: also surface the parsed client_id / client_secret so the
+      // renderer can auto-fill the OAuth form fields. Saves the operator
+      // from copy-pasting the same values from credentials.json into the
+      // form (and prevents copy-paste mismatches that bite later when
+      // the daemon tries to do OAuth).
+      resolve({
+        ok: true,
+        dest: dst,
+        clientId: root.client_id,
+        clientSecret: typeof root.client_secret === "string" ? root.client_secret : "",
+      });
     } catch (err) {
       resolve({ ok: false, error: String(err) });
     }

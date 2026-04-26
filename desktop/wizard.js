@@ -239,9 +239,11 @@ const steps = [
           <input type="password" id="g-csec" value="${v.GOOGLE_OAUTH_CLIENT_SECRET}" />
         </div>
         <div class="msg warn">
-          credentials.json (Google Cloud Console からダウンロードした OAuth client) を持っている場合は、
-          下のボタンで選択 → config dir に自動コピーします。<br/>
-          コピー後、config dir = <code>%ProgramData%\\WinServerRAG\\config\\</code> の <code>credentials.json</code> として保存されます。
+          推奨: <strong>credentials.json を先に選択</strong>すると Client ID / Secret は<strong>自動入力</strong>されます。<br/>
+          credentials.json は Google Cloud Console からダウンロードした OAuth client ファイル (installed app)。<br/>
+          コピー先: <code>%ProgramData%\\WinServerRAG\\config\\credentials.json</code><br/>
+          OAuth の本物の動作テスト (token.pickle 作成) はこのウィザードでは行いません。Step 8 で API サービスが初回起動した時に、ブラウザが開いて Google 認証画面に進みます。<br/>
+          このステップでは: ① credentials.json を選択 ② Google アカウント (Drive オーナーのメール) を入力 ③ 次へ。
         </div>
         <button id="pick-cred" class="btn test">credentials.json を選択...</button>
         <div id="cred-result">${STATE.credentialsCopiedTo ? `<div class="msg ok">✅ コピー済: ${escapeHtml(STATE.credentialsCopiedTo)}</div>` : ""}</div>
@@ -253,8 +255,28 @@ const steps = [
         const r = await W.copyCredentials(pick.path);
         if (r.ok) {
           STATE.credentialsCopiedTo = r.dest;
-          $("cred-result").innerHTML = `<div class="msg ok">✅ コピー済: ${escapeHtml(r.dest)}</div>`;
-          setStatus("credentials.json コピー完了", "ok");
+          // v1.3.3: auto-fill client_id / secret from the picked file so
+          // the operator doesn't have to copy-paste the same values into
+          // the form. STATE update happens via the input fields' .value =
+          // assignment so the next snapshotCurrentStep / collectGoogle
+          // call captures them.
+          let autofilled = [];
+          if (r.clientId) {
+            $("g-cid").value = r.clientId;
+            STATE.google.GOOGLE_OAUTH_CLIENT_ID = r.clientId;
+            autofilled.push("Client ID");
+          }
+          if (r.clientSecret) {
+            $("g-csec").value = r.clientSecret;
+            STATE.google.GOOGLE_OAUTH_CLIENT_SECRET = r.clientSecret;
+            autofilled.push("Client Secret");
+          }
+          const autofillNote = autofilled.length
+            ? `<div class="msg ok">🔑 自動入力: ${autofilled.join(" / ")} (credentials.json から)</div>`
+            : "";
+          $("cred-result").innerHTML =
+            `<div class="msg ok">✅ コピー済: ${escapeHtml(r.dest)}</div>` + autofillNote;
+          setStatus("credentials.json コピー完了 + 自動入力", "ok");
         } else {
           $("cred-result").innerHTML = `<div class="msg err">❌ コピー失敗: ${escapeHtml(r.error)}</div>`;
           setStatus("コピー失敗", "err");
