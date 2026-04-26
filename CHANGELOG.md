@@ -4,6 +4,75 @@ All notable changes to GridWorldRAG (Windows canonical). Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.2.0] — 2026-04-26
+
+**Theme: 4 .exe + Inno Setup インストーラー (.bat → exe 移行)**
+
+これまで `scripts/*.bat` で起動していた本機能を **PyInstaller で .exe 化** し、
+**Inno Setup インストーラー** にまとめました。新規 PC への展開がワンクリックに。
+
+### Added — exe pipeline
+- `winserverrag-api.exe` (`src.control_api` の PyInstaller --onedir bundle)
+- `winserverrag-daemon.exe` (`src.rag_daemon`、OMP/MKL 1 thread runtime hook 内蔵)
+- `winserverrag-dbinit.exe` (`src.db_init`)
+- `winserverrag-backup.exe` (新規 `src.db_backup` — `backup.bat` を Python に
+  port、pg_dump シェルアウト + 7/4 世代ローテーション)
+- ランタイムフック: UTF-8 強制 (`rt_utf8.py`) + OpenMP/MKL=1 (`rt_omp_threads.py`、
+  daemon のみ)
+- 共通 PyInstaller helper: `installer/pyinstaller/_common.py` で hidden imports /
+  data files / excludes をシェア (sentence-transformers / fastapi / pgvector
+  などの動的 import を補足)
+
+### Added — Inno Setup installer (`installer/inno/WinServerRAG.iss`)
+- `dist\WinServerRAG-Setup-1.2.0.exe` (~600MB) を出力
+- `%ProgramFiles%\WinServerRAG\bin\` に 4 つの exe + `nssm.exe`
+- `%ProgramFiles%\WinServerRAG\mini\` に Electron ミニモニタ
+- `%ProgramData%\WinServerRAG\{config,logs,backups\daily,backups\weekly}\` 作成
+  (権限: users read-exec、admins modify、logs/backups は users modify)
+- NSSM 経由で Windows サービス 2 本登録 + auto-start:
+  - `WinServerRAG-API`
+  - `WinServerRAG-Daemon` (`DependOnService = WinServerRAG-API`)
+  - 両方とも 10MB ローテーションログ
+- スタートメニューショートカット (Mini Monitor、Web Console)
+- アンインストーラーがサービス stop + remove を自動実行
+- Pre-install チェック: PostgreSQL 17 サービス検出、不在時は警告 (中止可)
+
+### Added — build pipeline (`installer/build.ps1`)
+- 一発ビルド: PyInstaller × 4 → electron-builder → Inno Setup compile
+- NSSM (2.24) 自動ダウンロード + キャッシュ
+- スイッチ: `-CleanFirst` / `-SkipPython` / `-SkipElectron` / `-Version <X>`
+- ビルド時間: cold ~7-10 分 (Akasaka PC)
+
+### Changed
+- `desktop/package.json`: `electron-builder` 25 を devDeps に追加、`pack` /
+  `dist` スクリプト追加、`build` セクション (appId / productName / target=dir)
+- `scripts/install_service.md`: インストーラー経由の手順を主推奨、手動 NSSM
+  登録は dev / カスタマイズ用に残置
+
+### Notes
+- **CPU torch のみ bundle** (CUDA は ~3GB で配布対象「~500MB-1GB」に収まらない)。
+  GPU 環境では post-install で `pip install torch==2.6.0 --index-url
+  https://download.pytorch.org/whl/cu124` (READMEに記載)。Akasaka PC は
+  既存 venv のまま (インストーラー経由デプロイは未実施)
+- **コード署名なし** (内部運用のため)。Smart Screen 警告は許容
+- **AWS bridge** (`src.aws_bridge`) は v1.2 インストーラー未登録。リモート
+  Cowork 接続が必要な場合は手動 NSSM 登録 (install_service.md 参照)。
+  v1.3+ で自動登録予定
+- **PG / pgvector / NVIDIA driver は prereq**。インストーラーが pre-install
+  で検出のみ
+
+### Removed
+- `scripts/run_api.bat` / `run_daemon.bat` / `run_mini.bat` / `backup.bat` /
+  `db_init.bat` の 5 個 bat ファイル。dev 環境は `python -m src.X` (venv 経由)
+  か `npm start` を直接呼ぶ。本番は exe 経由
+
+### Build prereqs (ビルドマシン側)
+- Python 3.12 + venv + PyInstaller (`pip install pyinstaller`)
+- Node.js 20+ (electron-builder)
+- Inno Setup 6 (<https://jrsoftware.org/isdl.php>)
+
+詳細: [installer/README.md](./installer/README.md)
+
 ## [v1.1.0] — 2026-04-26
 
 **Theme: pause/resume daemon control + mini-monitor toggle button**

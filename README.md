@@ -66,7 +66,7 @@ like this built for your business, reach out: **tobisako@gridworld.co**.
 - **Electron ミニモニター** (always-on-top、500ms 更新)
 - **MCP サーバー** (Streamable HTTP + Basic Auth、クエリログ付き) → [MCP 接続ガイドはこちら](./MCP.md)
 - **Eval Suite** (`tests/eval/`) — 品質の定量モニター
-- **自動バックアップ** (`scripts/backup.bat`) — 日次 7 + 週次 4 世代
+- **バックアップ** (`winserverrag-backup.exe`) — 日次 7 + 週次 4 世代
 
 ## アーキテクチャ
 
@@ -85,17 +85,33 @@ like this built for your business, reach out: **tobisako@gridworld.co**.
 
 ## クイックスタート
 
-1. Python 3.12+ と PostgreSQL 17 + pgvector を用意 (Windows ネイティブ)
+### 推奨: インストーラー (本番デプロイ向け、v1.2.0+)
+
+1. PostgreSQL 17 + pgvector を Windows ネイティブで用意
+2. [Releases](https://github.com/GridWorldOrganization/GridWorldRAG/releases) から
+   `WinServerRAG-Setup-1.2.0.exe` をダウンロードして管理者で実行
+3. `%ProgramData%\WinServerRAG\config\config.v2.env.example` を `config.v2.env` に
+   コピーして編集 (DB 接続情報、OAuth credentials)
+4. DB 初期化: `& "C:\Program Files\WinServerRAG\bin\winserverrag-dbinit\winserverrag-dbinit.exe"`
+5. サービス起動: `Start-Service WinServerRAG-API, WinServerRAG-Daemon`
+   (auto-start なので次回ブート以降は自動)
+6. ブラウザで `http://127.0.0.1:17600/` → 管理画面
+7. ミニモニタ: スタートメニューの「WinServerRAG Mini Monitor」
+8. MCP 公開: [MCP.md](./MCP.md) 参照
+9. バックアップ: `winserverrag-backup.exe` を手動実行 (Task Scheduler 禁止)
+
+### 開発向け (リポジトリから直接)
+
+1. Python 3.12+ と PostgreSQL 17 + pgvector を用意
 2. `python -m venv .venv && .venv\Scripts\activate`
 3. `pip install -r requirements.txt`
 4. `config\config.v2.env.example` を `config\config.v2.env` にコピーして編集
 5. DB 初期化: `python -m src.db_init`
-6. API 起動: `scripts\run_api.bat`
-7. デーモン起動 (別ターミナル): `scripts\run_daemon.bat`
+6. API 起動 (Terminal 1): `python -m src.control_api`
+7. デーモン起動 (Terminal 2): `python -m src.rag_daemon`
 8. ブラウザで `http://127.0.0.1:17600/` → 管理画面
-9. Electron ミニモニター: `scripts\run_mini.bat`
-10. MCP 公開: [MCP.md](./MCP.md) 参照
-11. バックアップは手動で `scripts\backup.bat` を実行（自動化は `scripts\install_service.md` 参照、Task Scheduler は使用禁止）
+9. ミニモニタ: `cd desktop && npm start`
+10. インストーラービルド: `pwsh installer\build.ps1` → `dist\WinServerRAG-Setup-*.exe`
 
 ## 廃案（設計書にあるが採用しない）
 
