@@ -91,37 +91,132 @@ function setIndicator(kind) {
 let _pausedState = null;
 let _pauseInflight = false;
 
+// --- Daemon state cache (v1.3) ----------------------------------------
+// Populated by a separate 5s polling loop that calls window.winsrv.daemonStatus()
+// (Electron main → sc query). Kept independent from /api/stats so that
+// "API down + Daemon up" is still visible. Shape mirrors service-control.js:
+//   { kind, code, devMode: { isDev, venvPython?, repoRoot? } }
+let _daemonState = null;
+// Tri-state: null = first poll hasn't completed, "..." = inflight start,
+// "ok" = idle, "err" = last start failed (sticky until next poll succeeds).
+let _daemonStartFlight = null;
+
 function setPauseUI(paused) {
   const btn = $("pause-btn");
   if (!btn) return;
-  if (paused) {
-    btn.textContent = "▶";
-    btn.title = "サービスを再開する";
-    btn.classList.add("paused");
-  } else {
-    btn.textContent = "⏸";
-    btn.title = "サービスを一時停止する (新規タスク取得を止める。進行中タスクは完走)";
-    btn.classList.remove("paused");
+  // The button label depends on a 2D state: (daemon SCM state, API paused).
+  // Most states are handled here based on the daemon kind we last saw.
+  // The API-derived `paused` flag is only meaningful when the daemon
+  // is actually running.
+  const d = _daemonState && _daemonState.kind;
+  if (d === "running" || d === "paused") {
+    if (paused) {
+      btn.textContent = "▶";
+      btn.title = "サービスを再開する";
+      btn.classList.add("paused");
+    } else {
+      btn.textContent = "⏸";
+      btn.title = "サービスを一時停止する (新規タスク取得を止める。進行中タスクは完走)";
+      btn.classList.remove("paused");
+    }
+    btn.disabled = _pauseInflight;
+    return;
   }
-  btn.disabled = _pauseInflight;
+  if (d === "stopped") {
+    btn.textContent = "▶";
+    btn.title = "Daemon サービスを起動する (UAC 不要)";
+    btn.classList.add("paused");
+    btn.disabled = !!_daemonStartFlight;
+    return;
+  }
+  if (d === "start_pending" || d === "stop_pending" ||
+      d === "continue_pending" || d === "pause_pending") {
+    btn.textContent = "⏳";
+    btn.title = "サービス遷移中...";
+    btn.disabled = true;
+    return;
+  }
+  if (d === "not_installed") {
+    const isDev = _daemonState.devMode && _daemonState.devMode.isDev;
+    btn.textContent = isDev ? "💻" : "⊘";
+    btn.title = isDev ? "dev mode 検出 — クリックで起動方法を表示"
+                      : "Daemon が未インストール — クリックでインストーラー案内";
+    btn.disabled = false;
+    return;
+  }
+  // unknown / null
+  btn.textContent = "?";
+  btn.title = "Daemon 状態取得中...";
+  btn.disabled = true;
 }
 
 async function togglePause() {
+  // Dispatch on daemon state — the button's meaning depends on it.
+  // Codex review made this explicit: a single "pause" handler can't
+  // safely paper over "service is stopped" vs "service is running".
+  const d = _daemonState && _daemonState.kind;
+
+  // 1) Daemon not registered. Show a help dialog instead of doing
+  //    anything system-mutating. Mini-monitor never installs.
+  if (d === "not_installed") {
+    const isDev = _daemonState.devMode && _daemonState.devMode.isDev;
+    if (isDev) showDevModeDialog(_daemonState.devMode);
+    else       showNotInstalledDialog();
+    return;
+  }
+
+  // 2) Daemon registered but stopped → start it (no UAC, SDDL relaxed).
+  if (d === "stopped") {
+    if (_daemonStartFlight) return;
+    _daemonStartFlight = "starting";
+    setPauseUI(_pausedState);
+    try {
+      const r = await window.winsrv.daemonStart();
+      if (r.kind === "started" || r.kind === "already_running") {
+        // Optimistic: surface PENDING immediately. Next pollDaemon()
+        // will pick up the real RUNNING transition (≤5s lag).
+        _daemonState = { kind: "start_pending", code: 2, devMode: _daemonState.devMode };
+        renderDaemonRow(_daemonState);
+      } else {
+        // Hard fail (access_denied / not_installed / dependency_failed
+        // / no_response / unknown_error). Show in debug overlay; the
+        // daemon row will reflect reality on the next poll.
+        DBG.lastFailReason = `daemon-start: ${r.kind} — ${r.message}`;
+        DBG.lastFailAt = new Date();
+        if (isDebugOpen()) renderDebug();
+      }
+    } catch (e) {
+      DBG.lastFailReason = `daemon-start IPC: ${e && e.message || e}`;
+      DBG.lastFailAt = new Date();
+      if (isDebugOpen()) renderDebug();
+    } finally {
+      _daemonStartFlight = null;
+      setPauseUI(_pausedState);
+    }
+    return;
+  }
+
+  // 3) PENDING — button is disabled, but defensive no-op anyway.
+  if (d === "start_pending" || d === "stop_pending" ||
+      d === "continue_pending" || d === "pause_pending") {
+    return;
+  }
+
+  // 4) Default path: daemon is RUNNING (or PAUSED, treated as running).
+  //    Standard pause/resume API call. _pausedState may still be null
+  //    on the first ever tick — bail in that case.
   if (_pauseInflight || _pausedState == null) return;
   const target = !_pausedState;
-  const path = target ? "/api/daemon/pause" : "/api/daemon/resume";
+  const apiPath = target ? "/api/daemon/pause" : "/api/daemon/resume";
   _pauseInflight = true;
-  setPauseUI(_pausedState);  // re-render with disabled=true
+  setPauseUI(_pausedState);
   try {
-    const r = await fetch(API + path, { method: "POST" });
+    const r = await fetch(API + apiPath, { method: "POST" });
     if (!r.ok) throw new Error("HTTP " + r.status);
     const state = await r.json();
     _pausedState = !!state.paused;
     setPauseUI(_pausedState);
   } catch (e) {
-    // Revert: keep the previous state on error. The next /api/stats poll
-    // will reconcile if the DB was actually updated. Surface the error
-    // in the debug overlay (Ctrl+Shift+D) so the operator can see why.
     DBG.lastFailReason = `pause-toggle: ${e && e.message || e}`;
     DBG.lastFailAt = new Date();
     if (isDebugOpen()) renderDebug();
@@ -129,6 +224,93 @@ async function togglePause() {
     _pauseInflight = false;
     setPauseUI(_pausedState);
   }
+}
+
+// --- Daemon SCM polling ------------------------------------------------
+// Independent loop, 5s cadence. Runs whether or not /api/stats responds
+// — that's the v1.3 promise to the operator.
+async function pollDaemon() {
+  try {
+    const status = await window.winsrv.daemonStatus();
+    _daemonState = status;
+    renderDaemonRow(status);
+    setPauseUI(_pausedState);
+  } catch (e) {
+    // Electron IPC genuinely shouldn't fail unless the main process is
+    // gone. Surface in debug overlay; leave _daemonState alone.
+    DBG.lastFailReason = `daemon-status IPC: ${e && e.message || e}`;
+    DBG.lastFailAt = new Date();
+    if (isDebugOpen()) renderDebug();
+  }
+}
+
+// Render the daemon row from a service-control.js result. Independent of
+// /api/stats — see comment in tick().
+function renderDaemonRow(state) {
+  const el = $("service-status");
+  if (!el) return;
+  switch (state.kind) {
+    case "running":
+    case "paused":  // treat SCM-level PAUSED same as RUNNING for UI
+      el.textContent = "● 実行中";
+      el.className = "v ok";
+      break;
+    case "stopped":
+      el.textContent = "■ 停止中 (登録済)";
+      el.className = "v muted";
+      break;
+    case "start_pending":
+      el.textContent = "⏳ 起動中...";
+      el.className = "v warn";
+      break;
+    case "stop_pending":
+      el.textContent = "⏳ 停止中...";
+      el.className = "v warn";
+      break;
+    case "continue_pending":
+    case "pause_pending":
+      el.textContent = "⏳ 遷移中...";
+      el.className = "v warn";
+      break;
+    case "not_installed":
+      if (state.devMode && state.devMode.isDev) {
+        el.textContent = "💻 dev mode (venv)";
+        el.className = "v muted";
+      } else {
+        el.textContent = "✕ 未インストール";
+        el.className = "v err";
+      }
+      break;
+    case "unknown":
+    default:
+      el.textContent = "? 状態取得失敗";
+      el.className = "v warn";
+  }
+}
+
+function showNotInstalledDialog() {
+  alert(
+    "Daemon サービスが未インストールです。\n\n" +
+    "本機能を使うには、管理者権限で\n" +
+    "  WinServerRAG-Setup-x.y.z.exe\n" +
+    "を実行してインストーラーを完了してください。\n\n" +
+    "https://github.com/GridWorldOrganization/GridWorldRAG/releases"
+  );
+}
+
+function showDevModeDialog(dev) {
+  const cmd = (dev.repoRoot || "<repo>") +
+              "\\.venv\\Scripts\\python.exe -m src.rag_daemon";
+  // Use prompt so the user can copy the command (alert doesn't allow copy
+  // in Electron without extra plumbing). Pre-fill the command as the
+  // default value; the operator presses Ctrl+C inside the prompt and
+  // dismisses with Esc.
+  prompt(
+    "dev mode 検出: NSSM サービスは未登録です。\n" +
+    "venv で Daemon を起動してください (別ターミナルで実行):\n\n" +
+    "↓ コマンド (Ctrl+C でコピー、Esc で閉じる)",
+    cmd
+  );
 }
 
 function flashTick() {
@@ -269,32 +451,15 @@ async function tick() {
     }
 
     // --- rows
-    // Service registration row — most important operator-facing status.
-    // Tells the operator at a glance whether the running daemon is the
-    // production NSSM-registered Windows service or an ad-hoc venv-
-    // launched dev process. /api/stats.service_managed_by ∈
-    // {"nssm","partial","manual"} based on `sc query` results for
-    // WinServerRAG-API and WinServerRAG-Daemon.
-    const svcEl = $("service-status");
-    const managed = s.service_managed_by;
-    if (managed === "nssm") {
-      svcEl.textContent = "● 登録済 (NSSM)";
-      svcEl.className = "v ok";
-    } else if (managed === "partial") {
-      // Exactly one service registered — usually means a half-uninstall
-      // or a manual NSSM tweak. Worth flagging so the operator notices.
-      svcEl.textContent = "▲ 一部登録 (要確認)";
-      svcEl.className = "v warn";
-    } else {
-      // "manual" or undefined — venv-launched dev mode is normal here.
-      svcEl.textContent = "○ 未登録 (手動起動)";
-      svcEl.className = "v muted";
-    }
+    // Daemon row — DAEMON-ONLY status, independent of /api/stats.
+    // Renders from _daemonState (Electron `sc query` poll, 5s). When the
+    // poll hasn't completed yet, _daemonState is null and we leave the
+    // row alone (will be filled on the next pollDaemon tick). Once we
+    // have a value, this row is authoritative and never gets cleared by
+    // showErr() — that's the v1.3 promise: "API down ≠ daemon unknown".
+    if (_daemonState !== null) renderDaemonRow(_daemonState);
 
-    // Build status row — explicit text label for indexing state. Mirrors
-    // the indicator color logic but spells it out so a glance at the row
-    // alone tells you "実行中" / "停止中" / "アイドル" without having to
-    // decode an indicator dot. Priority matches setIndicator() above:
+    // Build row — explicit text label for indexing state. /api/stats only.
     //   error/dead daemon → 障害
     //   paused=true       → 停止中（手動停止）
     //   activeWorkers > 0 → 実行中 (N workers)
@@ -456,11 +621,10 @@ function showErr() {
   $("files").textContent = "-";
   $("chunks").textContent = "-";
   $("dbsize").textContent = "-";
-  // Service / build status: API down means we can't tell either, so
-  // surface that honestly rather than freezing the last known good value.
-  const svcEl = $("service-status");
-  svcEl.textContent = "? (API 不通)";
-  svcEl.className = "v err";
+  // v1.3: Daemon row is independent of /api/stats — populated by the
+  // SCM poll (winsrv.daemonStatus). DO NOT clear it here. The whole
+  // point of v1.3 is "API down ≠ daemon unknown". Build row is API-only,
+  // so we mark it explicitly.
   const buildEl = $("build-status");
   buildEl.textContent = "? (API 不通)";
   buildEl.className = "v err";
@@ -517,4 +681,10 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   tick();
   setInterval(tick, 250);
+
+  // v1.3: separate Daemon SCM polling loop, 5s cadence. Independent of
+  // /api/stats. First poll immediate so the daemon row populates as
+  // soon as possible; subsequent polls every 5s.
+  pollDaemon();
+  setInterval(pollDaemon, 5000);
 });

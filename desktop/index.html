@@ -183,7 +183,11 @@
            service (production deploy) or a manually-launched venv process
            (dev mode); "ビルド" tells them whether RAG indexing is live,
            paused on purpose, or just idle (no work to do). -->
-      <div class="row"><span class="k">サービス</span><span class="v" id="service-status">-</span></div>
+      <!-- v1.3: this row is now Daemon-only (was service registration via API
+           in PR #28). Renderer pulls from Electron `sc query` directly so the
+           value is honest even when the API is down. id stays the same to
+           keep the renderer code change minimal. -->
+      <div class="row"><span class="k">Daemon</span><span class="v" id="service-status">-</span></div>
       <div class="row"><span class="k">ビルド</span><span class="v" id="build-status">-</span></div>
       <div class="row"><span class="k">PG / Drive</span><span class="v" id="conns">- / -</span></div>
       <div class="row"><span class="k">FDs enabled</span><span class="v" id="fds">-/-</span></div>

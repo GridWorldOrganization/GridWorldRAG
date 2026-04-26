@@ -4,8 +4,17 @@
 
 const { app, BrowserWindow, shell, ipcMain, Menu } = require("electron");
 const path = require("path");
+const sc = require("./service-control.js");
 
 const API_URL = process.env.WINSERVERRAG_API_URL || "http://127.0.0.1:17600";
+
+// Service names — hardcoded on purpose. The installer registers exactly
+// these (see installer/install-services.ps1). v1.3 doesn't need a
+// manifest file because `sc query <name>` and `sc start <name>` only
+// take a name, not a path. Codex review flagged path-resolution as
+// overbuilt; we deferred it.
+const DAEMON_SERVICE = "WinServerRAG-Daemon";
+const API_SERVICE    = "WinServerRAG-API";
 
 let win;
 
@@ -74,4 +83,35 @@ ipcMain.handle("get-always-on-top", () => {
 });
 ipcMain.on("set-always-on-top", (_evt, on) => {
   if (win) win.setAlwaysOnTop(!!on);
+});
+
+// IPC: daemon status — the renderer polls this every 5s. Returns the
+// numeric-parsed SCM state for WinServerRAG-Daemon. Independent of the
+// FastAPI lifecycle (the whole point of v1.3).
+//
+// Shape: { kind: "running" | "stopped" | ... | "not_installed" | "unknown",
+//          code: <numeric>, devMode: { isDev: bool, ...} }
+ipcMain.handle("daemon-status", async () => {
+  const status = await sc.queryService(DAEMON_SERVICE);
+  // Augment with dev-mode detection so the renderer can decide between
+  // "✕ 未インストール" (production deploy missing the installer) vs
+  // "💻 dev mode (venv で起動してください)" (developer running from repo).
+  const dev = sc.detectDevMode(__dirname);
+  return { ...status, devMode: dev };
+});
+
+// IPC: start the daemon. Triggered by the renderer's ▶ button when the
+// service is in STOPPED state. Works without UAC because the installer
+// (installer/install-services.ps1) granted SERVICE_START to the
+// WinServerRAG Operators local group at install time.
+//
+// Returns the classified exit:
+//   { kind: "started" | "already_running" | "access_denied" | "not_installed"
+//          | "dependency_failed" | "no_response" | "unknown_error",
+//     message: <user-facing string>, code: <numeric> }
+//
+// The renderer should poll daemon-status afterwards to observe the
+// START_PENDING → RUNNING transition (no need to block here).
+ipcMain.handle("daemon-start", async () => {
+  return sc.startService(DAEMON_SERVICE);
 });
