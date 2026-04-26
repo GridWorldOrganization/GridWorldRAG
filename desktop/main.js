@@ -70,10 +70,25 @@ function detectMode() {
 
 const MODE = detectMode();
 
-// Single-instance lock: prevent two Mini Monitors. Wizard is allowed
-// to coexist with Mini (different UI). The lock key includes the mode.
-const lockKey = `winserverrag-${MODE}`;
-const gotLock = app.requestSingleInstanceLock({ key: lockKey });
+// v1.3.2 fix B1: split userData by mode so Mini and Wizard don't share
+// the single-instance lock.
+//
+// Why: requestSingleInstanceLock(additionalData?) — the argument is NOT
+// a lock key, it's data passed to the second-instance event handler.
+// The actual lock is per-app, derived from app.name × userData dir.
+// Mini.exe and Setup.exe (a renamed copy of Mini.exe) share both, so
+// they share the lock. Result: clicking the Mini Monitor's "Setup
+// Wizard を起動" CTA spawns Setup.exe, which fails the lock check
+// while Mini holds it, and silently quits. Wizard never opens.
+//
+// Fix: change userData per mode BEFORE requestSingleInstanceLock. Each
+// mode now has its own SingletonLock file, so they coexist.
+if (MODE === "wizard") {
+  const wizardData = path.join(app.getPath("appData"), "WinServerRAG-Wizard");
+  app.setPath("userData", wizardData);
+}
+
+const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   console.log(`[main] another ${MODE} instance is already running, exiting.`);
   app.quit();
@@ -121,7 +136,8 @@ function createMiniWindow() {
       dialog.showErrorBox(
         "WinServerRAG Mini — Renderer crashed",
         `Reason: ${details.reason}\nExit code: ${details.exitCode}\n\n` +
-        "The mini-monitor will exit. Re-launch from the Start Menu."
+        "The mini-monitor will exit. Re-launch from the Start Menu shortcut\n" +
+        '"WinServerRAG Mini Monitor".'
       );
     } catch {}
     app.exit(3);
