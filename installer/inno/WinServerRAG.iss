@@ -318,39 +318,21 @@ end;
 //
 // CurStepChanged(ssPostInstall) fires AFTER all [Run] entries complete
 // and BEFORE the Finish wizard page. We check for the FAILED.txt
-// sentinel; if present + recent (<10 min old), show a clear error
-// dialog with the log path. The install still completes (files are
-// already on disk), but the user knows they need to investigate, and
-// /api/stats's "service registered" probe will reflect reality.
-
-function FileAgeMinutes(const Path: String): Integer;
-var
-  Modified: Double;
-  NowTs: Double;
-  Stamp: Longint;
-begin
-  // Inno Setup's Pascal Script does NOT expose TDateTime as a declarable
-  // variable type even though `Now` and `FileDateToDateTime` return one.
-  // TDateTime is a Double where integer part = days; declare as Double
-  // to make the parser happy. v1.3.2 first build failed with
-  // "Unknown type 'TDateTime'" at compile time.
-  Result := -1;
-  if not FileExists(Path) then Exit;
-  Stamp := FileAge(Path);
-  if Stamp = -1 then Exit;
-  try
-    Modified := FileDateToDateTime(Stamp);
-    NowTs := Now;
-    Result := Round((NowTs - Modified) * 1440); // days → minutes (24*60)
-  except
-    Result := -1;
-  end;
-end;
+// sentinel; if present, show a clear error dialog. The install still
+// completes (files are on disk), but the user knows services aren't
+// registered and where to look.
+//
+// Staleness: install-services.ps1 deletes FAILED.txt at the start of
+// every successful install (see step 1.6). So presence of the file
+// here means *this* install failed, not a prior one. Earlier drafts
+// of this hook compared file age via FileAge() / FileDateToDateTime()
+// but Inno Setup's Pascal Script does not expose those — first build
+// died with "Unknown identifier 'FileAge'". The "delete on success"
+// approach is simpler and equally robust.
 
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   FailPath, LogDir, AppRoot, DataRoot, ManualCmd: String;
-  AgeMin: Integer;
 begin
   if CurStep <> ssPostInstall then Exit;
 
@@ -360,11 +342,6 @@ begin
   FailPath := LogDir + '\install-services-FAILED.txt';
 
   if not FileExists(FailPath) then Exit;
-
-  // Stale sentinel from a prior install? Ignore anything older than 10
-  // minutes — current install would have been quicker than that.
-  AgeMin := FileAgeMinutes(FailPath);
-  if (AgeMin < 0) or (AgeMin > 10) then Exit;
 
   ManualCmd :=
     'powershell -ExecutionPolicy Bypass -File "' +

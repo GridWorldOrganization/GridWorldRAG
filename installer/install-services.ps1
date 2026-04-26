@@ -181,6 +181,18 @@ foreach ($p in @($NssmExe, $ApiExe, $DaemonExe)) {
     }
 }
 
+# 1.1 v1.3.2: clear any stale FAILED.txt sentinel from a prior install.
+# Inno Setup's CurStepChanged hook checks for this file's presence (NOT
+# its age — Inno Pascal Script doesn't expose FileAge). Removing it
+# here means: if the catch block at the bottom doesn't fire, no
+# sentinel = success path. Catch-block writes a fresh FAILED.txt with
+# the actual error if anything throws below.
+$staleFail = Join-Path $LogDir "install-services-FAILED.txt"
+if (Test-Path $staleFail) {
+    Log "Clearing stale FAILED.txt from prior install: $staleFail"
+    Remove-Item -Force -ErrorAction SilentlyContinue $staleFail
+}
+
 # 1.5 v1.3.2: upgrade-clean re-register.
 #
 # If we're running on top of an older WinServerRAG, the services already
