@@ -73,6 +73,30 @@ $DaemonExe = Join-Path $InstallRoot "bin\winserverrag-daemon\winserverrag-daemon
 $ConfigDir = Join-Path $DataRoot "config"
 $LogDir    = Join-Path $DataRoot "logs"
 
+# ---------------------------------------------------------------------
+# Transcript log — silent failures during Inno Setup [Run] are the
+# operator's number-one diagnostic problem. Capture every line of
+# stdout/stderr to disk so a post-mortem is one `notepad` away.
+#
+# Why we set this up before any other code: Start-Transcript itself can
+# fail if $LogDir doesn't exist yet (this is a fresh install path), so
+# we mkdir-best-effort first, then start the transcript. If even that
+# fails (e.g. ProgramData ACL surprise), we fall through and rely on
+# stderr — the hard error is still propagated to Inno Setup.
+# ---------------------------------------------------------------------
+try {
+    if (-not (Test-Path $LogDir)) {
+        New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+    }
+    $logStamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $mode = if ($Uninstall) { "uninstall" } else { "install" }
+    $TranscriptPath = Join-Path $LogDir "install-services-$mode-$logStamp.log"
+    Start-Transcript -Path $TranscriptPath -Force | Out-Null
+    Write-Host "[install-services] transcript: $TranscriptPath"
+} catch {
+    Write-Warning "Could not start transcript: $_"
+}
+
 
 # ---------------------------------------------------------------------
 # Helpers
@@ -99,6 +123,17 @@ function Stop-IfRunning($name) {
 
 
 # ---------------------------------------------------------------------
+# Main work — wrapped in try/catch so the slightest failure produces a
+# diagnosable on-disk sentinel (`install-services-FAILED.txt`) and a
+# non-zero exit code Inno Setup can react to. v1.3.0 had this whole
+# block silently swallow `throw` because Inno Setup [Run] was passing
+# everything through cmd.exe with $ErrorActionPreference="Stop" — the
+# exit code reached cmd, not Inno Setup. Direct powershell.exe + this
+# wrapper gives us both halves of the safety net.
+# ---------------------------------------------------------------------
+try {
+
+# ---------------------------------------------------------------------
 # Uninstall path
 # ---------------------------------------------------------------------
 if ($Uninstall) {
@@ -118,6 +153,7 @@ if ($Uninstall) {
         & net.exe localgroup $OperatorGroup /delete 2>&1 | Out-Null
     }
     Log "Uninstall complete."
+    try { Stop-Transcript | Out-Null } catch {}
     exit 0
 }
 
@@ -239,4 +275,27 @@ foreach ($svc in @($ServiceApi, $ServiceDaemon)) {
 Log "Install complete. Services registered with auto-start."
 Log "Operator group '$OperatorGroup' has SERVICE_START + SERVICE_QUERY_STATUS only (no SERVICE_STOP)."
 Log "Members: $((& net.exe localgroup $OperatorGroup) -join ', ')"
+
+}
+catch {
+    # Fatal — surface the error to disk so the operator can find it
+    # without re-running with /LOG=. The sentinel filename is fixed so
+    # the mini-monitor or a future "Repair" button can detect it.
+    $err = $_
+    Write-Host "FATAL: $err"
+    Write-Host $err.ScriptStackTrace
+    try {
+        $errPath = Join-Path $LogDir "install-services-FAILED.txt"
+        $stamp = Get-Date -Format "s"
+        "[$stamp] mode=$mode error=$err`r`n$($err.ScriptStackTrace)" |
+            Out-File -FilePath $errPath -Append -Encoding utf8
+    } catch {
+        # Even the error log failed — print to stderr at least.
+        [Console]::Error.WriteLine("FATAL (could not write error log): $err")
+    }
+    try { Stop-Transcript | Out-Null } catch {}
+    exit 1
+}
+
+try { Stop-Transcript | Out-Null } catch {}
 exit 0

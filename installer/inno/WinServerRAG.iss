@@ -121,10 +121,16 @@ Name: "{userdesktop}\{#AppName} Mini";   Filename: "{app}\mini\{#AppExeMini}"; T
 ; UAC. Single source of truth for service registration — re-runnable
 ; from a future "repair" path.
 ;
+; v1.3.1: invoke powershell.exe DIRECTLY (no cmd /C indirection).
+; v1.3.0 used `Filename: "{cmd}"; Parameters: "/C powershell.exe ..."`
+; which double-parsed the quoting and silently dropped the script
+; arguments on some hosts. Direct invocation is simpler and visibly
+; correct in services.msc + Inno Setup install logs.
+;
 ; -ExecutionPolicy Bypass: signed scripts not in scope; script ships
 ; alongside nssm.exe under {app}\bin which is admin-only writable.
-Filename: "{cmd}"; \
-  Parameters: "/C powershell.exe -NoProfile -ExecutionPolicy Bypass -File ""{app}\bin\install-services.ps1"" -InstallRoot ""{app}"" -DataRoot ""{commonappdata}\{#AppName}"" -OperatorUser ""{username}"""; \
+Filename: "powershell.exe"; \
+  Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\bin\install-services.ps1"" -InstallRoot ""{app}"" -DataRoot ""{commonappdata}\{#AppName}"" -OperatorUser ""{username}"""; \
   Flags: runhidden; StatusMsg: "Registering services + relaxing service ACL..."
 
 ; -- DB init (manual / not registered as a service) --
@@ -142,8 +148,9 @@ Filename: "{app}\mini\{#AppExeMini}"; \
 ; v1.3: delegate to install-services.ps1 -Uninstall, which stops both
 ; services, removes them, and deletes the local Operators group.
 ; Single source of truth, mirrors the [Run] block above.
-Filename: "{cmd}"; \
-  Parameters: "/C powershell.exe -NoProfile -ExecutionPolicy Bypass -File ""{app}\bin\install-services.ps1"" -InstallRoot ""{app}"" -DataRoot ""{commonappdata}\{#AppName}"" -Uninstall"; \
+; v1.3.1: same direct-powershell.exe fix as the [Run] block.
+Filename: "powershell.exe"; \
+  Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\bin\install-services.ps1"" -InstallRoot ""{app}"" -DataRoot ""{commonappdata}\{#AppName}"" -Uninstall"; \
   Flags: runhidden; RunOnceId: "uninstall_services"
 
 [UninstallDelete]
