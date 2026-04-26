@@ -18,9 +18,18 @@ contextBridge.exposeInMainWorld("wizard", {
   // Apply: write config.v2.env atomically
   writeConfig:       (values) => ipcRenderer.invoke("wizard:write-config", values),
 
-  // db_init — spawn winserverrag-dbinit.exe and stream output
+  // db_init — spawn winserverrag-dbinit.exe and stream output.
+  // v1.3.2 fix B3: onDbInitLog returns an `off()` disposer so the
+  // wizard renderer can detach the listener when the user navigates
+  // away from step 6 (or re-runs db_init). Without this, every
+  // re-entry into step 6 attaches another listener and log lines
+  // duplicate N times after N re-runs.
   runDbInit:         () => ipcRenderer.invoke("wizard:db-init"),
-  onDbInitLog:       (cb) => ipcRenderer.on("wizard:db-init-log", (_e, line) => cb(line)),
+  onDbInitLog:       (cb) => {
+    const handler = (_e, line) => cb(line);
+    ipcRenderer.on("wizard:db-init-log", handler);
+    return () => ipcRenderer.removeListener("wizard:db-init-log", handler);
+  },
 
   // Service start
   startServices:     () => ipcRenderer.invoke("wizard:start-services"),

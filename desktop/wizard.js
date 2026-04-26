@@ -80,18 +80,21 @@ const steps = [
       setBack(false);
       setStatus("既存の設定を読み込み中...", null);
       const existing = await W.readConfig();
-      // Pre-fill state from existing config (read-side; won't overwrite
-      // until step 6 writes).
-      if (existing && existing.kind !== "missing_file") {
-        try {
-          const path = await W.configPath();
-          // configCheck.checkConfig only returns status, not the full
-          // values. Re-fetch via readConfig for the values. Hmm — our
-          // IPC currently only exposes checkConfig. For the wizard we
-          // want the values. Let's just leave defaults; user enters
-          // values fresh. Future: extend IPC to expose values.
-          STATE.existing_status = existing;
-        } catch {}
+      // v1.3.2 fix B4: pre-fill STATE from existing config values so
+      // wizard re-run doesn't erase the operator's prior input.
+      // Each group merges only the keys it cares about; unknown keys
+      // are ignored. Empty/blank values fall through to defaults.
+      if (existing && existing.values) {
+        const v = existing.values;
+        const m = (group, keys) => {
+          for (const k of keys) {
+            if (v[k] !== undefined && v[k] !== "") group[k] = v[k];
+          }
+        };
+        m(STATE.google,   ["GOOGLE_EMAIL", "GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET", "GOOGLE_TOKEN_PATH"]);
+        m(STATE.postgres, ["PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE"]);
+        m(STATE.indexing, ["EMBEDDING_MODEL", "EMBEDDING_DEVICE", "BATCH_SIZE", "DAEMON_WORKER_THREADS"]);
+        m(STATE.api,      ["API_HOST", "API_PORT", "API_BEARER_TOKEN"]);
       }
       setStatus("");
       $("step-host").innerHTML = `
@@ -384,22 +387,28 @@ const steps = [
         box.appendChild(div);
         box.scrollTop = box.scrollHeight;
       };
-      // Subscribe to the log stream BEFORE invoking
-      W.onDbInitLog((line) => append(line));
+      // v1.3.2 fix B3: capture the off() disposer so re-runs don't
+      // accumulate listeners. We detach BEFORE returning regardless
+      // of success/fail. Subsequent runs start with a fresh listener.
+      const offLog = W.onDbInitLog((line) => append(line));
       setStatus("db_init 実行中...", null);
       setNext("実行中...", false);
-      const r = await W.runDbInit();
-      STATE.dbInitResult = r;
-      if (r.ok) {
-        append("--- 完了 (exit 0) ---", "ok");
-        setStatus("db_init 完了", "ok");
-        setNext("次へ", true);
-        return true;
-      } else {
-        append(`--- 失敗 (exit ${r.exitCode}): ${r.error || ""} ---`, "err");
-        setStatus("db_init 失敗", "err");
-        setNext("再実行", true);
-        return "stay";
+      try {
+        const r = await W.runDbInit();
+        STATE.dbInitResult = r;
+        if (r.ok) {
+          append("--- 完了 (exit 0) ---", "ok");
+          setStatus("db_init 完了", "ok");
+          setNext("次へ", true);
+          return true;
+        } else {
+          append(`--- 失敗 (exit ${r.exitCode}): ${r.error || ""} ---`, "err");
+          setStatus("db_init 失敗", "err");
+          setNext("再実行", true);
+          return "stay";
+        }
+      } finally {
+        try { if (typeof offLog === "function") offLog(); } catch {}
       }
     },
   },
@@ -513,25 +522,60 @@ async function go() {
   await steps[stepIdx].render();
 }
 
+// v1.3.2 fix B5: snapshot the current step's form values before any
+// transition (Back or Next). Without this, hitting Back after typing
+// a PG password (step 2) loses the input. Only steps with collect*
+// helpers participate; others are no-op.
+function snapshotCurrentStep() {
+  try {
+    if (stepIdx === 2 && document.getElementById("pg-host")) {
+      Object.assign(STATE.postgres, collectPg());
+    }
+    if (stepIdx === 3 && document.getElementById("g-email")) {
+      STATE.google.GOOGLE_EMAIL = $("g-email").value.trim();
+      STATE.google.GOOGLE_OAUTH_CLIENT_ID = $("g-cid").value.trim();
+      STATE.google.GOOGLE_OAUTH_CLIENT_SECRET = $("g-csec").value;
+    }
+    if (stepIdx === 4 && document.getElementById("ix-model")) {
+      STATE.indexing.EMBEDDING_MODEL = $("ix-model").value.trim();
+      STATE.indexing.EMBEDDING_DEVICE = $("ix-device").value;
+      STATE.indexing.BATCH_SIZE = $("ix-batch").value || "64";
+      STATE.indexing.DAEMON_WORKER_THREADS = $("ix-threads").value || "4";
+    }
+  } catch {
+    // DOM not ready / element missing — best-effort snapshot only.
+  }
+}
+
 // ---------------------------------------------------------------------
 // Wire-up
 // ---------------------------------------------------------------------
+// v1.3.2 fix B2: inflight guard. Without this, Back fires while
+// onNext (e.g. db_init child process running in step 6) is in flight,
+// state machine corrupts: stepIdx changes mid-await, the resolving
+// onNext writes to elements from a stale step.
+let _busyOnNext = false;
+
 window.addEventListener("DOMContentLoaded", () => {
   $("back").addEventListener("click", () => {
-    if (stepIdx > 0) {
-      stepIdx--;
-      go();
-    }
+    if (_busyOnNext || stepIdx === 0) return;
+    snapshotCurrentStep();
+    stepIdx--;
+    go();
   });
   $("next").addEventListener("click", async () => {
-    const result = await steps[stepIdx].onNext();
-    if (result === true) {
-      if (stepIdx < TOTAL_STEPS - 1) {
+    if (_busyOnNext) return;
+    _busyOnNext = true;
+    try {
+      const result = await steps[stepIdx].onNext();
+      if (result === true && stepIdx < TOTAL_STEPS - 1) {
         stepIdx++;
         go();
       }
+      // result === "stay" → render didn't change, status already set
+    } finally {
+      _busyOnNext = false;
     }
-    // result === "stay" → render didn't change, status already set
   });
   go();
 });

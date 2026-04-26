@@ -90,9 +90,17 @@ async function prereqCheck() {
 function testPgConnection(params) {
   const { host, port, user, password, database } = params || {};
   return new Promise((resolve) => {
-    // Build a temporary env so we don't leak the password into argv.
+    // v1.3.2 fix B8: minimal env to the child. Forwarding the full
+    // process.env leaks anything the wizard process picked up
+    // (WINSERVERRAG_API_BEARER_TOKEN if set, OAuth tokens, etc.).
+    // psql only needs PG* vars + SystemRoot/Path for DLL resolution
+    // on Windows.
     const env = {
-      ...process.env,
+      SystemRoot: process.env.SystemRoot || "C:\\Windows",
+      PATH: process.env.PATH || process.env.Path || "",
+      Path: process.env.Path || process.env.PATH || "",
+      TEMP: process.env.TEMP || process.env.TMP || "C:\\Windows\\Temp",
+      TMP:  process.env.TMP  || process.env.TEMP || "C:\\Windows\\Temp",
       PGHOST: host || "localhost",
       PGPORT: port || "5432",
       PGUSER: user || "postgres",
@@ -138,9 +146,42 @@ async function pickCredentials() {
   return { canceled: false, path: r.filePaths[0] };
 }
 
+// v1.3.2 fix B6: sanity-check the source path before copying. The
+// renderer SHOULD only ever pass a path returned by pickCredentials
+// (which is the Electron file dialog), but contextIsolation is
+// defense-in-depth, not a guarantee — a future preload regression or
+// devtools console call could pass any path. Reject anything that
+// isn't a JSON file under a reasonable size.
+const MAX_CREDENTIALS_BYTES = 32 * 1024; // 32KB; real OAuth client.json is ~500B
+
 function copyCredentials(srcPath) {
   return new Promise((resolve) => {
     try {
+      if (typeof srcPath !== "string" || srcPath.length === 0) {
+        return resolve({ ok: false, error: "invalid path" });
+      }
+      const ext = path.extname(srcPath).toLowerCase();
+      if (ext !== ".json") {
+        return resolve({ ok: false, error: `expected a .json file, got ${ext || "(no ext)"}` });
+      }
+      const stat = fs.statSync(srcPath);
+      if (!stat.isFile()) {
+        return resolve({ ok: false, error: "source is not a regular file" });
+      }
+      if (stat.size > MAX_CREDENTIALS_BYTES) {
+        return resolve({ ok: false, error: `file too large (${stat.size} bytes, max ${MAX_CREDENTIALS_BYTES})` });
+      }
+      // Light schema check: real Google OAuth credentials.json has
+      // an "installed" or "web" top-level key with "client_id" inside.
+      const text = fs.readFileSync(srcPath, "utf-8");
+      let obj;
+      try { obj = JSON.parse(text); } catch {
+        return resolve({ ok: false, error: "file is not valid JSON" });
+      }
+      const root = obj && (obj.installed || obj.web);
+      if (!root || typeof root.client_id !== "string") {
+        return resolve({ ok: false, error: "JSON does not look like a Google OAuth credentials file (missing installed/web → client_id)" });
+      }
       const dst = path.join(_ctx.configCheck.configDir(), "credentials.json");
       fs.mkdirSync(path.dirname(dst), { recursive: true });
       fs.copyFileSync(srcPath, dst);
@@ -233,7 +274,19 @@ function register(ctx) {
   const { ipcMain, app } = ctx;
   const { shell } = require("electron");
 
-  ipcMain.handle("wizard:read-config",   () => ctx.configCheck.checkConfig());
+  // v1.3.2 fix B4: include the parsed values so the wizard can
+  // pre-fill its forms on re-run. checkConfig() alone returns only
+  // status — without values, every re-run resets to defaults and
+  // the operator types their PG password again. Returns:
+  //   { kind, missingKeys?, placeholderKeys?, path, values }
+  // where values is the parsed {key: value} dict (empty {} if no
+  // file). missingKeys / placeholderKeys are still populated by
+  // validateConfig for the CTA logic.
+  ipcMain.handle("wizard:read-config",   () => {
+    const status = ctx.configCheck.checkConfig();
+    const parsed = ctx.configCheck.readConfig();
+    return { ...status, values: (parsed && parsed.values) || {} };
+  });
   ipcMain.handle("wizard:config-path",   () => ctx.configCheck.configPath());
   ipcMain.handle("wizard:prereq-check",  () => prereqCheck());
   ipcMain.handle("wizard:pg-test",       (_e, params) => testPgConnection(params));

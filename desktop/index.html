@@ -177,9 +177,9 @@
         <span id="indicator" class="indicator"><span class="core"></span></span>
         WinServerRAG
       </h1>
-      <button id="pause-btn" class="pause-btn" title="サービスを一時停止 / 再開 (新規タスク取得を止める。進行中タスクは完走)">⏸</button>
-      <button id="open-btn" class="header-btn" title="ブラウザでフル Monitor を開く">Monitor を開く</button>
-      <input type="checkbox" id="aot-toggle" class="aot-toggle" title="常に最前面に表示">
+      <button id="pause-btn" class="pause-btn" title="サービスを一時停止 / 再開 (新規タスク取得を止める。進行中タスクは完走)" aria-label="一時停止または再開">⏸</button>
+      <button id="open-btn" class="header-btn" title="ブラウザでフル Monitor を開く" aria-label="Web Console を開く">Monitor を開く</button>
+      <input type="checkbox" id="aot-toggle" class="aot-toggle" title="常に最前面に表示" aria-label="常に最前面に表示">
     </div>
     <div class="topbar">
       <div id="progress-agg" class="progress-agg"><div class="fill" id="progress-fill" style="width:0"></div></div>
@@ -202,7 +202,7 @@
     <div id="cfg-cta" class="cfg-cta">
       <div class="title" id="cfg-cta-title">⚠ config 設定を行ってください</div>
       <div class="detail" id="cfg-cta-detail">config.v2.env が未作成です。Setup Wizard を実行して PostgreSQL / Google OAuth を設定してください。</div>
-      <button id="cfg-cta-btn">Setup Wizard を起動</button>
+      <button id="cfg-cta-btn" aria-label="Setup Wizard を起動して config を作成">Setup Wizard を起動</button>
     </div>
     <div class="rows">
       <!-- High-priority operator-facing status — at the very top so it's the
