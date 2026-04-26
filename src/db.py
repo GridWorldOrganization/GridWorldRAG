@@ -192,7 +192,7 @@ def ensure_fd_schema(conn: psycopg.Connection, drive_id: str) -> str:
             # e.g., index already exists from a parallel create
             conn.rollback()
             return schema
-        except psycopg.errors.UniqueViolation as e:
+        except psycopg.errors.UniqueViolation:
             # Typically pg_namespace_nspname_index race. Re-check existence.
             conn.rollback()
             with conn.cursor() as cur:
