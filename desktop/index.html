@@ -122,6 +122,25 @@
     footer { display: flex; justify-content: space-between; align-items: center; font-size: 11px; gap: 8px; }
     .muted { color: var(--muted); font-size: 11px; }
     .err { color: var(--err); }
+    /* v1.3.2: config-missing call-to-action banner. Sits above the rows
+       when checkConfig() returns kind != "ok". Click → IPC launches the
+       Setup Wizard (separate Electron window). */
+    .cfg-cta {
+      display: none;
+      background: linear-gradient(180deg, #2a2418 0%, #1f1d12 100%);
+      border: 1px solid var(--warn); border-radius: 6px;
+      padding: 8px 10px; font-size: 12px;
+      flex-direction: column; gap: 6px;
+    }
+    .cfg-cta.show { display: flex; }
+    .cfg-cta .title { color: var(--warn); font-weight: 600; }
+    .cfg-cta .detail { color: var(--muted); font-size: 11px; }
+    .cfg-cta button {
+      align-self: stretch; background: var(--warn); color: #1a1209;
+      border: none; border-radius: 4px; padding: 6px 10px;
+      font-size: 12px; font-weight: 600; cursor: pointer;
+    }
+    .cfg-cta button:hover { filter: brightness(1.1); }
     .debug-link { color: var(--muted); cursor: pointer; user-select: none; font-size: 10px;
       padding: 1px 4px; border-radius: 3px; }
     .debug-link:hover { color: var(--accent); background: #14243d; }
@@ -175,6 +194,15 @@
         <span class="muted">全体 (ON分):</span>
         <span id="progress-global-text">—</span>
       </div>
+    </div>
+    <!-- v1.3.2: config-missing CTA. Renderer toggles .show based on the
+         config-check IPC. When config.v2.env is absent or has placeholder
+         values like "change_me", we tell the operator instead of just
+         showing "API 不通" red status (which isn't actionable). -->
+    <div id="cfg-cta" class="cfg-cta">
+      <div class="title" id="cfg-cta-title">⚠ config 設定を行ってください</div>
+      <div class="detail" id="cfg-cta-detail">config.v2.env が未作成です。Setup Wizard を実行して PostgreSQL / Google OAuth を設定してください。</div>
+      <button id="cfg-cta-btn">Setup Wizard を起動</button>
     </div>
     <div class="rows">
       <!-- High-priority operator-facing status — at the very top so it's the

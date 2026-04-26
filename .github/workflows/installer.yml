@@ -170,7 +170,7 @@ jobs:
       - name: Show installer size
         shell: pwsh
         run: |
-          $exe = Get-ChildItem dist/WinServerRAG-Setup-*.exe | Select-Object -First 1
+          $exe = Get-ChildItem dist/WinServerRAG-Daemon-Installer-*.exe | Select-Object -First 1
           if (-not $exe) { Write-Error "No installer .exe in dist/"; exit 1 }
           Write-Host "Built: $($exe.FullName)"
           Write-Host "Size:  $([math]::Round($exe.Length / 1MB, 1)) MB"
@@ -178,8 +178,8 @@ jobs:
       - name: Upload artifact (always, even on workflow_dispatch)
         uses: actions/upload-artifact@v4
         with:
-          name: WinServerRAG-Setup-${{ steps.ver.outputs.version }}
-          path: dist/WinServerRAG-Setup-*.exe
+          name: WinServerRAG-Daemon-Installer-${{ steps.ver.outputs.version }}
+          path: dist/WinServerRAG-Daemon-Installer-*.exe
           retention-days: 30
           if-no-files-found: error
 
@@ -194,6 +194,6 @@ jobs:
           } else {
             "${{ github.event.inputs.release_tag }}"
           }
-          $exe = (Get-ChildItem dist/WinServerRAG-Setup-*.exe | Select-Object -First 1).FullName
+          $exe = (Get-ChildItem dist/WinServerRAG-Daemon-Installer-*.exe | Select-Object -First 1).FullName
           Write-Host "Uploading $exe to release $tag..."
           gh release upload $tag $exe --clobber

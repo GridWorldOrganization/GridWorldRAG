@@ -52,7 +52,12 @@ DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 LicenseFile=..\..\LICENSE
 OutputDir=..\..\dist
-OutputBaseFilename=WinServerRAG-Setup-{#AppVersion}
+; v1.3.2: renamed from WinServerRAG-Setup-* to WinServerRAG-Daemon-Installer-*.
+; "Setup" was ambiguous since v1.3.2 also ships a separate Setup Wizard exe
+; (WinServerRAG Setup.exe) that walks the operator through config + OAuth +
+; db_init + service start. The installer just deploys binaries; the wizard
+; finishes the setup. Different names, different jobs.
+OutputBaseFilename=WinServerRAG-Daemon-Installer-{#AppVersion}
 ; SetupIconFile=assets\icon.ico   ; Drop a 256x256 .ico here to brand the installer
 Compression=lzma2/ultra
 SolidCompression=yes
@@ -88,6 +93,12 @@ Source: "..\..\dist\exe\winserverrag-backup\*"; DestDir: "{app}\bin\winserverrag
 ; Electron mini-monitor (electron-builder --dir output).
 Source: "..\..\dist\desktop\win-unpacked\*"; DestDir: "{app}\mini"; Flags: ignoreversion recursesubdirs createallsubdirs
 
+; v1.3.2: Setup Wizard EXE — same Electron binary as Mini Monitor, copied
+; under a different name. main.js detects the exec path and switches to
+; wizard mode when launched as "WinServerRAG Setup.exe". This avoids
+; bundling a second 200MB Electron runtime; one app.asar serves both UIs.
+Source: "..\..\dist\desktop\win-unpacked\WinServerRAG Mini.exe"; DestDir: "{app}\mini"; DestName: "WinServerRAG Setup.exe"; Flags: ignoreversion
+
 ; NSSM (bundled in installer/inno/assets at build time by build.ps1).
 Source: "assets\nssm.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
 
@@ -120,6 +131,10 @@ Name: "{commonappdata}\{#AppName}\backups\daily";  Permissions: users-modify
 Name: "{commonappdata}\{#AppName}\backups\weekly"; Permissions: users-modify
 
 [Icons]
+; v1.3.2: Setup Wizard shortcut listed FIRST so it's visible as the
+; default action after install (operator opens Start Menu → sees Setup
+; Wizard at the top → clicks → walks through config/OAuth/db_init/start).
+Name: "{group}\{#AppName} Setup Wizard"; Filename: "{app}\mini\WinServerRAG Setup.exe"
 Name: "{group}\{#AppName} Mini Monitor"; Filename: "{app}\mini\{#AppExeMini}"
 Name: "{group}\{#AppName} Web Console";  Filename: "http://127.0.0.1:17600/"
 Name: "{group}\{cm:UninstallProgram,{#AppName}}"; Filename: "{uninstallexe}"

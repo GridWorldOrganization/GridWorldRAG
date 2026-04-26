@@ -1,0 +1,232 @@
+/* WinServerRAG Setup Wizard styles */
+:root {
+  --bg: #0f1115;
+  --bg-soft: #181b22;
+  --bg-card: #1e222b;
+  --fg: #e6e9ef;
+  --fg-mute: #9aa0aa;
+  --accent: #4f8cf8;
+  --accent-hover: #639dff;
+  --ok: #57c785;
+  --warn: #e8b54f;
+  --err: #ed5757;
+  --border: #2a2f39;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: "Segoe UI", "Yu Gothic UI", "Hiragino Kaku Gothic ProN", sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  height: 100vh;
+  overflow: hidden;
+}
+
+body { display: flex; flex-direction: column; }
+
+/* ----- Header ----- */
+.hdr {
+  flex: 0 0 auto;
+  padding: 14px 20px 10px;
+  background: var(--bg-soft);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+.hdr .title {
+  font-size: 16px;
+  font-weight: 600;
+}
+.step-pip {
+  display: flex;
+  gap: 6px;
+  flex: 1;
+  justify-content: flex-end;
+}
+.pip {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--border);
+  transition: background 0.2s;
+}
+.pip.done { background: var(--ok); }
+.pip.active { background: var(--accent); box-shadow: 0 0 0 3px rgba(79, 140, 248, 0.25); }
+
+/* ----- Main step area ----- */
+main {
+  flex: 1 1 auto;
+  padding: 20px 24px;
+  overflow-y: auto;
+}
+h2 {
+  margin: 0 0 6px;
+  font-size: 18px;
+  font-weight: 600;
+}
+.subtitle {
+  color: var(--fg-mute);
+  margin: 0 0 18px;
+  font-size: 13px;
+}
+
+/* ----- Form fields ----- */
+.field {
+  margin-bottom: 14px;
+}
+.field label {
+  display: block;
+  font-size: 12px;
+  color: var(--fg-mute);
+  margin-bottom: 4px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+.field input[type="text"],
+.field input[type="password"],
+.field input[type="number"],
+.field select {
+  width: 100%;
+  padding: 7px 10px;
+  background: var(--bg-card);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 13px;
+}
+.field input:focus,
+.field select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.field .hint {
+  color: var(--fg-mute);
+  font-size: 11px;
+  margin-top: 3px;
+}
+.row { display: flex; gap: 12px; }
+.row .field { flex: 1; }
+
+/* ----- Cards (prereq, status displays) ----- */
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px 14px;
+  margin-bottom: 10px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.card .icon { font-size: 18px; line-height: 1; }
+.card .body { flex: 1; }
+.card .body .name { font-weight: 600; }
+.card .body .detail { color: var(--fg-mute); font-size: 12px; }
+.card.ok { border-color: var(--ok); }
+.card.warn { border-color: var(--warn); }
+.card.err { border-color: var(--err); }
+
+/* ----- Buttons ----- */
+.btn {
+  background: var(--bg-card);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 7px 18px;
+  font-family: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.btn:hover { border-color: var(--fg-mute); }
+.btn.primary {
+  background: var(--accent);
+  color: white;
+  border-color: var(--accent);
+}
+.btn.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+.btn.ghost { background: transparent; }
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.btn.test {
+  margin-top: 8px;
+  font-size: 12px;
+  padding: 5px 12px;
+}
+
+/* ----- Footer ----- */
+.ftr {
+  flex: 0 0 auto;
+  padding: 12px 20px;
+  background: var(--bg-soft);
+  border-top: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.ftr .status {
+  flex: 1;
+  font-size: 12px;
+  color: var(--fg-mute);
+}
+.ftr .status.ok { color: var(--ok); }
+.ftr .status.err { color: var(--err); }
+.ftr .status.warn { color: var(--warn); }
+
+/* ----- Log box (db_init step) ----- */
+.log-box {
+  background: #0a0c10;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 10px;
+  font-family: "Cascadia Mono", "Consolas", monospace;
+  font-size: 12px;
+  height: 280px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.log-box .line { line-height: 1.4; }
+.log-box .line.err { color: var(--err); }
+
+/* ----- Welcome / Done step large displays ----- */
+.hero {
+  text-align: center;
+  padding: 40px 20px;
+}
+.hero .emoji { font-size: 48px; margin-bottom: 8px; }
+.hero h2 { font-size: 20px; }
+.hero p { color: var(--fg-mute); }
+
+/* ----- Inline messages ----- */
+.msg {
+  padding: 8px 12px;
+  border-radius: 4px;
+  font-size: 13px;
+  margin: 8px 0;
+}
+.msg.ok { background: rgba(87, 199, 133, 0.1); border-left: 3px solid var(--ok); }
+.msg.warn { background: rgba(232, 181, 79, 0.1); border-left: 3px solid var(--warn); }
+.msg.err { background: rgba(237, 87, 87, 0.1); border-left: 3px solid var(--err); }
+
+/* ----- Done-step action grid ----- */
+.action-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 20px;
+}
+.action-grid .btn {
+  padding: 14px;
+  text-align: center;
+}
