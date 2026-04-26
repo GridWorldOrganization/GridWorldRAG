@@ -257,21 +257,42 @@ Install-NssmService $ServiceApi    $ApiExe
 Install-NssmService $ServiceDaemon $DaemonExe
 
 # 6. Apply / re-apply NSSM params for both services.
-function Set-NssmParams($name, $appDir, $logBase, $env, $depends) {
-    & $NssmExe set $name AppDirectory       $appDir         | Out-Null
-    & $NssmExe set $name AppStdout          "$LogDir\$logBase.out.log" | Out-Null
-    & $NssmExe set $name AppStderr          "$LogDir\$logBase.err.log" | Out-Null
-    & $NssmExe set $name AppRotateFiles     1               | Out-Null
-    & $NssmExe set $name AppRotateBytes     10485760        | Out-Null
-    & $NssmExe set $name AppEnvironmentExtra "WINSERVERRAG_CONFIG_DIR=$ConfigDir" | Out-Null
-    & $NssmExe set $name Start              SERVICE_AUTO_START | Out-Null
+#
+# v1.3.2: stopTimeoutMs param. NSSM's default stop sequence is
+# Console (1.5s) → Window (1.5s) → Threads (1.5s) → Process kill ≈ 4.5s.
+# The daemon needs much longer to drain in-flight workers (PDF extract,
+# embedding batch, DB commit can take 10-30s each). Without this, NSSM
+# TerminateProcess's the daemon mid-task → stale worker rows in PG,
+# leaked advisory locks, half-committed builds.
+#
+# stopTimeoutMs is the Console (Ctrl+C / SIGBREAK) budget. We give 30s
+# to daemon, 5s to API (the FastAPI lifespan unwinds quickly). Window /
+# Threads phases stay short (5s each) — by the time we're there, the
+# graceful path failed and we want to escalate.
+function Set-NssmParams($name, $appDir, $logBase, $env, $depends, $stopTimeoutMs) {
+    & $NssmExe set $name AppDirectory       $appDir         *>$null
+    & $NssmExe set $name AppStdout          "$LogDir\$logBase.out.log" *>$null
+    & $NssmExe set $name AppStderr          "$LogDir\$logBase.err.log" *>$null
+    & $NssmExe set $name AppRotateFiles     1               *>$null
+    & $NssmExe set $name AppRotateBytes     10485760        *>$null
+    & $NssmExe set $name AppRotateOnline    1               *>$null  # rotate without restart
+    & $NssmExe set $name AppEnvironmentExtra "WINSERVERRAG_CONFIG_DIR=$ConfigDir" *>$null
+    & $NssmExe set $name Start              SERVICE_AUTO_START *>$null
+    # Stop sequence — graceful shutdown budget.
+    & $NssmExe set $name AppStopMethodSkip    0          *>$null  # try all 4 phases
+    & $NssmExe set $name AppStopMethodConsole $stopTimeoutMs *>$null
+    & $NssmExe set $name AppStopMethodWindow  5000       *>$null
+    & $NssmExe set $name AppStopMethodThreads 5000       *>$null
+    & $NssmExe set $name AppKillProcessTree   1          *>$null  # kill children with main
     if ($depends) {
-        & $NssmExe set $name DependOnService $depends | Out-Null
+        & $NssmExe set $name DependOnService $depends *>$null
     }
 }
 
-Set-NssmParams $ServiceApi    (Split-Path $ApiExe)    "api"    $ConfigDir $null
-Set-NssmParams $ServiceDaemon (Split-Path $DaemonExe) "daemon" $ConfigDir $ServiceApi
+# API: 5s console budget (FastAPI lifespan unwinds fast).
+# Daemon: 30s console budget (workers may be mid-PDF / mid-embedding).
+Set-NssmParams $ServiceApi    (Split-Path $ApiExe)    "api"    $ConfigDir $null         5000
+Set-NssmParams $ServiceDaemon (Split-Path $DaemonExe) "daemon" $ConfigDir $ServiceApi  30000
 
 # 7. Set descriptions (cosmetic, services.msc).
 & $NssmExe set $ServiceApi    Description "WinServerRAG control API + web monitor (FastAPI on :17600)" | Out-Null

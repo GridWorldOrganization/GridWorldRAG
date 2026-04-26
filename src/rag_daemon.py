@@ -662,6 +662,18 @@ def main() -> int:
         signal.signal(signal.SIGTERM, _signal_handler)
     except (ValueError, AttributeError):
         pass
+    # NSSM's AppStopMethodConsole = 1 (default) sends CTRL_BREAK_EVENT,
+    # not CTRL_C_EVENT. On Windows, Python translates that to SIGBREAK,
+    # not SIGINT. Without this handler, NSSM's graceful-stop signal is
+    # silently dropped and the daemon only exits when NSSM escalates to
+    # CTRL_C_EVENT or TerminateProcess. Pair with the 30s
+    # AppStopMethodConsole timeout configured in install-services.ps1.
+    sigbreak = getattr(signal, "SIGBREAK", None)
+    if sigbreak is not None:
+        try:
+            signal.signal(sigbreak, _signal_handler)
+        except (ValueError, AttributeError):
+            pass
 
     try:
         lock = Lock(LOCK_PATH, stale_after_sec=1800)
