@@ -180,7 +180,110 @@ like this built for your business, reach out: **tobisako@gridworld.co**.
 - 停止状態でも Drive Changes API のトークンは進めない（次回開始時に取りこぼしなく再開）
 - サービス本体（NSSM 登録の Windows サービス）の停止 / 再起動は OS の `services.msc` または `nssm stop` から行う（ミニモニタの管轄外）
 
-> 実装は v1.1 で予定。v1.0.0 時点では設計確定済み、コードはこれから。
+## ミニモニタ ↔ Daemon 制御プロトコル (v1.3)
+
+ミニモニタは **API のライフサイクルに依存せず** Daemon を直接監視・制御する。
+API が停止していても Daemon が稼働中なら正しく "実行中" を表示する。
+逆に Daemon 停止時は **管理者権限なしで起動** できる。
+
+### 大原則 (boundaries)
+
+- **インストール作業はインストーラーのみ**: `WinServerRAG-Setup-*.exe` を管理者で実行することで、API + Daemon の 2 サービスがペアで NSSM 登録される。ミニモニタはインストール (= `nssm install` / `sc create`) を **絶対に行わない**
+- **日常運用は管理者権限不要**: 起動 (`sc start`) は SDDL 緩和済の専用ローカルグループ `WinServerRAG Operators` に限定付与され、UAC プロンプト無しで実行可能
+- **Daemon が未インストール時は警告のみ**: ミニモニタの起動ボタンを押しても、`sc query` が rc=1060 を返す場合は「インストーラーを実行してください」のダイアログを出すだけで、何もインストールしない
+
+### ミニモニタ → Windows SCM (sc query / sc start)
+
+ミニモニタの Electron main プロセスから `%SystemRoot%\System32\sc.exe` を `child_process.execFile()` で直接呼ぶ。renderer は preload.js 経由で IPC アクセス。
+
+| ポーリング | 対象 | 周期 | 目的 |
+|---|---|---|---|
+| `GET /api/stats` | API | 250ms | ビルド状態、pause フラグ、統計 |
+| `sc query WinServerRAG-Daemon` | SCM | 5s | Daemon の SCM state (API 不通時もこれ) |
+
+state 値は **数値で parse** (`STATE :  4  RUNNING` の `4`)。日本語 Windows でも壊れない。
+
+| 数値 | 意味 | ミニモニタ表記 (灰=既知、黃=遷移中、赤=要注意) |
+|---|---|---|
+| `1` | STOPPED | ■ 停止中 (登録済) |
+| `2` | START_PENDING | ⏳ 起動中... (黃 + spinner) |
+| `3` | STOP_PENDING | ⏳ 停止中... (黃 + spinner) |
+| `4` | RUNNING | ● 実行中 (緑) |
+| `5` | CONTINUE_PENDING | ⏳ 遷移中... (黃) |
+| `6` | PAUSE_PENDING | ⏳ 遷移中... (黃) |
+| `7` | PAUSED | (rare、RUNNING 同等扱い) |
+| rc=`1060` + venv 検出 | NOT_INSTALLED | 💻 dev mode (灰) |
+| rc=`1060` + venv 不在 | NOT_INSTALLED | ✕ 未インストール (赤) |
+| その他 | UNKNOWN | ? 状態取得失敗 (橙) |
+
+### ボタン状態遷移表
+
+ボタン押下で次の動作:
+
+| Daemon 状態 | API paused | ボタン | 押下時の動作 |
+|---|---|---|---|
+| RUNNING | false | ⏸ | `POST /api/daemon/pause` |
+| RUNNING | true | ▶ | `POST /api/daemon/resume` |
+| STOPPED | — | ▶ | **`sc start WinServerRAG-Daemon`** (UAC 不要、SDDL 緩和) → poll RUNNING |
+| START/STOP_PENDING | — | (disabled) | 押せない |
+| NOT_INSTALLED + dev | — | 💻 | dialog: "venv で `python -m src.rag_daemon` を実行" + コピーボタン |
+| NOT_INSTALLED + 本番 | — | ⊘ | dialog: "インストーラーを実行してください" + リンク |
+| UNKNOWN | — | (disabled) | 押せない |
+
+### `sc start` の error code 区別
+
+`sc start` 戻り値で UI フィードバックを変える:
+
+| exit code | 意味 | UI |
+|---|---|---|
+| `0` | 開始成功 (非同期、START_PENDING へ) | poll で RUNNING 確認 (30s タイムアウト) |
+| `5` | アクセス拒否 | "起動失敗 — SDDL 設定を確認" |
+| `1056` | 既に開始されている | 冪等 OK、success 扱い |
+| `1060` | 未インストール | "未インストール (再表示)" |
+| `1068` | 依存サービス起動失敗 | "API 起動失敗 — SCM ログ確認" |
+| `1053` | 応答なし | "起動タイムアウト" |
+
+### インストーラー側の責務 (v1.3)
+
+`installer/install-services.ps1` (管理者権限要、Inno Setup `[Run]` から呼ばれる) で:
+
+1. `WinServerRAG-API` + `WinServerRAG-Daemon` を `nssm install` (冪等: 既存検出+更新、blind install しない)
+2. Daemon の `DependOnService = WinServerRAG-API`
+3. **ローカルグループ `WinServerRAG Operators` を作成** (`net localgroup ... /add`、既存なら no-op)
+4. インストーラー実行ユーザーをグループに追加
+5. **両サービスの SDDL を `sc sdset` で書き換え**:
+   ```
+   (A;;LCRPLO;;;<SID-of-WinServerRAG-Operators>)
+   ```
+   付与: `SERVICE_QUERY_STATUS` + `SERVICE_START` のみ (SERVICE_STOP は **付与しない** — Microsoft ガイダンス: AU や広い範囲に START を渡すと実害)
+6. uninstall 時に group + service を削除
+
+### セキュリティ境界
+
+- **インストール時に admin 1 回だけ**: NSSM 登録 + SDDL 設定 + group 作成
+- **以降の起動操作は Operators グループメンバーのみ**: ドメイン全認証ユーザーや一般ユーザーは start 不可
+- **API pause/resume は HTTP のみ**: API_BEARER_TOKEN 設定可、localhost-only がデフォルト
+- **ミニモニタは Electron 通常権限 (UAC 不要)**: SDDL 緩和済サービスへの start のみ可能、install 系コマンドは一切実行しない
+
+### UI 合成ルール (API down + Daemon up の独立表示)
+
+ミニモニタの 2 行は **独立した data stream** から描画:
+
+```
+"Daemon"  ← sc query のみ依存。API 不通でも常に最新状態
+"ビルド"  ← /api/stats のみ依存。API 不通時は "? (API 不通)" 表示
+```
+
+`showErr()` (API 接続失敗時) は **ビルド行 + PG/Drive 行 + 各統計のみクリア**。Daemon 行は触らない。
+
+### v1.3 NOT in scope (将来候補)
+
+- Path manifest (`%ProgramData%\WinServerRAG\config\paths.json`): `sc start` は exe path 不要のため不要
+- Dev mode auto-spawn (Electron が `python -m src.rag_daemon` を spawn): v1.4 検討
+- Mini-monitor から install 操作: 永久 NOT (security boundary)
+- AWS bridge service の SCM 統合: v1.4
+
+> 実装は v1.3 で予定。v1.2.0 時点では設計確定済み、コードはこれから。
 
 ## スキーマ (PostgreSQL)
 
