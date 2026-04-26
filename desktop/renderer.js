@@ -97,6 +97,10 @@ let _pauseInflight = false;
 // "API down + Daemon up" is still visible. Shape mirrors service-control.js:
 //   { kind, code, devMode: { isDev, venvPython?, repoRoot? } }
 let _daemonState = null;
+// v1.3.2: same-cadence config-check cache. Shape mirrors config-check.js
+// validateConfig: { kind: "ok" | "missing_file" | "incomplete",
+// missingKeys?, placeholderKeys?, path }.
+let _configState = null;
 // Tri-state: null = first poll hasn't completed, "..." = inflight start,
 // "ok" = idle, "err" = last start failed (sticky until next poll succeeds).
 let _daemonStartFlight = null;
@@ -242,6 +246,48 @@ async function pollDaemon() {
     DBG.lastFailAt = new Date();
     if (isDebugOpen()) renderDebug();
   }
+}
+
+// v1.3.2: config-missing CTA polling (same 5s cadence as pollDaemon).
+// When the config is incomplete, surface a banner with a "Setup Wizard
+// を起動" button. The button IPC's launch-wizard, which spawns the
+// renamed exe (or self+arg in dev).
+async function pollConfig() {
+  try {
+    const r = await window.winsrv.configCheck();
+    _configState = r;
+    renderConfigCta(r);
+  } catch (e) {
+    DBG.lastFailReason = `config-check IPC: ${e && e.message || e}`;
+    if (isDebugOpen()) renderDebug();
+  }
+}
+
+function renderConfigCta(state) {
+  const cta = $("cfg-cta");
+  if (!cta) return;
+  if (!state || state.kind === "ok") {
+    cta.classList.remove("show");
+    return;
+  }
+  const title = $("cfg-cta-title");
+  const detail = $("cfg-cta-detail");
+  if (state.kind === "missing_file") {
+    title.textContent = "⚠ config.v2.env が未作成です";
+    detail.textContent = `Setup Wizard を実行して、PostgreSQL 接続情報や Google OAuth credentials を設定してください。書き出し先: ${state.path || "(unknown)"}`;
+  } else if (state.kind === "incomplete") {
+    const missing = (state.missingKeys || []).join(", ");
+    const placeholder = (state.placeholderKeys || []).join(", ");
+    title.textContent = "⚠ config の入力が不足しています";
+    let bits = [];
+    if (missing) bits.push(`未入力: ${missing}`);
+    if (placeholder) bits.push(`未変更 (例値のまま): ${placeholder}`);
+    detail.textContent = bits.join(" / ") || "Setup Wizard で設定を完了してください。";
+  } else {
+    cta.classList.remove("show");
+    return;
+  }
+  cta.classList.add("show");
 }
 
 // Render the daemon row from a service-control.js result. Independent of
@@ -679,6 +725,18 @@ window.addEventListener("DOMContentLoaded", async () => {
     }
   });
 
+  // v1.3.2: config-missing CTA wiring. Click → launch-wizard IPC.
+  const ctaBtn = $("cfg-cta-btn");
+  if (ctaBtn) {
+    ctaBtn.addEventListener("click", async () => {
+      try {
+        await window.winsrv.launchWizard();
+      } catch (e) {
+        console.error("launchWizard failed:", e);
+      }
+    });
+  }
+
   tick();
   setInterval(tick, 250);
 
@@ -687,4 +745,8 @@ window.addEventListener("DOMContentLoaded", async () => {
   // soon as possible; subsequent polls every 5s.
   pollDaemon();
   setInterval(pollDaemon, 5000);
+
+  // v1.3.2: config-check polling, same 5s cadence.
+  pollConfig();
+  setInterval(pollConfig, 5000);
 });

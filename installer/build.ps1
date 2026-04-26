@@ -4,7 +4,7 @@
     WinServerRAG installer build pipeline.
 
 .DESCRIPTION
-    Produces dist\WinServerRAG-Setup-<VERSION>.exe by running:
+    Produces dist\WinServerRAG-Daemon-Installer-<VERSION>.exe by running:
       1. PyInstaller --onedir for 4 entry points (api, daemon, dbinit, backup)
       2. electron-builder --dir for the mini-monitor
       3. NSSM download (cached after first run)
@@ -25,7 +25,7 @@
         - Node.js 20+
         - Inno Setup 6 (https://jrsoftware.org/isdl.php) — installs to "C:\Program Files (x86)\Inno Setup 6\"
 
-    Run output: dist\WinServerRAG-Setup-<VERSION>.exe (~600MB).
+    Run output: dist\WinServerRAG-Daemon-Installer-<VERSION>.exe (~600MB).
 #>
 
 param(
@@ -196,7 +196,7 @@ $ISS = Join-Path $InstallerDir "inno\WinServerRAG.iss"
 & $IsccExe "/DAppVersion=$Version" $ISS 2>&1 | Out-Host
 if ($LASTEXITCODE -ne 0) { Fail "Inno Setup compile failed" }
 
-$Output = Get-ChildItem (Join-Path $DistDir "WinServerRAG-Setup-*.exe") | Sort-Object LastWriteTime | Select-Object -Last 1
+$Output = Get-ChildItem (Join-Path $DistDir "WinServerRAG-Daemon-Installer-*.exe") | Sort-Object LastWriteTime | Select-Object -Last 1
 if (-not $Output) { Fail "Installer not produced" }
 
 Section "Done"

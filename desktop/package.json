@@ -23,9 +23,15 @@
     "files": [
       "main.js",
       "preload.js",
+      "preload-wizard.js",
       "renderer.js",
       "index.html",
+      "wizard.html",
+      "wizard.css",
+      "wizard.js",
+      "wizard-ipc.js",
       "service-control.js",
+      "config-check.js",
       "package.json"
     ],
     "win": {

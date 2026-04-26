@@ -11,4 +11,7 @@ contextBridge.exposeInMainWorld("winsrv", {
   // when the API is down (precisely when the operator wants honesty).
   daemonStatus: () => ipcRenderer.invoke("daemon-status"),
   daemonStart:  () => ipcRenderer.invoke("daemon-start"),
+  // v1.3.2: config-missing detection + Setup Wizard launch.
+  configCheck:  () => ipcRenderer.invoke("config-check"),
+  launchWizard: () => ipcRenderer.invoke("launch-wizard"),
 });
