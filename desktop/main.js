@@ -70,6 +70,27 @@ function createWindow() {
       nodeIntegration: false,
     },
   });
+  // v1.3.2: catch renderer-process crashes. Without this, a fatal JS
+  // error in renderer.js leaves a blank always-on-top window with the
+  // main process still alive — user has no way to recover except Task
+  // Manager. uncaughtException (set above) only covers the main
+  // process; renderer crashes are a separate event.
+  win.webContents.on("render-process-gone", (_e, details) => {
+    console.error("[main] renderer gone:", details);
+    try {
+      dialog.showErrorBox(
+        "WinServerRAG Mini — Renderer crashed",
+        `Reason: ${details.reason}\nExit code: ${details.exitCode}\n\n` +
+        "The mini-monitor will exit. Re-launch from the Start Menu."
+      );
+    } catch {}
+    app.exit(3);
+  });
+  // Render process becoming unresponsive (infinite loop, blocked main
+  // thread) — surface but don't auto-kill; user may want to wait.
+  win.on("unresponsive", () => {
+    console.warn("[main] renderer unresponsive");
+  });
   win.setMenuBarVisibility(false);
   // Hidden accelerators: menu is not visible but accelerators still fire.
   // Lets the user pop DevTools / reload / force-refresh when diagnosing the UI.

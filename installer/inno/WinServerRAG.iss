@@ -103,9 +103,17 @@ Source: "..\..\LICENSE";     DestDir: "{app}\docs"; Flags: ignoreversion
 Source: "..\install-services.ps1"; DestDir: "{app}\bin"; Flags: ignoreversion
 
 [Dirs]
-; Per-machine writable dirs. Permissions: standard users can write logs
-; and run backups, but cannot edit config (admin-only).
-Name: "{commonappdata}\{#AppName}\config";  Permissions: users-readexec admins-modify
+; Per-machine writable dirs.
+;
+; v1.3.2: config dir is admin-only. install-services.ps1 follows up
+; with `icacls /inheritance:r /grant:r Administrators:(OI)(CI)F
+; SYSTEM:(OI)(CI)F` to BREAK inheritance from %ProgramData% (which
+; otherwise grants Authenticated Users read access). Inno's
+; [Dirs] Permissions only adds explicit ACEs, it does not strip
+; inherited ones — that's why the icacls call is required for the
+; secrets in config.v2.env (GOOGLE_OAUTH_CLIENT_SECRET, PGPASSWORD,
+; API_BEARER_TOKEN) to actually be admin-only readable.
+Name: "{commonappdata}\{#AppName}\config";  Permissions: admins-full
 Name: "{commonappdata}\{#AppName}\logs";    Permissions: users-modify
 Name: "{commonappdata}\{#AppName}\backups"; Permissions: users-modify
 Name: "{commonappdata}\{#AppName}\backups\daily";  Permissions: users-modify
@@ -225,9 +233,16 @@ function ServiceExists(const SvcName: String): Boolean;
 var
   ResultCode: Integer;
 begin
-  Exec(ExpandConstant('{cmd}'),
-       '/C sc query "' + SvcName + '" >NUL 2>&1',
-       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  // v1.3.2: Exec returns False if cmd.exe couldn't even be spawned
+  // (security software block, low-resource OS, etc). ResultCode is
+  // undefined in that case — must not be trusted.
+  if not Exec(ExpandConstant('{cmd}'),
+              '/C sc query "' + SvcName + '" >NUL 2>&1',
+              '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  begin
+    Result := False; // Can't probe → behave as "doesn't exist", let install proceed.
+    Exit;
+  end;
   Result := (ResultCode = 0);
 end;
 
@@ -236,9 +251,13 @@ var
   ResultCode: Integer;
 begin
   // findstr exit 0 means "STOPPED" line was found in `sc query` output.
-  Exec(ExpandConstant('{cmd}'),
-       '/C sc query "' + SvcName + '" | findstr /C:"STATE" | findstr /C:"STOPPED" >NUL 2>&1',
-       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  if not Exec(ExpandConstant('{cmd}'),
+              '/C sc query "' + SvcName + '" | findstr /C:"STATE" | findstr /C:"STOPPED" >NUL 2>&1',
+              '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  begin
+    Result := False;
+    Exit;
+  end;
   Result := (ResultCode = 0);
 end;
 
@@ -250,12 +269,15 @@ begin
   if not ServiceExists(SvcName) then Exit; // Fresh install — nothing to do.
 
   // sc stop is best-effort; if already stopped it returns 1062 which is fine.
+  // Exec spawn-failure is non-fatal — fall through to the polling loop, which
+  // will time out and surface a useful error if the service is genuinely stuck.
   Exec(ExpandConstant('{cmd}'),
        '/C sc stop "' + SvcName + '" >NUL 2>&1',
        '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 
-  // Poll for STOPPED state, up to 30s. NSSM's stop-method default is
-  // graceful-then-kill at 5s, so 30s is plenty even for a stuck daemon.
+  // Poll for STOPPED state, up to 30s. NSSM's stop-method (configured in
+  // install-services.ps1 to 30s console) is the actual graceful-shutdown
+  // budget; 30s here is the wrapper that confirms it took.
   WaitCount := 0;
   while WaitCount < 30 do
   begin
@@ -283,4 +305,79 @@ begin
               'Stop it manually via services.msc and re-run the installer.';
     Exit;
   end;
+end;
+
+// v1.3.2: surface install-services.ps1 failures to the user.
+//
+// The PS1 has a try/catch sentinel (writes install-services-FAILED.txt
+// on any uncaught error, since PR #34). But Inno Setup's [Run] block
+// does NOT inspect exit codes — runhidden + no Check: callback means a
+// PS1 throw silently completes the install. Users see "Setup
+// successful" while services are unregistered. This was the silent
+// failure path that motivated PR #37.
+//
+// CurStepChanged(ssPostInstall) fires AFTER all [Run] entries complete
+// and BEFORE the Finish wizard page. We check for the FAILED.txt
+// sentinel; if present + recent (<10 min old), show a clear error
+// dialog with the log path. The install still completes (files are
+// already on disk), but the user knows they need to investigate, and
+// /api/stats's "service registered" probe will reflect reality.
+
+function FileAgeMinutes(const Path: String): Integer;
+var
+  Modified: TDateTime;
+  NowTs: TDateTime;
+begin
+  Result := -1;
+  if not FileExists(Path) then Exit;
+  try
+    Modified := FileDateToDateTime(FileAge(Path));
+    // Inno Setup's Pascal Script exposes `Now` from SysUtils-equivalents.
+    // TDateTime is a Double where integer part = days. (Now - Modified)
+    // is a fractional day count; *24*60 → minutes.
+    NowTs := Now;
+    Result := Round((NowTs - Modified) * 24 * 60);
+  except
+    Result := -1;
+  end;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  FailPath, LogDir, AppRoot, DataRoot, ManualCmd: String;
+  AgeMin: Integer;
+begin
+  if CurStep <> ssPostInstall then Exit;
+
+  AppRoot  := ExpandConstant('{app}');
+  DataRoot := ExpandConstant('{commonappdata}\{#AppName}');
+  LogDir   := DataRoot + '\logs';
+  FailPath := LogDir + '\install-services-FAILED.txt';
+
+  if not FileExists(FailPath) then Exit;
+
+  // Stale sentinel from a prior install? Ignore anything older than 10
+  // minutes — current install would have been quicker than that.
+  AgeMin := FileAgeMinutes(FailPath);
+  if (AgeMin < 0) or (AgeMin > 10) then Exit;
+
+  ManualCmd :=
+    'powershell -ExecutionPolicy Bypass -File "' +
+    AppRoot + '\bin\install-services.ps1" ' +
+    '-InstallRoot "' + AppRoot + '" -DataRoot "' + DataRoot + '"';
+
+  MsgBox(
+    '⚠ サービス登録に失敗しました' + #13#10 + #13#10 +
+    'インストーラーはファイルのコピーは完了しましたが、' + #13#10 +
+    'WinServerRAG-API / WinServerRAG-Daemon の登録 (NSSM) が' + #13#10 +
+    'エラーで止まっています。' + #13#10 + #13#10 +
+    '詳細ログ:' + #13#10 +
+    '  ' + FailPath + #13#10 +
+    '  ' + LogDir + '\install-services-install-*.log' + #13#10 + #13#10 +
+    '対応策:' + #13#10 +
+    '  1) 上のログを確認してエラー原因を特定' + #13#10 +
+    '  2) 修正後、インストーラーを再実行 (graceful upgrade で復旧)' + #13#10 +
+    '  3) または管理者 PowerShell で手動再実行:' + #13#10 +
+    '     ' + ManualCmd,
+    mbError, MB_OK);
 end;
