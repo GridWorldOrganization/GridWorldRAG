@@ -4,6 +4,60 @@ All notable changes to GridWorldRAG (Windows canonical). Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.1.0] — 2026-04-26
+
+**Theme: pause/resume daemon control + mini-monitor toggle button**
+
+v1.0.0 の README で「実装は v1.1 で予定」と書いた pause/resume コントロール面を
+実装。daemon の **新規タスク取得を一時停止/再開** できるようになり、ミニモニタ
+に **⏸/▶ アイコンボタン** を配置。CI を Windows 11 matrix に拡張。
+
+### Added
+- `POST /api/daemon/pause` / `POST /api/daemon/resume` / `GET /api/daemon/state`
+  (transition-only `since` で「停止してからの経過時間」表示が信頼できる)
+- `/api/stats` レスポンスに `paused: bool` + `paused_since: ISO8601` を追加
+- ミニモニタの ⏸/▶ アイコントグルボタン (360px header に収まる icon-only)
+- paused 状態を `setIndicator` の独立 state に追加 (gray)、優先度
+  `err > paused > active > ok > idle`
+- 「停止中（手動停止）」ステータステキスト (README spec line 149 順守)
+- `daemon_config['paused']` 単一 JSON 行で race-free 永続化、サービス再起動後も
+  状態保持
+- GitHub Actions の `Lint` workflow に `windows-latest` matrix を追加 (`shell:
+  bash` で line-continuation を統一)
+
+### Changed
+- `_manager_iter` が pause 中 enqueue を skip。cancel-drain と finalize は継続
+  (in-flight ビルドの commit を保証)
+- Worker dispatch loop が pause 中 queue 残留 `list_full` / `list_delta` task を
+  drop (defense-in-depth)。`file` / `file_delete` / `finalize` は常に処理
+- `daemon_events.log_event()` 失敗を pause/resume API は try/except で吸収 (event
+  table エラーで control plane を落とさない)
+- `_stats_pump` が paused state も毎 5s 更新、加えて pause/resume API 内で
+  `_stats_cache` を **同期更新** (ミニモニタ button 反映が即時)
+- Lifespan startup で `_stats_cache.paused` を DB から bootstrap
+
+### Cleanup (in CI matrix PR)
+- F401 unused imports: `aws_bridge.logging`, `control_api.{Path,timezone}`,
+  `embedding.Optional`, `mcp_auth.os`, `rag_daemon.Tuple`, `reranker.Optional`
+- F811 `control_api.timezone` 二重 import (関数内 import のみ残す)
+- F841 `db.UniqueViolation as e` の unused `e`
+- E127 `api_set_user_scope` continuation indent
+- E306 `api_refresh_count` 内 nested `def _work():` 前の空行
+
+### Tests
+- 21 新規テスト 全 pass:
+  - `test_pause_helpers.py` (8): KV JSON、transition-only since、idempotency、
+    persistence、malformed JSON degradation、ISO Z 接尾辞 parse
+  - `test_control_api_pause.py` (6): endpoint flip state + cache push、
+    idempotent preserve since、_try_log_event swallows、end-to-end consistency
+  - `test_rag_daemon_pause.py` (7): manager skip enqueue when paused、normal
+    flow when not paused、finalize/cancel still run when paused、paused-read
+    failure handling、worker drop list_* only
+
+### Reviewed via
+- `/plan-eng-review` (HOLD_SCOPE) — 4 sections, 0 critical gaps
+- `/codex review` (outside voice) — 14 findings, all adopted
+
 ## [v1.0.0] — 2026-04-26
 
 **Theme: Windows-only canonical release — Mac line sunset**
