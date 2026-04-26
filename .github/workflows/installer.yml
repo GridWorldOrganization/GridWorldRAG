@@ -108,41 +108,45 @@ jobs:
         # regress.
         run: |
           choco install nssm --no-progress --yes
-          $candidates = @(
-            "C:\ProgramData\chocolatey\lib\NSSM\tools\win64\nssm.exe",
-            "C:\ProgramData\chocolatey\lib.installed\NSSM\tools\win64\nssm.exe"
-          )
-          $nssm = $null
-          foreach ($p in $candidates) {
-            if (Test-Path $p) { $nssm = $p; break }
+          # Find the REAL nssm.exe — NOT the Chocolatey shim.
+          #
+          # Choco's nssm package extracts arch-specific binaries somewhere
+          # under C:\ProgramData\chocolatey\, but the exact path varies:
+          # `lib\nssm\tools\win64\`, `lib.installed\nssm\tools\win64\`,
+          # and a few variants depending on choco version + cache state.
+          #
+          # Cheaper than guessing paths: recursive scan for nssm.exe,
+          # then filter by VersionInfo.FileDescription. The shim has
+          # "Chocolatey Shim"; the real binary has "the Non-Sucking
+          # Service Manager". Also keep a size>200KB safety net (real
+          # nssm-2.24 win64 is ~370KB; shim ~60KB).
+          Write-Host "--- Probing chocolatey directory for nssm.exe ---"
+          $allNssm = Get-ChildItem -Path "C:\ProgramData\chocolatey" -Recurse `
+            -Filter "nssm.exe" -ErrorAction SilentlyContinue |
+            ForEach-Object {
+              [pscustomobject]@{
+                Path  = $_.FullName
+                Size  = $_.Length
+                Desc  = $_.VersionInfo.FileDescription
+              }
+            }
+          $allNssm | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
+          # Keep only candidates that are REAL nssm (not shim) AND look like 64-bit.
+          $real = $allNssm | Where-Object {
+            $_.Size -gt 200000 -and
+            $_.Desc -notmatch "Shim" -and
+            ($_.Path -match "win64" -or $_.Path -notmatch "win32")
           }
-          if (-not $nssm) {
-            # Last-resort scan
-            $nssm = Get-ChildItem -Path "C:\ProgramData\chocolatey" -Recurse `
-              -Filter "nssm.exe" -ErrorAction SilentlyContinue |
-              Where-Object { $_.FullName -match "win64" -and $_.Length -gt 200000 } |
-              Select-Object -First 1 -ExpandProperty FullName
-          }
-          if (-not $nssm) {
-            Write-Error "Real nssm.exe not found in choco lib subtree"
+          if (-not $real) {
+            Write-Error "No real nssm.exe found anywhere under C:\ProgramData\chocolatey. Listed candidates above."
             exit 1
           }
-          $size = (Get-Item $nssm).Length
-          if ($size -lt 200000) {
-            Write-Error "nssm.exe at $nssm is only $size bytes — likely a shim, not the real binary"
-            exit 1
-          }
-          # Verify it's not a shim by checking VersionInfo. The shim has
-          # FileDescription containing "Chocolatey Shim". Real nssm
-          # has FileDescription "the Non-Sucking Service Manager".
-          $vi = (Get-Item $nssm).VersionInfo.FileDescription
-          if ($vi -match "Shim") {
-            Write-Error "nssm.exe at $nssm is a Chocolatey shim ($vi). Use the real binary."
-            exit 1
-          }
+          # Prefer one whose path explicitly contains "win64".
+          $win64 = $real | Where-Object { $_.Path -match "win64" } | Select-Object -First 1
+          $nssm = if ($win64) { $win64 } else { $real | Select-Object -First 1 }
           New-Item -ItemType Directory -Force -Path "installer/inno/assets" | Out-Null
-          Copy-Item -Force $nssm "installer/inno/assets/nssm.exe"
-          Write-Host "Copied REAL nssm.exe ($size bytes, '$vi') from $nssm"
+          Copy-Item -Force $nssm.Path "installer/inno/assets/nssm.exe"
+          Write-Host ("Copied REAL nssm.exe ({0} bytes, '{1}') from {2}" -f $nssm.Size, $nssm.Desc, $nssm.Path)
 
       - name: Resolve version
         id: ver
