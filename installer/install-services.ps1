@@ -198,6 +198,19 @@ foreach ($p in @($NssmExe, $ApiExe, $DaemonExe)) {
     }
 }
 
+# 1.0a v1.3.2: detect Chocolatey shim masquerading as nssm.exe.
+# The shim (~60KB) delegates to a real binary in choco's lib subtree
+# that doesn't exist on the operator's machine — every nssm call would
+# return exit -1 with "Cannot find file at '..\lib\NSSM\tools\...'".
+# Real nssm.exe 2.24 win64 is ~370KB. If we ever ship a shim again,
+# this throws fast with a clear message instead of failing mid-install.
+$nssmSize = (Get-Item $NssmExe).Length
+$nssmDesc = (Get-Item $NssmExe).VersionInfo.FileDescription
+if ($nssmSize -lt 200000 -or $nssmDesc -match "Shim") {
+    throw "nssm.exe at $NssmExe looks like a Chocolatey shim (size=$nssmSize, desc='$nssmDesc'). Real nssm-2.24 win64 is ~370KB and FileDescription does NOT contain 'Shim'. The CI workflow's `Install NSSM via choco` step is supposed to copy the REAL binary from C:\ProgramData\chocolatey\lib\NSSM\tools\win64\nssm.exe, not the shim from C:\ProgramData\chocolatey\bin\nssm.exe. Re-build the installer."
+}
+Log "nssm.exe verified ($nssmSize bytes, '$nssmDesc')"
+
 # 1.1 v1.3.2: clear any stale FAILED.txt sentinel from a prior install.
 # Inno Setup's CurStepChanged hook checks for this file's presence (NOT
 # its age — Inno Pascal Script doesn't expose FileAge). Removing it
