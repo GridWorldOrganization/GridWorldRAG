@@ -2,9 +2,40 @@
 // A tiny frameless-ish always-on-top window that shows health metrics
 // and has one button to open the full web UI in the default browser.
 
-const { app, BrowserWindow, shell, ipcMain, Menu } = require("electron");
+const { app, BrowserWindow, shell, ipcMain, Menu, dialog } = require("electron");
 const path = require("path");
-const sc = require("./service-control.js");
+
+// v1.3.2: catch unhandled exceptions in the main process. Without this,
+// a failure during init (e.g. require() of a missing module) shows the
+// default Electron error dialog and leaves the GPU helper / utility
+// child processes orphaned in the background after the user closes it.
+// Forcing app.exit() from the handler kills the whole process tree.
+process.on("uncaughtException", (err) => {
+  console.error("[main] uncaughtException:", err);
+  try {
+    if (app.isReady()) {
+      dialog.showErrorBox(
+        "WinServerRAG Mini — Fatal error",
+        String((err && err.stack) || err)
+      );
+    }
+  } catch {}
+  app.exit(1);
+});
+
+// v1.3.2: guard the service-control.js require. PR #34 fixed the asar
+// packaging miss that caused this to throw, but a top-level require()
+// is a footgun: any future bundle regression lands the user back in
+// the orphan-process state. Catch the error, defer the user-facing
+// dialog until app is ready, and exit cleanly so no helpers leak.
+let sc = null;
+let scLoadErr = null;
+try {
+  sc = require("./service-control.js");
+} catch (err) {
+  scLoadErr = err;
+  console.error("[main] failed to load service-control.js:", err);
+}
 
 const API_URL = process.env.WINSERVERRAG_API_URL || "http://127.0.0.1:17600";
 
@@ -60,7 +91,19 @@ function createWindow() {
   win.loadFile("index.html");
 }
 
-app.whenReady().then(createWindow);
+app.whenReady().then(() => {
+  if (scLoadErr) {
+    dialog.showErrorBox(
+      "WinServerRAG Mini — Bundle error",
+      "service-control.js is missing from the app bundle.\n\n" +
+        "This is an installer packaging bug. Please reinstall WinServerRAG.\n\n" +
+        String(scLoadErr)
+    );
+    app.exit(2);
+    return;
+  }
+  createWindow();
+});
 
 app.on("window-all-closed", () => {
   app.quit();
