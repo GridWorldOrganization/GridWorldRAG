@@ -128,6 +128,20 @@ async def _lifespan(_app):
         except Exception as e:
             log.error("startup mcp-user seed / pause bootstrap failed (non-fatal): %s", e)
 
+        # Bootstrap Windows service registration status into _stats_cache
+        # for the same reason. _stats_pump refreshes every 5s but the
+        # mini-monitor pulls /api/stats every 250ms, so the first 5s
+        # would otherwise show "未登録 (manual)" even on an NSSM-managed
+        # install.
+        try:
+            svc, managed_by = await asyncio.to_thread(_check_service_registration)
+            with _stats_lock:
+                _stats_cache["service_status"] = svc
+                _stats_cache["service_managed_by"] = managed_by
+            log.info("service registration: managed_by=%s", managed_by)
+        except Exception as e:
+            log.warning("startup service-status bootstrap failed (non-fatal): %s", e)
+
         # Fix C: prime the Google Drive service once at startup so requests
         # don't block on OAuth refresh. _get_service() now just returns the
         # cached handle.
@@ -532,6 +546,20 @@ _stats_cache: dict = {
     # via /api/stats and toggles the ⏸/▶ button accordingly.
     "paused": False,
     "paused_since": None,
+    # Windows service registration status. Populated by _stats_pump every
+    # 5s via `sc query`. Two services we care about: WinServerRAG-API and
+    # WinServerRAG-Daemon. Each entry is {registered: bool, running: bool}.
+    # When both registered + running, the operator deployed via the v1.2
+    # installer; otherwise they're running ad-hoc from a venv (dev mode).
+    "service_status": {
+        "WinServerRAG-API":    {"registered": False, "running": False},
+        "WinServerRAG-Daemon": {"registered": False, "running": False},
+    },
+    # Convenience derived field:
+    #   "nssm"    — both services registered via NSSM (production)
+    #   "partial" — exactly one service registered (broken install)
+    #   "manual"  — neither registered (dev mode, venv-launched)
+    "service_managed_by": "manual",
     # Device info (GPU vs CPU). Static fields are probed once at startup;
     # dynamic VRAM / util are refreshed in _stats_pump via nvidia-smi.
     "device": {
@@ -562,6 +590,49 @@ def _probe_device_static() -> dict:
         pass
     return {"kind": "cpu", "name": None, "total_vram_mb": None,
             "used_vram_mb": None, "util_pct": None, "power_w": None}
+
+
+def _check_service_registration() -> tuple[dict, str]:
+    """Probe WinServerRAG-API / WinServerRAG-Daemon Windows service status.
+
+    Uses `sc query <name>` which returns rc=0 + "STATE : RUNNING" line if
+    the service is registered AND running, rc=0 + "STATE : STOPPED" if
+    registered but down, and rc=1060 (1 here) if not registered.
+
+    Each call is bounded to 2 s so a hung Service Control Manager can't
+    stall the stats pump. On non-Windows hosts (CI Linux) sc.exe is
+    absent and we return all-false silently — the field is populated as
+    "manual" which matches the dev-mode reality on those platforms.
+
+    Returns (per-service dict, derived_managed_by_label).
+    """
+    import subprocess
+    services = ("WinServerRAG-API", "WinServerRAG-Daemon")
+    out = {}
+    for name in services:
+        registered = False
+        running = False
+        try:
+            r = subprocess.run(
+                ["sc", "query", name],
+                capture_output=True, text=True, timeout=2,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if r.returncode == 0:
+                registered = True
+                # `sc query` output line: "        STATE              : 4  RUNNING"
+                running = "RUNNING" in (r.stdout or "")
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            pass
+        out[name] = {"registered": registered, "running": running}
+    regs = sum(1 for v in out.values() if v["registered"])
+    if regs == len(services):
+        managed_by = "nssm"
+    elif regs == 0:
+        managed_by = "manual"
+    else:
+        managed_by = "partial"
+    return out, managed_by
 
 
 def _probe_gpu_live() -> dict | None:
@@ -619,6 +690,17 @@ async def _stats_pump():
             with _stats_lock:
                 _stats_cache["pg_ok"] = False
                 _stats_cache["last_updated"] = _time.time()
+
+        # Service registration check is OS-level (`sc query`), not DB —
+        # runs even if the PG block above failed. 2s timeout per service.
+        try:
+            svc, managed_by = await _a.to_thread(_check_service_registration)
+            with _stats_lock:
+                _stats_cache["service_status"] = svc
+                _stats_cache["service_managed_by"] = managed_by
+        except Exception:
+            # Leave the cached value alone on transient failure.
+            pass
 
         # GPU live telemetry (only if we detected CUDA at startup)
         if _stats_cache["device"].get("kind") == "cuda":
