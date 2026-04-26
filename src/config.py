@@ -9,11 +9,35 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# v1.3.2: honor the WINSERVERRAG_CONFIG_DIR env var that the installer
+# (installer/install-services.ps1) sets via NSSM AppEnvironmentExtra.
+# Without this, a PyInstaller-bundled service resolves PROJECT_ROOT to
+# its frozen bundle root (e.g. C:\Program Files\WinServerRAG\bin\
+# winserverrag-daemon\_internal\) and never finds the operator's
+# config at %ProgramData%\WinServerRAG\config\config.v2.env. The
+# service exits 1 with "no config.env found" and NSSM crash-loops it.
+#
+# Fallback chain:
+#   1) WINSERVERRAG_CONFIG_DIR env var (production: set by installer)
+#   2) PROJECT_ROOT/config/                (dev: running from repo)
+#
+# DATA_ROOT is derived from CONFIG_DIR's parent so logs/lock dirs land
+# next to config under %ProgramData%\WinServerRAG\ instead of inside
+# the read-only Program Files bundle.
+_env_config_dir = os.environ.get("WINSERVERRAG_CONFIG_DIR")
+if _env_config_dir:
+    CONFIG_DIR = Path(_env_config_dir).resolve()
+    DATA_ROOT = CONFIG_DIR.parent
+else:
+    CONFIG_DIR = PROJECT_ROOT / "config"
+    DATA_ROOT = PROJECT_ROOT
+
 # Config path lookup: prefer the versioned v2 file, fall back to legacy.
 # Both are tried in order; the first that exists is loaded.
 CONFIG_PATH_CANDIDATES = [
-    PROJECT_ROOT / "config" / "config.v2.env",
-    PROJECT_ROOT / "config" / "config.env",
+    CONFIG_DIR / "config.v2.env",
+    CONFIG_DIR / "config.env",
 ]
 CONFIG_PATH: Path | None = None  # set by load_config()
 
@@ -74,7 +98,23 @@ def _env_float(name: str, default: float) -> float:
 GOOGLE_EMAIL = _env("GOOGLE_EMAIL")
 GOOGLE_CLIENT_ID = _env("GOOGLE_OAUTH_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = _env("GOOGLE_OAUTH_CLIENT_SECRET")
-TOKEN_PATH = PROJECT_ROOT / _env("GOOGLE_TOKEN_PATH", "config/token.pickle")
+# Token path resolution. Three forms supported:
+#   1) Absolute path → used as-is
+#   2) Legacy "config/foo" prefix → resolved under DATA_ROOT (= repo
+#      root in dev, %ProgramData%\WinServerRAG in prod). Backward compat
+#      for installs whose config.v2.env carries the pre-v1.3.2 default.
+#   3) Plain relative → resolved under CONFIG_DIR (alongside config.v2.env)
+#
+# Pre-v1.3.2 always used PROJECT_ROOT, which broke installed services
+# (PyInstaller bundle = read-only Program Files subtree).
+_token_setting = _env("GOOGLE_TOKEN_PATH", "token.pickle")
+_token_path = Path(_token_setting)
+if _token_path.is_absolute():
+    TOKEN_PATH = _token_path
+elif _token_setting.replace("\\", "/").startswith("config/"):
+    TOKEN_PATH = DATA_ROOT / _token_setting
+else:
+    TOKEN_PATH = CONFIG_DIR / _token_setting
 
 # --- PostgreSQL ---
 PG_HOST = _env("PGHOST", "localhost")
@@ -122,7 +162,11 @@ API_PORT = _env_int("API_PORT", 17600)
 API_BEARER_TOKEN = _env("API_BEARER_TOKEN", "")
 
 # --- Derived paths ---
-LOGS_DIR = PROJECT_ROOT / "logs"
-LOGS_DIR.mkdir(exist_ok=True)
-LOCK_DIR = PROJECT_ROOT / "run"
-LOCK_DIR.mkdir(exist_ok=True)
+# In production these resolve under %ProgramData%\WinServerRAG\
+# (created by the installer with users-modify perms). In dev they
+# resolve next to the repo. parents=True so a fresh ProgramData layout
+# without a pre-created run\ directory still works.
+LOGS_DIR = DATA_ROOT / "logs"
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
+LOCK_DIR = DATA_ROOT / "run"
+LOCK_DIR.mkdir(parents=True, exist_ok=True)

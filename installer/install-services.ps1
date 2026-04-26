@@ -220,6 +220,35 @@ foreach ($d in @($ConfigDir, $LogDir)) {
     }
 }
 
+# 2.5 v1.3.2: lock down the config directory ACL.
+#
+# config.v2.env contains GOOGLE_OAUTH_CLIENT_SECRET, PGPASSWORD, and
+# (optionally) API_BEARER_TOKEN. Inno Setup's [Dirs] only ADDS explicit
+# ACEs — it does not break inherited ACEs from %ProgramData% which by
+# default grants Authenticated Users read access to subdirectories.
+# Without this step, any local user can `type config.v2.env` and harvest
+# the credentials.
+#
+# After this:
+#   Administrators : Full control (operators editing config)
+#   SYSTEM         : Full control (services run as LocalSystem by default)
+#   <nobody else>  : no access
+#
+# Logs and backup dirs stay user-readable/writable (no secrets there).
+Log "Hardening config dir ACL: $ConfigDir"
+$null = & icacls.exe $ConfigDir /inheritance:r /Q 2>$null
+if ($LASTEXITCODE -ne 0) {
+    Write-Warning "icacls /inheritance:r failed (exit $LASTEXITCODE) — config dir may still allow Users:read"
+}
+$null = & icacls.exe $ConfigDir /grant:r 'Administrators:(OI)(CI)F' /Q 2>$null
+if ($LASTEXITCODE -ne 0) {
+    Write-Warning "icacls grant Administrators failed (exit $LASTEXITCODE)"
+}
+$null = & icacls.exe $ConfigDir /grant:r 'SYSTEM:(OI)(CI)F' /Q 2>$null
+if ($LASTEXITCODE -ne 0) {
+    Write-Warning "icacls grant SYSTEM failed (exit $LASTEXITCODE)"
+}
+
 # 3. Local Operators group — create-if-missing, idempotent.
 if (-not (Group-Exists $OperatorGroup)) {
     Log "Creating local group: $OperatorGroup"

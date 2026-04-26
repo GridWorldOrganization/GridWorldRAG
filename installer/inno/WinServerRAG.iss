@@ -103,9 +103,17 @@ Source: "..\..\LICENSE";     DestDir: "{app}\docs"; Flags: ignoreversion
 Source: "..\install-services.ps1"; DestDir: "{app}\bin"; Flags: ignoreversion
 
 [Dirs]
-; Per-machine writable dirs. Permissions: standard users can write logs
-; and run backups, but cannot edit config (admin-only).
-Name: "{commonappdata}\{#AppName}\config";  Permissions: users-readexec admins-modify
+; Per-machine writable dirs.
+;
+; v1.3.2: config dir is admin-only. install-services.ps1 follows up
+; with `icacls /inheritance:r /grant:r Administrators:(OI)(CI)F
+; SYSTEM:(OI)(CI)F` to BREAK inheritance from %ProgramData% (which
+; otherwise grants Authenticated Users read access). Inno's
+; [Dirs] Permissions only adds explicit ACEs, it does not strip
+; inherited ones — that's why the icacls call is required for the
+; secrets in config.v2.env (GOOGLE_OAUTH_CLIENT_SECRET, PGPASSWORD,
+; API_BEARER_TOKEN) to actually be admin-only readable.
+Name: "{commonappdata}\{#AppName}\config";  Permissions: admins-full
 Name: "{commonappdata}\{#AppName}\logs";    Permissions: users-modify
 Name: "{commonappdata}\{#AppName}\backups"; Permissions: users-modify
 Name: "{commonappdata}\{#AppName}\backups\daily";  Permissions: users-modify
