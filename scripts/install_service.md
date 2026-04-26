@@ -1,33 +1,60 @@
 # サービス運用メモ
 
+## 推奨: インストーラー経由 (v1.2.0+)
+
+```
+dist\WinServerRAG-Setup-1.2.0.exe
+```
+
+を管理者として実行すれば、以下が自動で行われます:
+
+- exe 4 本 (`winserverrag-api`, `winserverrag-daemon`, `winserverrag-dbinit`,
+  `winserverrag-backup`) + Electron ミニモニタを `%ProgramFiles%\WinServerRAG\` に配置
+- NSSM による Windows サービス 2 本登録 + auto-start:
+  - `WinServerRAG-API` (port 17600)
+  - `WinServerRAG-Daemon` (`DependOnService = WinServerRAG-API`)
+- ログローテーション (10MB 上限)、`%ProgramData%\WinServerRAG\logs\` 配下
+- スタートメニューにミニモニタ + Web Console ショートカット
+- アンインストール時に上記 2 サービスを stop + remove
+
+ビルド方法は [installer/README.md](../installer/README.md) 参照。
+
 ## ポリシー: Task Scheduler 禁止
 
 本プロジェクトでは Windows タスクスケジューラへの登録は行わない。
 バックアップも自動起動も、タスクスケジューラ経由では組まない。
 
 - 理由: バックグラウンドで勝手に PowerShell / cmd が起動する挙動を避けるため。
-- 代替: 必要なものは手動起動、または NSSM による Windows サービス化のみ。
+- 代替: NSSM による Windows サービス化のみ (上記インストーラーが自動で行う)。
 
-## 起動プロセス一覧
+## 起動プロセス一覧 (本番)
 
-実運用では 3 本のプロセスを常駐させる:
+インストーラーが登録する 2 サービス:
 
-1. `src.control_api` — Web UI + REST API（ポート `API_PORT`、デフォルト 17600）
-2. `src.rag_daemon` — インデックス構築デーモン（4 並列ワーカー）
-3. `src.aws_bridge` — SQS/DDB ブリッジ（リモート Cowork からの MCP クエリ中継）
+1. `WinServerRAG-API` — Web UI + REST API (port `API_PORT`、デフォルト 17600)
+2. `WinServerRAG-Daemon` — インデックス構築デーモン (4 並列ワーカー)
+
+オプション: `aws_bridge` (リモート Cowork 接続) は v1.2 インストーラーでは
+未登録。必要な場合は下記「手動 NSSM 登録」のセクションで追加してください。
+v1.3+ で自動登録予定。
 
 ## バックアップ
 
-`scripts/backup.bat` を手動実行して下さい。自動化はしません。
+インストーラー配下では `winserverrag-backup.exe` を手動実行:
+
+```powershell
+& "C:\Program Files\WinServerRAG\bin\winserverrag-backup\winserverrag-backup.exe"
+```
 
 - 保持: 日次 7 世代、週次 (日曜) 4 世代
-- 保存先: `backups/daily/*.dump` と `backups/weekly/*.dump`
+- 保存先: `%ProgramData%\WinServerRAG\backups\daily\*.dump` と
+  `%ProgramData%\WinServerRAG\backups\weekly\*.dump`
 - 復元: `pg_restore -U postgres -d winserverrag --clean --if-exists <file>.dump`
 - 保存先変更: `WINSRV_BACKUP_DIR` 環境変数で上書き
 
-## 手動起動（開発・実験時）
+## 開発時の手動起動
 
-別々のターミナルで各プロセスを起動:
+開発機では venv 経由で直接起動するのが楽 (再ビルド不要):
 
 ```powershell
 cd C:\claude_code\dev\WinServerRAG
@@ -44,10 +71,9 @@ cd C:\claude_code\dev\WinServerRAG
 
 各ターミナルは開いたままにする。閉じるとプロセスが停止する。
 
-## NSSM (Non-Sucking Service Manager) による常駐化
+## 手動 NSSM 登録 (インストーラーを使わない場合)
 
-管理者権限がある場合のみ推奨。タスクスケジューラではなく Windows サービス
-として登録する。
+管理者権限がある場合のみ推奨。インストーラーが行うのと同じことを手動で。
 
 ### 入手
 
@@ -58,7 +84,7 @@ winget install NSSM.NSSM
 choco install nssm
 ```
 
-### サービス登録（管理者 PowerShell）
+### サービス登録 (管理者 PowerShell)
 
 ```powershell
 $ROOT = "C:\claude_code\dev\WinServerRAG"

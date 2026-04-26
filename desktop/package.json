@@ -1,14 +1,36 @@
 {
   "name": "winserverrag-mini-monitor",
-  "version": "0.1.0",
+  "version": "1.2.0",
   "description": "Small always-on-top desktop monitor for WinServerRAG. Shows daemon health + a button to open the full web UI.",
   "main": "main.js",
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "pack": "electron-builder --dir --win",
+    "dist": "electron-builder --win"
   },
-  "author": "",
+  "author": "GridJapan",
   "license": "MIT",
   "devDependencies": {
-    "electron": "^33.0.0"
+    "electron": "^33.0.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "co.gridworld.winserverrag.mini",
+    "productName": "WinServerRAG Mini",
+    "directories": {
+      "output": "../dist/desktop"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer.js",
+      "index.html",
+      "package.json"
+    ],
+    "win": {
+      "target": "dir",
+      "artifactName": "winserverrag-mini-${version}.${ext}"
+    },
+    "asar": true
   }
 }

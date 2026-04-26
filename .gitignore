@@ -26,9 +26,17 @@ pg_data/
 pg17/
 models/
 data/
+backups/
 
 # Build artifacts (pgvector source clone, compile outputs, one-off admin scripts)
 build/
+
+# Installer pipeline outputs and downloaded vendor binaries.
+# `dist/` holds PyInstaller bundles, electron-builder output, and the
+# final WinServerRAG-Setup-*.exe. `installer/inno/assets/nssm.exe` is
+# downloaded by installer/build.ps1 on first run.
+dist/
+installer/inno/assets/nssm.exe
 
 # Node / Electron
 node_modules/
