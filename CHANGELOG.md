@@ -4,6 +4,93 @@ All notable changes to GridWorldRAG (Windows canonical). Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.3.0] — 2026-04-26
+
+**Theme: ミニモニタを daemon SCM 直結に格上げ — API 不通でも状態が見える**
+
+ミニモニタが API のライフサイクルから独立。daemon の状態を Windows SCM
+(`sc query`) から直接取得するため、API が落ちていても daemon の
+「実行中 / 停止中 / 未インストール」が正しく表示される。停止中 daemon は
+**UAC 不要で起動**できる (インストーラーが SDDL を緩和)。
+
+### Added
+
+- `desktop/service-control.js` (NEW): pure-Node ヘルパー。
+  - `parseScQueryOutput()` — `STATE : N` の数値 parse (locale 非依存)
+  - `queryService()` — Electron main から `%SystemRoot%\System32\sc.exe` 直叩き
+  - `classifyStartExit()` — sc start exit code 細別 (0/5/1056/1060/1068/1053)
+  - `startService()` — UAC なし起動 (SDDL 緩和済前提)
+  - `detectDevMode()` — `.venv\Scripts\python.exe` 検出で dev mode 判定
+- `desktop/__tests__/service-control.test.js` (NEW): Node native test 25 件
+- `installer/install-services.ps1` (NEW): NSSM 登録 + SDDL 緩和の冪等スクリプト
+  - `WinServerRAG Operators` ローカルグループ作成
+  - インストーラー実行ユーザーをグループに add
+  - SDDL `(A;;LCRP;;;<SID-of-Operators>)` で SERVICE_QUERY_STATUS +
+    SERVICE_START のみ付与 (SERVICE_STOP は付与しない、AU でなく
+    Operators — Microsoft 推奨パターン)
+  - 既存サービスを検出して params のみ更新する真の冪等性
+  - `-Uninstall` モードで stop + remove + group 削除
+
+### Changed
+
+- `desktop/main.js` + `desktop/preload.js`: IPC `daemon-status` (5s
+  ポーリング) と `daemon-start` (▶ クリック時) を追加
+- `desktop/renderer.js`:
+  - **Daemon 行が API から独立**: `pollDaemon()` 5s ループで `sc query`
+    結果を直接反映
+  - Button state machine 拡張 (5 → 8 状態): running / paused /
+    start_pending / stop_pending / continue_pending / pause_pending /
+    paused / stopped / not_installed (dev|prod)
+  - `showErr()` (API 接続失敗時) は build 行・統計のみクリア、
+    daemon 行は触らない (v1.3 の主要な約束)
+  - `showDevModeDialog()`: dev mode 検出時に `python -m src.rag_daemon`
+    コマンドを Ctrl+C コピー可能な形で表示
+  - `showNotInstalledDialog()`: 本番未インストール時にインストーラー
+    実行を案内 (mini-monitor は **install しない**)
+- `desktop/index.html`: row label "サービス" → "Daemon" (id 据置で
+  renderer 側差分最小)
+- `installer/inno/WinServerRAG.iss`: `[Run]` の長い NSSM コマンド列
+  (~80 行) を `install-services.ps1` 1 invocation に置換。
+  `[UninstallRun]` も同 PS1 -Uninstall に置換。`[Files]` で
+  `install-services.ps1` を `{app}\bin\` へ配置
+
+### Reviewed via
+
+- `/plan-eng-review` (HOLD_SCOPE) — 4 sections、12 issues found+resolved
+- `/codex review` (outside voice、ChatGPT 認証) — **12 findings 全採用**:
+  - SDDL は AU でなく `WinServerRAG Operators` ローカルグループ
+  - SERVICE_STOP は付与しない (button が stop しないため)
+  - State 数値 parse (`STATE : 4`)、localized text 不依存
+  - sc.exe フルパス使用 (PATH 非依存)
+  - Pending states 独立表示 (黃 + spinner)
+  - sc start error code 細別 (5/1056/1060/1068/1053)
+  - NSSM install 冪等化 (detect+update、blind install しない)
+  - 2-stream UI 合成 (showErr が daemon 行を触らない)
+
+### Tests
+
+- 既存 28 Python tests 全 pass (PR #28 の 7 件含む、後方互換)
+- 新規 25 Node native tests 全 pass:
+  - parseScQueryOutput: 12 cases (各 STATE 数値 + edge cases)
+  - classifyStartExit: 7 cases (主要 exit code + unknown)
+  - scExePath: 3 cases (env var + fallback)
+  - detectDevMode: 2 cases
+  - exports surface: 1 case
+
+### Notes
+
+- ミニモニタは **install / uninstall を絶対に行わない**。インストール
+  は v1.2 インストーラーの責務。security boundary 永久
+- v1.3 では path manifest / dev mode auto-spawn は scope 外
+  (Codex 指摘で v1.4 候補に降格)
+- pause/resume は引き続き API 経由 (v1.1)。Daemon SCM 操作は
+  Electron main 直接
+
+### PRs merged
+
+- #29 docs: v1.3 mini-monitor ↔ daemon protocol spec
+- #30 feat(mini-monitor): daemon SCM control + ACL relaxation
+
 ## [v1.2.0] — 2026-04-26
 
 **Theme: 4 .exe + Inno Setup インストーラー (.bat → exe 移行)**
