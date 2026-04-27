@@ -129,13 +129,36 @@ function testPgConnection(params) {
           // failed for user", "database X does not exist", etc) over Node's
           // generic "Command failed" wrapper. stderr is what the operator
           // needs to fix the problem.
+          //
+          // v1.3.4 fix: when stderr is empty (psql aborted before writing —
+          // typically DLL load failure, ENOENT, or sandbox/permissions),
+          // surface diagnostic fields so the operator (and we) can tell
+          // WHAT went wrong instead of seeing "Command failed: <cmd>" alone.
           const stderrText = String(stderr || "").trim();
-          const errorText = stderrText.length > 0
-            ? stderrText
-            : String((err && err.message) || err);
+          const stdoutText = String(stdout || "").trim();
+          const diag = [];
+          if (err.code !== undefined && err.code !== null) diag.push(`code=${err.code}`);
+          if (err.errno !== undefined && err.errno !== null) diag.push(`errno=${err.errno}`);
+          if (err.signal) diag.push(`signal=${err.signal}`);
+          if (err.killed) diag.push("killed=true (timeout?)");
+          let errorText;
+          if (stderrText) {
+            errorText = stderrText;
+          } else if (stdoutText) {
+            errorText = `(no stderr, stdout=${stdoutText})`;
+          } else {
+            errorText = String((err && err.message) || err);
+          }
+          if (diag.length) errorText += `  [${diag.join(", ")}]`;
+          // Hint: ENOENT means the binary path is wrong — almost always
+          // a "PostgreSQL not installed at expected path" issue.
+          if (err.code === "ENOENT") {
+            errorText += "\n\n(psql.exe が見つかりません。PostgreSQL 17 を C:\\Program Files\\PostgreSQL\\17\\ にインストールしてください)";
+          }
           resolve({
             ok: false,
-            error: errorText.slice(0, 500),
+            error: errorText.slice(0, 800),
+            psqlPath: psql,
           });
           return;
         }
