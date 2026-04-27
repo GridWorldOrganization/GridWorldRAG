@@ -144,13 +144,19 @@ async def _lifespan(_app):
 
         # Fix C: prime the Google Drive service once at startup so requests
         # don't block on OAuth refresh. _get_service() now just returns the
-        # cached handle.
+        # cached handle. Skip when token.pickle is missing — otherwise the
+        # OAuth flow opens an interactive local-server callback that hangs
+        # forever in service context.
         global _service
-        try:
-            _service = await asyncio.to_thread(dc.authenticate)
-            log.info("Drive service pre-authenticated at startup")
-        except Exception as e:
-            log.warning("Drive pre-auth failed (will lazy-retry on demand): %s", e)
+        from pathlib import Path as _Path
+        if _Path(dc.TOKEN_PATH).exists():
+            try:
+                _service = await asyncio.to_thread(dc.authenticate)
+                log.info("Drive service pre-authenticated at startup")
+            except Exception as e:
+                log.warning("Drive pre-auth failed (will lazy-retry on demand): %s", e)
+        else:
+            log.warning("token.pickle missing — skipping Drive pre-auth; complete OAuth via wizard or bootstrap script")
 
         # Background pumps
         asyncio.create_task(_event_pump())
@@ -159,7 +165,7 @@ async def _lifespan(_app):
         yield
 
 
-app = FastAPI(title="WinServerRAG Control API", version="0.6.1", lifespan=_lifespan)
+app = FastAPI(title="WinServerRAG Control API", version="1.4.0", lifespan=_lifespan)
 
 
 class _NoCacheStaticMiddleware(BaseHTTPMiddleware):
@@ -1018,8 +1024,8 @@ async def ws_events(ws: WebSocket):
 # ---------------------------------------------------------------------
 def main() -> int:
     import uvicorn
-    uvicorn.run("src.control_api:app",
-                host=config.API_HOST, port=config.API_PORT, reload=False, log_level="info")
+    uvicorn.run(app,
+                host=config.API_HOST, port=config.API_PORT, log_level="info")
     return 0
 
 
