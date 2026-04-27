@@ -290,6 +290,17 @@ $ec = Invoke-Native { icacls.exe $ConfigDir /grant:r 'SYSTEM:(OI)(CI)F' /Q }
 if ($ec -ne 0) {
     Write-Warning "icacls grant SYSTEM failed (exit $ec)"
 }
+# v1.3.3: also grant the operator user direct access. The Setup Wizard
+# (WinServerRAG Setup.exe) runs as the operator without UAC elevation,
+# so it needs write access to drop config.v2.env. Without this grant,
+# the wizard's Apply step fails with EPERM. Other local users still
+# can't read secrets — only the explicitly named operator account.
+if ($OperatorUser) {
+    $ec = Invoke-Native { icacls.exe $ConfigDir /grant:r "${OperatorUser}:(OI)(CI)F" /Q }
+    if ($ec -ne 0) {
+        Write-Warning "icacls grant operator '$OperatorUser' failed (exit $ec) — wizard may need elevation"
+    }
+}
 
 # 3. Local Operators group — create-if-missing, idempotent.
 if (-not (Group-Exists $OperatorGroup)) {

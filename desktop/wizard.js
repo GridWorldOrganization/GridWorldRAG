@@ -45,7 +45,8 @@ const STATE = {
 };
 
 let stepIdx = 0;
-const TOTAL_STEPS = 9;
+// v1.3.3: was 9 — step 5 (Apply / 書き出し) folded into step 4 onNext.
+const TOTAL_STEPS = 8;
 
 function setStatus(text, kind) {
   const el = $("status");
@@ -361,35 +362,14 @@ const steps = [
       STATE.indexing.EMBEDDING_DEVICE = $("ix-device").value;
       STATE.indexing.BATCH_SIZE = $("ix-batch").value || "64";
       STATE.indexing.DAEMON_WORKER_THREADS = $("ix-threads").value || "4";
-      return true;
-    },
-  },
-
-  // 5. Apply / write config.v2.env
-  {
-    title: "設定書き出し",
-    render: async () => {
-      setBack(true);
-      $("step-host").innerHTML = `
-        <h2>設定書き出し</h2>
-        <p class="subtitle">入力した内容を config.v2.env に書き出します。</p>
-        <div class="card">
-          <div class="icon">📄</div>
-          <div class="body">
-            <div class="name">書き出し先</div>
-            <div class="detail">%ProgramData%\\WinServerRAG\\config\\config.v2.env</div>
-          </div>
-        </div>
-        <div class="msg warn">
-          この操作は admin-only ACL のディレクトリに書き込みます。<br/>
-          既存の config.v2.env がある場合は config.v2.env.bak にバックアップされます。
-        </div>
-        <div id="write-result"></div>
-      `;
-      setNext("書き出す", true);
-    },
-    onNext: async () => {
-      setStatus("書き出し中...", null);
+      // v1.3.3: auto-write config.v2.env on transition out of step 4.
+      // The previous "Step 5: Apply" page asking the operator to confirm
+      // and click "書き出す" was redundant — they had no choice of
+      // destination, no preview, and the only info added was a 2-line
+      // warning. The action is now implicit; failure surfaces in the
+      // wizard footer status. On EPERM, fall through to a clearer
+      // error message that points at the icacls grant requirement.
+      setStatus("config.v2.env に書き出し中...", null);
       const values = {
         ...STATE.google,
         ...STATE.postgres,
@@ -398,18 +378,24 @@ const steps = [
       };
       const r = await W.writeConfig(values);
       if (r.ok) {
-        setStatus(`書き出し完了 (${r.bytes} bytes)`, "ok");
-        $("write-result").innerHTML = `<div class="msg ok">✅ ${escapeHtml(r.path)} (${r.bytes} bytes)</div>`;
+        setStatus(`config.v2.env 保存完了 (${r.bytes} bytes)`, "ok");
         return true;
-      } else {
-        setStatus("書き出し失敗", "err");
-        $("write-result").innerHTML = `<div class="msg err">❌ ${escapeHtml(r.error)}</div>`;
-        return "stay";
       }
+      // EPERM = config dir ACL doesn't include the operator user.
+      // Inline the icacls fix as a copy-paste hint so the operator
+      // can resolve in one elevated command.
+      const isAcl = /EPERM|EACCES|operation not permitted|access is denied/i.test(r.error || "");
+      const hint = isAcl
+        ? `\n\n権限不足です。管理者 PowerShell で以下を実行してから再試行してください:\n  icacls "C:\\ProgramData\\WinServerRAG\\config" /grant "$env:USERNAME:(OI)(CI)F"`
+        : "";
+      setStatus(`書き出し失敗: ${r.error}${hint}`, "err");
+      // Inline status only — keep the user on this step but don't
+      // force a separate "Apply" page.
+      return "stay";
     },
   },
 
-  // 6. db_init
+  // 5 (was 6): db_init
   {
     title: "DB スキーマ初期化",
     render: async () => {
@@ -457,7 +443,7 @@ const steps = [
     },
   },
 
-  // 7. Start services
+  // 6 (was 7): Start services
   {
     title: "サービス起動",
     render: async () => {
@@ -514,7 +500,7 @@ const steps = [
     },
   },
 
-  // 8. Done
+  // 7 (was 8): Done
   {
     title: "完了",
     render: async () => {
