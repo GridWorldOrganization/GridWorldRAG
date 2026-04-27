@@ -34,6 +34,44 @@ function bundledExe(name) {
   return path.join(appRoot(), "bin", `winserverrag-${name}`, `winserverrag-${name}.exe`);
 }
 
+// v1.3.7: dev-mode fallback. When running under `npm start` (Electron
+// from node_modules), the bundled .exe doesn't exist — those are
+// produced by PyInstaller in the installer build. Walk up looking for
+// the repo's .venv\Scripts\python.exe so the wizard can still drive
+// `python -m src.db_init` (or other modules) end-to-end during dev
+// testing. Returns null if no venv found (caller falls back to .exe).
+function resolveDevPython() {
+  let dir = process.execPath;
+  for (let i = 0; i < 6; i++) {
+    dir = path.dirname(dir);
+    if (!dir || dir === path.dirname(dir)) break;
+    const venvPython = path.join(dir, ".venv", "Scripts", "python.exe");
+    const srcDir = path.join(dir, "src");
+    if (fs.existsSync(venvPython) && fs.existsSync(srcDir)) {
+      return { python: venvPython, repoRoot: dir };
+    }
+  }
+  return null;
+}
+
+// Returns { exe, args, cwd } for invoking a daemon helper. In production
+// uses the PyInstaller bundle; in dev uses `python -m src.<module>`.
+function resolveDaemonHelper(name) {
+  const exe = bundledExe(name);
+  if (fs.existsSync(exe)) {
+    return { exe, args: [], cwd: undefined };
+  }
+  const dev = resolveDevPython();
+  if (dev) {
+    // dbinit → src.db_init, daemon → src.rag_daemon, etc.
+    const moduleMap = { dbinit: "src.db_init", daemon: "src.rag_daemon",
+                        api: "src.control_api", backup: "src.db_backup" };
+    const mod = moduleMap[name] || `src.${name}`;
+    return { exe: dev.python, args: ["-m", mod], cwd: dev.repoRoot };
+  }
+  return { exe, args: [], cwd: undefined }; // bad path; caller will surface ENOENT
+}
+
 
 // ---------------------------------------------------------------------
 // Step 2: prerequisites — PG service running? pgvector available?
@@ -87,74 +125,142 @@ async function prereqCheck() {
 // For now, simpler approach: spawn psql via choco/pg's bin folder.
 // Falls back to "no test, just save" if psql isn't on PATH.
 // ---------------------------------------------------------------------
-// v1.3.6: TCP-only port reachability test (no psql subprocess).
+// v1.3.7: PG Client wire-protocol test (auth-validating).
 //
-// History of failed approaches:
-//   PR #47: hardcode PGDATABASE='postgres'  → fixed "DB doesn't exist"
-//   PR #53: surface stderr / err.code        → diagnostic only, no fix
-//   PR #55: stdin.end() + 15s timeout        → still hangs at 15s SIGTERM
+// History:
+//   PR #47–55: psql.exe subprocess approaches — all hung from Electron
+//   PR #56:    net.connect TCP-only — verifies port but NOT auth.
+//              Real-user feedback: "passed even with empty password" 😬
 //
-// Root cause we couldn't shake: psql.exe launched from Electron's main
-// process consistently hangs until SIGTERM. Same binary, same env, same
-// command works in <1s from a normal console node REPL. The exact
-// mechanism (Job Object inheritance? AppContainer? GUI-vs-console
-// stdio?) was never pinned down.
+// Final answer: use the `pg` npm package (pure JS implementation of the
+// PG wire protocol, including SCRAM-SHA-256). `pg.Client.connect()` does
+// the full handshake — TCP + StartupMessage + auth challenge/response +
+// SELECT 1. Reports the real error (FATAL: password authentication
+// failed for user, etc.) when something is wrong.
 //
-// New approach: skip psql entirely. Use Node's net.connect to verify the
-// PG port is reachable. That answers the "is PG listening at this
-// host:port?" question, which is the most common operator mistake at
-// this step (wrong port, PG not running, firewall blocking). Auth + DB
-// existence are deferred to Step 6 (db_init), which spawns
-// winserverrag-dbinit.exe — that goes through psycopg + libpq, not psql,
-// so it works fine.
+// pg is bundled into the asar via package.json `dependencies` + the
+// `node_modules/**/*` entry in build.files. No subprocess, no DLL loads,
+// no Electron sandbox surprises — pure JS sockets.
 //
-// What we still don't catch here:
-//   - Wrong password         → caught by db_init step
-//   - Missing target DB      → db_init creates it (the form hint already
-//                              tells the operator this)
-//   - Wrong PG user          → caught by db_init
+// What we now validate:
+//   ✅ Host/port reachable
+//   ✅ Username valid
+//   ✅ Password correct (SCRAM-SHA-256 / md5 / trust)
+//   ✅ Database 'postgres' exists (always does on a fresh PG install)
+//
+// Still deferred to Step 6 (db_init):
+//   - Target DB ('winserverrag') creation
+//   - Schema (winserverrag_main + per-FD schemas)
+//   - pgvector extension load
 function testPgConnection(params) {
-  const net = require("node:net");
-  const { host, port } = params || {};
+  // v1.3.7: collectPg() in wizard.js uses ENV-VAR style keys (PGHOST,
+  // PGPORT, PGUSER, PGPASSWORD). The pre-PR-#56 psql code passed those
+  // through to env { ... } so the case mismatch went unnoticed.
+  // Accept either spelling here so the IPC contract is robust.
+  const p0 = params || {};
+  const host     = p0.host     || p0.PGHOST     || "";
+  const port     = p0.port     || p0.PGPORT     || "";
+  const user     = p0.user     || p0.PGUSER     || "";
+  const password = p0.password || p0.PGPASSWORD || "";
   let h = host || "localhost";
-  // Force IPv4 loopback to avoid any IPv6/IPv4 mismatch with PG's
-  // listen_addresses on Windows.
+  // Force IPv4 loopback to avoid IPv6/IPv4 mismatch with PG's
+  // listen_addresses on Windows (PG's default 'localhost' is IPv4-only
+  // unless explicitly extended).
   if (h === "localhost") h = "127.0.0.1";
   const p = parseInt(port || "5432", 10);
-  return new Promise((resolve) => {
-    const t0 = Date.now();
-    const socket = new net.Socket();
-    let settled = false;
-    const finish = (result) => {
-      if (settled) return;
-      settled = true;
-      try { socket.destroy(); } catch {}
-      resolve(result);
-    };
-    socket.setTimeout(5000);
-    socket.once("connect", () => {
-      const elapsed = Date.now() - t0;
-      finish({
-        ok: true,
-        stdout: `TCP接続成功 (${h}:${p}, ${elapsed}ms)`,
-        note: "ポート到達のみ確認。認証・DB 存在チェックは Step 6 (db_init) で行います。",
-      });
+  let Client;
+  try {
+    ({ Client } = require("pg"));
+  } catch (e) {
+    return Promise.resolve({
+      ok: false,
+      error: `pg module not bundled: ${e.message}`,
     });
-    socket.once("error", (err) => {
-      finish({
-        ok: false,
-        error: `TCP接続失敗 (${h}:${p}): ${err.code || err.message || err}`,
-      });
+  }
+  // Early reject — pg's SCRAM client throws an opaque "client password
+  // must be a string" if password is empty. Better to fail fast with a
+  // clear operator-facing message.
+  if (!password) {
+    return Promise.resolve({
+      ok: false,
+      error: "パスワードを入力してください。",
     });
-    socket.once("timeout", () => {
-      finish({
-        ok: false,
-        error: `TCP接続タイムアウト (${h}:${p}, 5s)。PostgreSQL サービスが起動しているか確認してください。`,
-      });
-    });
-    try { socket.connect(p, h); }
-    catch (e) { finish({ ok: false, error: `connect error: ${e.message || e}` }); }
+  }
+  const client = new Client({
+    host: h,
+    port: p,
+    user: user || "postgres",
+    password: password || "",
+    database: "postgres", // system DB, always exists
+    connectionTimeoutMillis: 5000,
+    statement_timeout: 5000,
+    query_timeout: 5000,
+    // v1.3.7: force English error messages. JP-locale PG installs send
+    // localized messages encoded in cp932 even when client_encoding is
+    // UTF8, which surfaces in the Wizard UI as mojibake. lc_messages=C
+    // pins the messages to ASCII English so the operator sees readable
+    // codes like "FATAL: password authentication failed for user".
+    options: "-c lc_messages=C",
   });
+  return (async () => {
+    const t0 = Date.now();
+    try {
+      await client.connect();
+      const r = await client.query("SELECT 1 AS one");
+      const elapsed = Date.now() - t0;
+      try { await client.end(); } catch {}
+      return {
+        ok: true,
+        stdout: `接続成功 (${h}:${p}, ${user || "postgres"}, ${elapsed}ms, ${r.rows[0].one === 1 ? "SELECT 1 OK" : "SELECT 1 ?"})`,
+        note: "認証 + 'postgres' DB への接続を確認しました。target DB ('winserverrag') は Step 6 (db_init) で作成されます。",
+      };
+    } catch (err) {
+      try { await client.end(); } catch {}
+      // Surface the specific PG error code with an ENGLISH description.
+      //
+      // Why we don't use err.message: on JP-Windows PG-17 installs the
+      // server's default lc_messages is Japanese_Japan.932. Auth errors
+      // are generated DURING the startup phase, BEFORE any GUC param
+      // (including our options="-c lc_messages=C") takes effect. The
+      // message bytes come out in cp932 but are labeled UTF-8 on the
+      // wire — the pg lib decodes them as UTF-8, U+FFFD replacements
+      // appear, and we can't recover the original. Hardcoded English
+      // mapping per SQLSTATE is the only reliable cross-locale display.
+      const PG_ERR = {
+        // Class 28: Invalid Authorization Specification
+        "28P01": "Password authentication failed for user",
+        "28000": "Invalid authorization specification",
+        // Class 3D: Invalid Catalog Name
+        "3D000": "Database does not exist",
+        // Class 53: Insufficient Resources
+        "53300": "Too many connections",
+        "53400": "Configuration limit exceeded",
+        // Class 57: Operator Intervention
+        "57P03": "Cannot connect now (server starting up)",
+        "57P01": "Server is shutting down",
+        // Class 08: Connection Exception
+        "08000": "Connection exception",
+        "08001": "SQL client unable to connect",
+        "08003": "Connection does not exist",
+        "08004": "Server rejected connection",
+        "08006": "Connection failure",
+        "08P01": "Protocol violation",
+      };
+      const code = err && err.code ? err.code : null;
+      const enText = code && PG_ERR[code];
+      // Fallback: use err.message if we don't have a mapping. Most
+      // unmapped errors are non-localized (e.g. ECONNREFUSED, ENOTFOUND
+      // from Node net) so they display fine.
+      const msg = enText || (err.message || String(err));
+      const userFromForm = (params && (params.user || params.PGUSER)) || "postgres";
+      // For 28P01 the operator wants to know which user's password failed.
+      const detail = code === "28P01" ? `: "${userFromForm}"` : "";
+      return {
+        ok: false,
+        error: `${msg}${detail}${code ? ` [code=${code}]` : ""}`,
+      };
+    }
+  })();
 }
 
 
@@ -250,12 +356,26 @@ function writeConfig(values) {
 // ---------------------------------------------------------------------
 function runDbInit(sender) {
   return new Promise((resolve) => {
-    const exe = bundledExe("dbinit");
+    const { exe, args, cwd } = resolveDaemonHelper("dbinit");
     if (!fs.existsSync(exe)) {
-      resolve({ ok: false, error: `dbinit exe not found at ${exe}` });
+      resolve({ ok: false, error: `db_init invocation not resolvable: ${exe} ${args.join(" ")}` });
       return;
     }
-    const child = spawn(exe, [], { windowsHide: true });
+    // v1.3.7: in dev mode, the Python child needs WINSERVERRAG_CONFIG_DIR
+    // explicitly set so it reads the wizard-written %ProgramData%
+    // \WinServerRAG\config\config.v2.env (and not the legacy
+    // <repo>\config path that src/config.py defaults to without the env
+    // var). In production the bundled exe inherits this from NSSM's
+    // AppEnvironmentExtra, but in dev the Python is invoked directly.
+    const childEnv = {
+      ...process.env,
+      WINSERVERRAG_CONFIG_DIR: _ctx.configCheck.configDir(),
+      PYTHONUTF8: "1",
+      PYTHONIOENCODING: "utf-8",
+    };
+    try { sender.send("wizard:db-init-log", `[wizard] spawning: ${exe} ${args.join(" ")}${cwd ? ` (cwd=${cwd})` : ""}`); } catch {}
+    try { sender.send("wizard:db-init-log", `[wizard] WINSERVERRAG_CONFIG_DIR=${childEnv.WINSERVERRAG_CONFIG_DIR}`); } catch {}
+    const child = spawn(exe, args, { windowsHide: true, cwd, env: childEnv });
     let buf = "";
     const onChunk = (chunk) => {
       buf += chunk.toString("utf-8");

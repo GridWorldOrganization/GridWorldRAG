@@ -190,12 +190,31 @@ const steps = [
           </div>
         </div>
         <div class="field">
-          <label>パスワード</label>
-          <input type="password" id="pg-pw" value="${v.PGPASSWORD}" />
+          <label>パスワード <span class="hint" style="font-weight:normal;text-transform:none">(${(v.PGPASSWORD || "").length} 文字)</span></label>
+          <div style="display:flex;gap:6px;align-items:stretch">
+            <input type="password" id="pg-pw" value="${v.PGPASSWORD}" style="flex:1" autocomplete="off" autocorrect="off" spellcheck="false" />
+            <button type="button" id="pg-pw-toggle" class="btn" style="padding:0 12px" title="表示/非表示">👁</button>
+          </div>
+          <div class="hint" id="pg-pw-len"></div>
         </div>
-        <button id="pg-test" class="btn test">接続テスト (TCP)</button>
+        <button id="pg-test" class="btn test">接続テスト (認証込み)</button>
         <div id="pg-test-result"></div>
       `;
+      // v1.3.7: password show/hide toggle + live char count.
+      // Real-user feedback: typed 13 chars when target was 12 — couldn't
+      // see the typo because the field is masked. Toggle reveals the
+      // actual value so they can verify before clicking test.
+      const updatePwLen = () => {
+        const v = $("pg-pw").value;
+        $("pg-pw-len").textContent = `(現在 ${v.length} 文字)`;
+      };
+      $("pg-pw").addEventListener("input", updatePwLen);
+      updatePwLen();
+      $("pg-pw-toggle").addEventListener("click", () => {
+        const inp = $("pg-pw");
+        inp.type = inp.type === "password" ? "text" : "password";
+        $("pg-pw-toggle").textContent = inp.type === "password" ? "👁" : "🙈";
+      });
       $("pg-test").addEventListener("click", async () => {
         // v1.3.4: clear previous result the moment the test fires so the
         // user doesn't see stale "❌ 接続失敗: ..." lingering during the
@@ -554,6 +573,10 @@ function escapeHtml(s) {
 }
 
 async function go() {
+  // v1.3.7: clear stale footer status on step transition. Without this,
+  // "接続 OK" from step 2's PG test stays visible while the operator is
+  // already on step 3 (OAuth) — confusing.
+  setStatus("");
   renderPip();
   await steps[stepIdx].render();
 }

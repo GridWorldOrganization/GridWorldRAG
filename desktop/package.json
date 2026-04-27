@@ -1,6 +1,6 @@
 {
   "name": "winserverrag-mini-monitor",
-  "version": "1.2.0",
+  "version": "1.4.0",
   "description": "Small always-on-top desktop monitor for WinServerRAG. Shows daemon health + a button to open the full web UI.",
   "main": "main.js",
   "scripts": {
@@ -32,12 +32,16 @@
       "wizard-ipc.js",
       "service-control.js",
       "config-check.js",
-      "package.json"
+      "package.json",
+      "node_modules/**/*"
     ],
     "win": {
       "target": "dir",
       "artifactName": "winserverrag-mini-${version}.${ext}"
     },
     "asar": true
+  },
+  "dependencies": {
+    "pg": "^8.20.0"
   }
 }
