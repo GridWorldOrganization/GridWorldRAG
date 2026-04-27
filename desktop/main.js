@@ -248,8 +248,13 @@ app.whenReady().then(() => {
     return;
   }
   console.log(`[main] mode=${MODE} execPath=${process.execPath}`);
+  // v1.3.4: register the wizard IPC handlers regardless of mode. Mini's
+  // launch-wizard CTA used to spawn Setup.exe as a separate process; v1.3.4
+  // opens the wizard as a CHILD MODAL of the Mini window instead. That
+  // requires Mini's main process to handle the wizard:* IPC channels too.
+  // wizard-ipc.js is idempotent on re-call so this is safe.
+  wizardIpc.register({ ipcMain, app, dialog, sc, configCheck, services: { api: API_SERVICE, daemon: DAEMON_SERVICE } });
   if (MODE === "wizard") {
-    wizardIpc.register({ ipcMain, app, dialog, sc, configCheck, services: { api: API_SERVICE, daemon: DAEMON_SERVICE } });
     createWizardWindow();
   } else {
     createMiniWindow();
@@ -317,23 +322,68 @@ ipcMain.handle("config-check", async () => {
   return configCheck.checkConfig();
 });
 
-// v1.3.2: launch the Setup Wizard from Mini Monitor. The wizard exe is
-// a renamed copy of this same Electron binary at "{app}\mini\WinServerRAG
-// Setup.exe". We compute its path from execPath so the same code works
-// regardless of install location.
+// v1.3.4: launch the Setup Wizard as a CHILD MODAL of the Mini Monitor
+// window. Previously this spawned Setup.exe as a separate process. Modal
+// behavior matches operator's mental model — Mini Monitor is the home
+// surface, the Wizard is a transient configuration dialog that should
+// disable Mini until completed/cancelled.
+//
+// Setup.exe (a renamed copy of this binary) still works as a standalone
+// Start Menu launcher for the case where Mini isn't running yet (first-
+// time setup).
+let _wizardChild = null;
 ipcMain.handle("launch-wizard", async () => {
+  if (_wizardChild && !_wizardChild.isDestroyed()) {
+    _wizardChild.focus();
+    return { ok: true, focused: true };
+  }
   try {
-    const dir = path.dirname(process.execPath);
-    const wizardExe = path.join(dir, "WinServerRAG Setup.exe");
-    if (require("fs").existsSync(wizardExe)) {
-      shell.openPath(wizardExe);
-      return { ok: true, path: wizardExe };
-    }
-    // Fallback: spawn ourselves with --mode=wizard. Useful in dev where
-    // the renamed exe doesn't exist (npm run pack only produces Mini.exe).
-    const { spawn } = require("node:child_process");
-    spawn(process.execPath, ["--mode=wizard"], { detached: true, stdio: "ignore" }).unref();
-    return { ok: true, path: process.execPath, fallback: "self+arg" };
+    _wizardChild = new BrowserWindow({
+      width: 720,
+      height: 560,
+      minWidth: 640,
+      minHeight: 480,
+      resizable: true,
+      maximizable: false,
+      fullscreenable: false,
+      title: "WinServerRAG Setup Wizard",
+      backgroundColor: "#0f1115",
+      parent: win,
+      modal: true,
+      show: false,
+      webPreferences: {
+        preload: path.join(__dirname, "preload-wizard.js"),
+        contextIsolation: true,
+        nodeIntegration: false,
+      },
+    });
+    _wizardChild.setMenuBarVisibility(false);
+    // Same clipboard-only context menu as the parent (PR #52).
+    _wizardChild.webContents.on("context-menu", (event, params) => {
+      const m = Menu.buildFromTemplate([
+        { role: "cut",       enabled: params.editFlags.canCut },
+        { role: "copy",      enabled: params.editFlags.canCopy },
+        { role: "paste",     enabled: params.editFlags.canPaste },
+        { type: "separator" },
+        { role: "selectAll", enabled: params.editFlags.canSelectAll },
+      ]);
+      m.popup();
+    });
+    _wizardChild.webContents.on("render-process-gone", (_e, details) => {
+      console.error("[wizard child] renderer gone:", details);
+      try {
+        dialog.showErrorBox(
+          "WinServerRAG Setup — Renderer crashed",
+          `Reason: ${details.reason}\nExit code: ${details.exitCode}`
+        );
+      } catch {}
+      try { _wizardChild.destroy(); } catch {}
+      _wizardChild = null;
+    });
+    _wizardChild.on("closed", () => { _wizardChild = null; });
+    _wizardChild.once("ready-to-show", () => _wizardChild.show());
+    await _wizardChild.loadFile("wizard.html");
+    return { ok: true, modal: true };
   } catch (err) {
     return { ok: false, error: String(err) };
   }

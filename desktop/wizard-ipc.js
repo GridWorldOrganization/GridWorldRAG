@@ -317,8 +317,16 @@ async function serviceStatus() {
 // ---------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------
+// v1.3.4: idempotent. main.js now calls register() unconditionally so
+// the Mini Monitor process can host wizard:* IPC channels (the wizard
+// is opened as a child modal of Mini, not a separate Setup.exe
+// process). Calling ipcMain.handle twice on the same channel throws,
+// so guard with a one-shot flag — subsequent calls just refresh _ctx.
+let _registered = false;
 function register(ctx) {
   _ctx = ctx;
+  if (_registered) return;
+  _registered = true;
   const { ipcMain, app } = ctx;
   const { shell } = require("electron");
 
@@ -348,8 +356,19 @@ function register(ctx) {
     shell.openExternal("http://127.0.0.1:17600/");
     return { ok: true };
   });
-  ipcMain.handle("wizard:launch-mini", () => {
+  ipcMain.handle("wizard:launch-mini", (e) => {
     try {
+      // v1.3.4: when the wizard is a child modal of Mini (current
+      // launch-wizard flow), Mini is already alive as our parent
+      // window. Focus it instead of spawning another instance.
+      const { BrowserWindow } = require("electron");
+      const w = BrowserWindow.fromWebContents(e.sender);
+      const parent = w && w.getParentWindow();
+      if (parent && !parent.isDestroyed()) {
+        parent.focus();
+        return { ok: true, focused: true };
+      }
+      // Standalone Setup.exe — spawn Mini.exe.
       const dir = path.dirname(process.execPath);
       const miniExe = path.join(dir, "WinServerRAG Mini.exe");
       if (fs.existsSync(miniExe)) {
@@ -358,12 +377,24 @@ function register(ctx) {
         // dev fallback: spawn ourselves with --mode=mini
         spawn(process.execPath, ["--mode=mini"], { detached: true, stdio: "ignore" }).unref();
       }
-      return { ok: true };
+      return { ok: true, spawned: true };
     } catch (err) {
       return { ok: false, error: String(err) };
     }
   });
-  ipcMain.handle("wizard:close", () => { app.quit(); return { ok: true }; });
+  // v1.3.4: close only the originating wizard window. When the wizard
+  // is a child modal of Mini, calling app.quit() would kill Mini too.
+  // Closing the specific BrowserWindow leaves Mini alive; for the
+  // standalone Setup.exe case (no parent), the closed event triggers
+  // window-all-closed → app.quit() naturally.
+  ipcMain.handle("wizard:close", (e) => {
+    try {
+      const { BrowserWindow } = require("electron");
+      const w = BrowserWindow.fromWebContents(e.sender);
+      if (w) w.close();
+    } catch {}
+    return { ok: true };
+  });
 }
 
 module.exports = { register };
