@@ -145,11 +145,22 @@ function createMiniWindow() {
   win.on("unresponsive", () => {
     console.warn("[main] renderer unresponsive");
   });
-  // v1.3.3: suppress the default Chromium context menu (right-click /
-  // Context Menu keyboard key). The default has Reload / Save / Print /
-  // Inspect / etc. which look unprofessional on a polished UI window.
-  // The Debug submenu set up below still works via Ctrl+Shift+I.
-  win.webContents.on("context-menu", (e) => e.preventDefault());
+  // v1.3.3: replace the default Chromium context menu with a minimal
+  // clipboard-only menu. The default has Reload / Save / Print /
+  // Inspect / etc. which look unprofessional. But we DO want the
+  // operator to be able to Cut/Copy/Paste in input fields — PR #51
+  // suppressed the menu entirely which broke that. v1.3.4 puts Cut/
+  // Copy/Paste/Select All back, omits the rest.
+  win.webContents.on("context-menu", (event, params) => {
+    const m = Menu.buildFromTemplate([
+      { role: "cut",       enabled: params.editFlags.canCut },
+      { role: "copy",      enabled: params.editFlags.canCopy },
+      { role: "paste",     enabled: params.editFlags.canPaste },
+      { type: "separator" },
+      { role: "selectAll", enabled: params.editFlags.canSelectAll },
+    ]);
+    m.popup();
+  });
   win.setMenuBarVisibility(false);
   // Hidden accelerators: menu is not visible but accelerators still fire.
   // Lets the user pop DevTools / reload / force-refresh when diagnosing the UI.
@@ -198,11 +209,19 @@ function createWizardWindow() {
     } catch {}
     app.exit(3);
   });
-  // v1.3.3: suppress the default Chromium context menu (see Mini window
-  // comment). The Wizard renders form inputs; the default menu's Cut /
-  // Copy / Paste items conflict with the polished step-by-step UX.
-  // Standard keyboard shortcuts (Ctrl+C / Ctrl+V) still work.
-  win.webContents.on("context-menu", (e) => e.preventDefault());
+  // v1.3.3: minimal clipboard-only context menu. See Mini window
+  // for rationale — Wizard renders form inputs so Cut/Copy/Paste must
+  // be available. v1.3.4 puts them back, omits Reload/Save/Inspect/etc.
+  win.webContents.on("context-menu", (event, params) => {
+    const m = Menu.buildFromTemplate([
+      { role: "cut",       enabled: params.editFlags.canCut },
+      { role: "copy",      enabled: params.editFlags.canCopy },
+      { role: "paste",     enabled: params.editFlags.canPaste },
+      { type: "separator" },
+      { role: "selectAll", enabled: params.editFlags.canSelectAll },
+    ]);
+    m.popup();
+  });
   win.setMenuBarVisibility(false);
   const menu = Menu.buildFromTemplate([{
     label: "Debug", visible: false, submenu: [
