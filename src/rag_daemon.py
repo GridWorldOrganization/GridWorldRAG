@@ -739,6 +739,14 @@ def main() -> int:
                     if gc["workers_removed"]:
                         log.warning("zombie cleanup: removed worker rows %s",
                                     gc["workers_removed"])
+                        # Evict the zombie wids from the in-process dict so
+                        # _live_worker_count() drops below target and the
+                        # next pool-maintenance pass spawns a fresh worker.
+                        # The blocked thread itself stays alive (Python can't
+                        # force-kill threads) but it no longer pins a slot.
+                        with _workers_lock:
+                            for wid in gc["workers_removed"]:
+                                _workers.pop(wid, None)
                     if gc["drives_reset"]:
                         log.warning("zombie cleanup: reset stuck drives %s",
                                     gc["drives_reset"])
