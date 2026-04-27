@@ -122,7 +122,24 @@ function testPgConnection(params) {
       "psql.exe", // PATH lookup as last resort
     ];
     const psql = candidates.find((p) => p === "psql.exe" || fs.existsSync(p)) || candidates[candidates.length - 1];
-    execFile(psql, ["-c", "SELECT 1"], { env, timeout: 5000, windowsHide: true },
+    // v1.3.5: bump timeout 5s→15s + explicitly close stdin.
+    //
+    // Symptom: when psql is launched from an Electron renderer-side
+    // exec (Setup.exe / Mini.exe modal), it consistently exceeded the
+    // 5s timeout (signal=SIGTERM, killed=true) even though the same
+    // command from a console node REPL completes in <1s.
+    //
+    // Hypothesis: Electron's main process is a GUI subsystem with no
+    // attached console. With windowsHide:true the child psql is launched
+    // without a console either, and on some Win32 versions psql then
+    // sits waiting on stdin for an EOF signal that never arrives. The
+    // SIGTERM after 5s confirms it's a hang, not a slow query.
+    //
+    // Fix: explicitly end the child's stdin so psql sees EOF
+    // immediately. Also bump the wall-clock timeout to 15s in case the
+    // first invocation is slow due to DLL warm-up / Windows Defender
+    // ETW scan / etc.
+    const child = execFile(psql, ["-c", "SELECT 1"], { env, timeout: 15000, windowsHide: true },
       (err, stdout, stderr) => {
         if (err) {
           // v1.3.3 fix: prefer psql's stderr ("FATAL: password authentication
@@ -164,6 +181,9 @@ function testPgConnection(params) {
         }
         resolve({ ok: true, stdout: String(stdout).slice(0, 200) });
       });
+    // v1.3.5: close child stdin immediately so psql sees EOF and
+    // proceeds without waiting on a non-existent terminal handle.
+    try { if (child && child.stdin) child.stdin.end(); } catch {}
   });
 }
 
