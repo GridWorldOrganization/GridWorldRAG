@@ -87,103 +87,73 @@ async function prereqCheck() {
 // For now, simpler approach: spawn psql via choco/pg's bin folder.
 // Falls back to "no test, just save" if psql isn't on PATH.
 // ---------------------------------------------------------------------
+// v1.3.6: TCP-only port reachability test (no psql subprocess).
+//
+// History of failed approaches:
+//   PR #47: hardcode PGDATABASE='postgres'  → fixed "DB doesn't exist"
+//   PR #53: surface stderr / err.code        → diagnostic only, no fix
+//   PR #55: stdin.end() + 15s timeout        → still hangs at 15s SIGTERM
+//
+// Root cause we couldn't shake: psql.exe launched from Electron's main
+// process consistently hangs until SIGTERM. Same binary, same env, same
+// command works in <1s from a normal console node REPL. The exact
+// mechanism (Job Object inheritance? AppContainer? GUI-vs-console
+// stdio?) was never pinned down.
+//
+// New approach: skip psql entirely. Use Node's net.connect to verify the
+// PG port is reachable. That answers the "is PG listening at this
+// host:port?" question, which is the most common operator mistake at
+// this step (wrong port, PG not running, firewall blocking). Auth + DB
+// existence are deferred to Step 6 (db_init), which spawns
+// winserverrag-dbinit.exe — that goes through psycopg + libpq, not psql,
+// so it works fine.
+//
+// What we still don't catch here:
+//   - Wrong password         → caught by db_init step
+//   - Missing target DB      → db_init creates it (the form hint already
+//                              tells the operator this)
+//   - Wrong PG user          → caught by db_init
 function testPgConnection(params) {
-  const { host, port, user, password } = params || {};
+  const net = require("node:net");
+  const { host, port } = params || {};
+  let h = host || "localhost";
+  // Force IPv4 loopback to avoid any IPv6/IPv4 mismatch with PG's
+  // listen_addresses on Windows.
+  if (h === "localhost") h = "127.0.0.1";
+  const p = parseInt(port || "5432", 10);
   return new Promise((resolve) => {
-    // v1.3.2 fix B8: minimal env to the child. Forwarding the full
-    // process.env leaks anything the wizard process picked up
-    // (WINSERVERRAG_API_BEARER_TOKEN if set, OAuth tokens, etc.).
-    // psql only needs PG* vars + SystemRoot/Path for DLL resolution
-    // on Windows.
-    //
-    // v1.3.3 fix B-PG: hardcode PGDATABASE='postgres' for the connection
-    // test. The target DB (user-entered, default 'winserverrag') doesn't
-    // exist yet — db_init creates it later. The form's hint already says
-    // 'db_init 実行時に作成されます (まだ無くて OK)' but the test was
-    // still using the target DB and silently failing on every fresh
-    // install. 'postgres' is the always-existing system database.
-    const env = {
-      SystemRoot: process.env.SystemRoot || "C:\\Windows",
-      PATH: process.env.PATH || process.env.Path || "",
-      Path: process.env.Path || process.env.PATH || "",
-      TEMP: process.env.TEMP || process.env.TMP || "C:\\Windows\\Temp",
-      TMP:  process.env.TMP  || process.env.TEMP || "C:\\Windows\\Temp",
-      PGHOST: host || "localhost",
-      PGPORT: port || "5432",
-      PGUSER: user || "postgres",
-      PGPASSWORD: password || "",
-      PGDATABASE: "postgres",
+    const t0 = Date.now();
+    const socket = new net.Socket();
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      try { socket.destroy(); } catch {}
+      resolve(result);
     };
-    // psql is usually at C:\Program Files\PostgreSQL\<ver>\bin\psql.exe.
-    const candidates = [
-      "C:\\Program Files\\PostgreSQL\\17\\bin\\psql.exe",
-      "C:\\Program Files\\PostgreSQL\\16\\bin\\psql.exe",
-      "C:\\Program Files\\PostgreSQL\\15\\bin\\psql.exe",
-      "psql.exe", // PATH lookup as last resort
-    ];
-    const psql = candidates.find((p) => p === "psql.exe" || fs.existsSync(p)) || candidates[candidates.length - 1];
-    // v1.3.5: bump timeout 5s→15s + explicitly close stdin.
-    //
-    // Symptom: when psql is launched from an Electron renderer-side
-    // exec (Setup.exe / Mini.exe modal), it consistently exceeded the
-    // 5s timeout (signal=SIGTERM, killed=true) even though the same
-    // command from a console node REPL completes in <1s.
-    //
-    // Hypothesis: Electron's main process is a GUI subsystem with no
-    // attached console. With windowsHide:true the child psql is launched
-    // without a console either, and on some Win32 versions psql then
-    // sits waiting on stdin for an EOF signal that never arrives. The
-    // SIGTERM after 5s confirms it's a hang, not a slow query.
-    //
-    // Fix: explicitly end the child's stdin so psql sees EOF
-    // immediately. Also bump the wall-clock timeout to 15s in case the
-    // first invocation is slow due to DLL warm-up / Windows Defender
-    // ETW scan / etc.
-    const child = execFile(psql, ["-c", "SELECT 1"], { env, timeout: 15000, windowsHide: true },
-      (err, stdout, stderr) => {
-        if (err) {
-          // v1.3.3 fix: prefer psql's stderr ("FATAL: password authentication
-          // failed for user", "database X does not exist", etc) over Node's
-          // generic "Command failed" wrapper. stderr is what the operator
-          // needs to fix the problem.
-          //
-          // v1.3.4 fix: when stderr is empty (psql aborted before writing —
-          // typically DLL load failure, ENOENT, or sandbox/permissions),
-          // surface diagnostic fields so the operator (and we) can tell
-          // WHAT went wrong instead of seeing "Command failed: <cmd>" alone.
-          const stderrText = String(stderr || "").trim();
-          const stdoutText = String(stdout || "").trim();
-          const diag = [];
-          if (err.code !== undefined && err.code !== null) diag.push(`code=${err.code}`);
-          if (err.errno !== undefined && err.errno !== null) diag.push(`errno=${err.errno}`);
-          if (err.signal) diag.push(`signal=${err.signal}`);
-          if (err.killed) diag.push("killed=true (timeout?)");
-          let errorText;
-          if (stderrText) {
-            errorText = stderrText;
-          } else if (stdoutText) {
-            errorText = `(no stderr, stdout=${stdoutText})`;
-          } else {
-            errorText = String((err && err.message) || err);
-          }
-          if (diag.length) errorText += `  [${diag.join(", ")}]`;
-          // Hint: ENOENT means the binary path is wrong — almost always
-          // a "PostgreSQL not installed at expected path" issue.
-          if (err.code === "ENOENT") {
-            errorText += "\n\n(psql.exe が見つかりません。PostgreSQL 17 を C:\\Program Files\\PostgreSQL\\17\\ にインストールしてください)";
-          }
-          resolve({
-            ok: false,
-            error: errorText.slice(0, 800),
-            psqlPath: psql,
-          });
-          return;
-        }
-        resolve({ ok: true, stdout: String(stdout).slice(0, 200) });
+    socket.setTimeout(5000);
+    socket.once("connect", () => {
+      const elapsed = Date.now() - t0;
+      finish({
+        ok: true,
+        stdout: `TCP接続成功 (${h}:${p}, ${elapsed}ms)`,
+        note: "ポート到達のみ確認。認証・DB 存在チェックは Step 6 (db_init) で行います。",
       });
-    // v1.3.5: close child stdin immediately so psql sees EOF and
-    // proceeds without waiting on a non-existent terminal handle.
-    try { if (child && child.stdin) child.stdin.end(); } catch {}
+    });
+    socket.once("error", (err) => {
+      finish({
+        ok: false,
+        error: `TCP接続失敗 (${h}:${p}): ${err.code || err.message || err}`,
+      });
+    });
+    socket.once("timeout", () => {
+      finish({
+        ok: false,
+        error: `TCP接続タイムアウト (${h}:${p}, 5s)。PostgreSQL サービスが起動しているか確認してください。`,
+      });
+    });
+    try { socket.connect(p, h); }
+    catch (e) { finish({ ok: false, error: `connect error: ${e.message || e}` }); }
   });
 }
 

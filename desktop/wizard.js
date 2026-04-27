@@ -193,7 +193,7 @@ const steps = [
           <label>パスワード</label>
           <input type="password" id="pg-pw" value="${v.PGPASSWORD}" />
         </div>
-        <button id="pg-test" class="btn test">接続テスト (psql)</button>
+        <button id="pg-test" class="btn test">接続テスト (TCP)</button>
         <div id="pg-test-result"></div>
       `;
       $("pg-test").addEventListener("click", async () => {
@@ -207,7 +207,8 @@ const steps = [
         STATE.pgTestResult = r;
         const box = $("pg-test-result");
         if (r.ok) {
-          box.innerHTML = `<div class="msg ok">✅ 接続成功 (SELECT 1 が通りました)</div>`;
+          const note = r.note ? `<div class="hint" style="margin-top:4px">${escapeHtml(r.note)}</div>` : "";
+          box.innerHTML = `<div class="msg ok">✅ ${escapeHtml(r.stdout || "接続成功")}</div>${note}`;
           setStatus("接続 OK", "ok");
         } else {
           // Use <pre> so multi-line diag (with code=N etc) wraps nicely.
