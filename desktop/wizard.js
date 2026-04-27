@@ -304,13 +304,35 @@ const steps = [
     render: async () => {
       setBack(true);
       const v = STATE.indexing;
+      // v1.3.3: dropdown of curated 768-dim multilingual models. The
+      // PG schema uses `vector(768)` (config.py EMBEDDING_DIM=768), so
+      // models with different dim would crash on insert. Free-form
+      // text input let users type model names that broke the daemon
+      // silently. If config.v2.env had a custom value not in this
+      // list (e.g., from manual edit), it shows up as a "(config から)"
+      // option to preserve existing setups.
+      const KNOWN_MODELS = [
+        { value: "paraphrase-multilingual-mpnet-base-v2",
+          label: "paraphrase-multilingual-mpnet-base-v2 (推奨、768d、~500MB、日本語+50言語)" },
+        { value: "intfloat/multilingual-e5-base",
+          label: "intfloat/multilingual-e5-base (新世代 E5、768d、~500MB)" },
+      ];
+      const cur = v.EMBEDDING_MODEL || KNOWN_MODELS[0].value;
+      const isKnown = KNOWN_MODELS.some((m) => m.value === cur);
+      const opts = KNOWN_MODELS.map((m) => {
+        const sel = m.value === cur ? " selected" : "";
+        return `<option value="${escapeHtml(m.value)}"${sel}>${escapeHtml(m.label)}</option>`;
+      }).join("");
+      const customOpt = !isKnown
+        ? `<option value="${escapeHtml(cur)}" selected>${escapeHtml(cur)} (既存 config から)</option>`
+        : "";
       $("step-host").innerHTML = `
         <h2>インデックス設定</h2>
-        <p class="subtitle">推奨のままで問題ありません。後から config.v2.env を編集して変更できます。</p>
+        <p class="subtitle">推奨のままで問題ありません。後から config.v2.env を編集して変更できます (要 reindex)。</p>
         <div class="field">
           <label>埋め込みモデル</label>
-          <input type="text" id="ix-model" value="${v.EMBEDDING_MODEL}" />
-          <div class="hint">変更すると初回起動時にモデルを再ダウンロード (~500MB)</div>
+          <select id="ix-model">${opts}${customOpt}</select>
+          <div class="hint">PG schema は vector(768) 固定なので 768 次元モデルのみ。変更すると初回起動時にモデルを再ダウンロード + 全 chunk を reindex (~時間〜日)。</div>
         </div>
         <div class="row">
           <div class="field">
