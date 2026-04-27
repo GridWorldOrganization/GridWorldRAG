@@ -14,6 +14,12 @@ Claude Cowork / Claude Desktop / 任意の MCP クライアントから **MCP (M
 > 🔧 **運用**: 4 並列ワーカー、自動差分同期、ゾンビ GC、障害耐性
 
 <p align="center">
+  <img src="docs/screenshots/web-ui.png" alt="WinServerRAG Web Monitor — full operational console at http://127.0.0.1:17600/">
+</p>
+
+<p align="center"><sub>Web Monitor (`http://127.0.0.1:17600/`)。GPU 利用率・worker カード・ドライブ一覧・MCP 検索設定タブを 1 画面で。FastAPI 上で動く SPA、Mini Monitor と同じ `/api/stats` を裏で叩く。</sub></p>
+
+<p align="center">
   <img src="docs/screenshots/mini-monitor.png" alt="WinServerRAG Mini Monitor — always-on-top desktop client" width="360">
 </p>
 
