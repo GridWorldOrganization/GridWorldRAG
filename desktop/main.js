@@ -145,6 +145,11 @@ function createMiniWindow() {
   win.on("unresponsive", () => {
     console.warn("[main] renderer unresponsive");
   });
+  // v1.3.3: suppress the default Chromium context menu (right-click /
+  // Context Menu keyboard key). The default has Reload / Save / Print /
+  // Inspect / etc. which look unprofessional on a polished UI window.
+  // The Debug submenu set up below still works via Ctrl+Shift+I.
+  win.webContents.on("context-menu", (e) => e.preventDefault());
   win.setMenuBarVisibility(false);
   // Hidden accelerators: menu is not visible but accelerators still fire.
   // Lets the user pop DevTools / reload / force-refresh when diagnosing the UI.
@@ -193,6 +198,11 @@ function createWizardWindow() {
     } catch {}
     app.exit(3);
   });
+  // v1.3.3: suppress the default Chromium context menu (see Mini window
+  // comment). The Wizard renders form inputs; the default menu's Cut /
+  // Copy / Paste items conflict with the polished step-by-step UX.
+  // Standard keyboard shortcuts (Ctrl+C / Ctrl+V) still work.
+  win.webContents.on("context-menu", (e) => e.preventDefault());
   win.setMenuBarVisibility(false);
   const menu = Menu.buildFromTemplate([{
     label: "Debug", visible: false, submenu: [
