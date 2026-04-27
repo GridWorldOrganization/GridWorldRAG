@@ -197,6 +197,10 @@ const steps = [
         <div id="pg-test-result"></div>
       `;
       $("pg-test").addEventListener("click", async () => {
+        // v1.3.4: clear previous result the moment the test fires so the
+        // user doesn't see stale "❌ 接続失敗: ..." lingering during the
+        // new test's network roundtrip. Status footer shows progress.
+        $("pg-test-result").innerHTML = `<div class="msg" style="opacity:.7">⏳ 接続テスト中...</div>`;
         setStatus("接続テスト中...", null);
         const params = collectPg();
         const r = await W.testPgConnection(params);
@@ -206,8 +210,9 @@ const steps = [
           box.innerHTML = `<div class="msg ok">✅ 接続成功 (SELECT 1 が通りました)</div>`;
           setStatus("接続 OK", "ok");
         } else {
-          box.innerHTML = `<div class="msg err">❌ 接続失敗: ${escapeHtml(r.error)}</div>`;
-          setStatus("接続失敗", "err");
+          // Use <pre> so multi-line diag (with code=N etc) wraps nicely.
+          box.innerHTML = `<div class="msg err">❌ 接続失敗:<pre style="margin:4px 0 0;white-space:pre-wrap;font-size:11px">${escapeHtml(r.error)}</pre></div>`;
+          setStatus("接続失敗 (テストは informational、「次へ」で進めます)", "err");
         }
       });
       setNext("次へ", true);
