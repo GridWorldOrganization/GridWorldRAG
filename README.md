@@ -13,6 +13,12 @@ Claude Cowork / Claude Desktop / 任意の MCP クライアントから **MCP (M
 > 🔒 **セキュリティ**: Basic Auth + per-drive 分離スキーマ + PBKDF2-SHA256 + AWS IAM 最小権限
 > 🔧 **運用**: 4 並列ワーカー、自動差分同期、ゾンビ GC、障害耐性
 
+<p align="center">
+  <img src="docs/screenshots/mini-monitor.png" alt="WinServerRAG Mini Monitor — always-on-top desktop client" width="360">
+</p>
+
+<p align="center"><sub>常駐 Mini Monitor (always-on-top, 360x400)。Daemon 状態 / ビルド進捗 / FD 数 / DB サイズ / Worker pill を 250ms ポーリングでリアルタイム表示。Pause/Resume / 「Monitor を開く」 / Config 起動を Electron 内 IPC で操作。</sub></p>
+
 ---
 
 ## このリポジトリについて

@@ -4,6 +4,73 @@ All notable changes to GridWorldRAG (Windows canonical). Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.4.0] — 2026-04-28
+
+**Theme: インストーラ→ウィザード→サービス起動の連鎖を完走可能に**
+
+v1.3.0 でセットアップ可視化までは整ったが、実環境で初回起動を試すと
+API サービスが PAUSED 無限ループ、daemon が worker を再生成しない、
+ウィザードの PG 接続テストがパスワード未入力でも成功してしまう、と
+3 系統で連鎖が止まっていた。本 release は 3 系統まとめて修正、新規
+PC のクリーン環境でセットアップを完走できる状態にする。
+
+### Fixed
+
+- **API サービスが NSSM PAUSED 無限ループに陥るバグ** (`src/control_api.py`)
+  - `uvicorn.run("src.control_api:app", ...)` の文字列インポート形式が
+    PyInstaller frozen exe で破綻。エントリースクリプトは `__main__`
+    として読み込まれるため `importlib.import_module("src.control_api")`
+    が失敗し、`ERROR: Error loading ASGI app. Could not import module
+    "src.control_api"` を吐いて即終了 → NSSM が指数バックオフで再試行
+    → 5 回失敗で PAUSED 固定。`uvicorn.run(app, ...)` でオブジェクト
+    直渡しに変更。
+  - `_lifespan` の Drive pre-auth が `token.pickle` 不在時に
+    `flow.run_local_server` の OAuth 待機で永遠にブロックする問題。
+    token 存在チェックを先に入れて、無ければ pre-auth スキップ +
+    遅延認証フォールバックに統一。
+- **daemon が stale worker を検出しても再生成しないバグ** (`src/rag_daemon.py`)
+  - `db.cleanup_zombies()` は `daemon_workers` の DB 行を削除して
+    `workers_removed=[wid]` を返すが、daemon の in-process `_workers`
+    dict (スレッド参照) は更新していなかった。`_live_worker_count() =
+    len(_workers)` が target を維持し続けるため、スタック中の worker
+    が消えても respawn 条件 `_live_worker_count() < target`
+    (rag_daemon.py:721) が成立しない。zombie cleanup 直後に
+    `_workers.pop(wid, None)` を追加。Python はスレッドを強制終了
+    できないので blocked thread は残るが、新しい worker が立ち上がり
+    キュー消化が再開する。
+- **ウィザード PG 接続テストの認証バイパス** (`desktop/wizard-ipc.js`)
+  - PR #56 で `net.connect` TCP 確認に切り替えたが「PW 未入力でも
+    成功」する状態だった。`pg` npm パッケージで wire-protocol レベル
+    の `pg.Client.connect()` に置換 — TCP + StartupMessage + SCRAM-
+    SHA-256 + `SELECT 1` まで完走させて初めて ✅ を返す。失敗時は
+    SQLSTATE → 英語固定文の map で表示 (cp932 mojibake 回避)。
+  - dev mode (`npm start`) で `winserverrag-dbinit.exe` が存在せず
+    Step 6 が失敗する問題。`resolveDaemonHelper()` で
+    `<repo>\.venv\Scripts\python.exe -m src.db_init` にフォールバック。
+
+### Changed
+
+- ウィザード Step 2 PG パスワード欄に **👁 表示/非表示トグル** と
+  **文字数カウンタ** を追加 (実ユーザーが 12 文字目標で 13 文字
+  打ってしまい、マスク表示で typo に気付けなかった事例の対応)
+- ウィザード `go()` が step 遷移時に `setStatus("")` を打つ — 直前
+  step の "接続 OK" がフッターに残って次 step を汚染するのを防止
+- ウィザード PG 接続テストボタン文言: "接続テスト (TCP)" → "接続
+  テスト (認証込み)"。実態を反映
+
+### Reviewed via
+
+- 実環境クリーン install テスト (Microsoft Account `tobisako@gridworld.co`)
+- `_full_restart.ps1` で daemon+API 再デプロイ → `target=2 live=2` を確認
+- `/api/stats` 完全疎通: 30 FDs / 4800 files / pg_ok=true / drive_ok=true / GPU 検出
+
+### Migration
+
+なし。`token.pickle` 既存環境は従来通り起動時 pre-auth が走る。
+インストーラ既知ユーザは `Program Files\WinServerRAG\bin\` の
+`winserverrag-api\` と `winserverrag-daemon\` を v1.4.0 ビルドの
+`dist/exe/` から差し替え。NSSM 設定は変更なし。
+
 ## [v1.3.0] — 2026-04-26
 
 **Theme: ミニモニタを daemon SCM 直結に格上げ — API 不通でも状態が見える**
