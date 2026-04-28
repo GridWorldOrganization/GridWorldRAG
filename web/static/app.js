@@ -222,6 +222,25 @@ const refreshWorkers = withInflight(async function _refreshWorkersImpl() {
   updateGlobalIndicator(data);  // indicator depends on heartbeat freshness → always
 });
 
+// Stable-DOM worker render (v1.5).
+//
+// Old version (pre-v1.5) replaced #workers-body innerHTML wholesale on
+// every poll where any visible field changed. Side-effect: the
+// `gpu-chase` CSS animation on `.worker-card.gpu-active::before`
+// restarted at t=0 for every card simultaneously, so both spinners
+// rotated in lockstep — looked unrealistic given that real GPU usage
+// for two workers is interleaved (one extracting a PDF, the other
+// running embedding inference).
+//
+// New version: cards are keyed by slot number (1..N). On each render
+// pass we (a) reuse existing card elements for slots that still exist,
+// (b) create new ones only for new slots, (c) remove the tail when the
+// pool shrinks. CSS animations on existing nodes keep running across
+// re-renders so each card preserves its own phase.
+//
+// Per-card animation-delay: still set a -worker_id*0.30s offset so the
+// FIRST time a fresh card mounts (e.g. a respawn after zombie cleanup)
+// it doesn't start at 0deg in sync with its sibling.
 function renderWorkers(data) {
   const body = $("#workers-body");
   if (!body) return;
@@ -229,12 +248,131 @@ function renderWorkers(data) {
   const byId = new Map(data.workers.map((w) => [w.worker_id, w]));
   const ids = data.workers.map((w) => w.worker_id).sort((a, b) => a - b);
   const slots = Math.max(target, ids.length);
-  const html = [];
-  for (let i = 0; i < slots; i++) {
-    const w = ids[i] != null ? byId.get(ids[i]) : null;
-    html.push(renderWorkerCard(i + 1, w));
+
+  const existing = new Map();
+  for (const el of body.children) {
+    const slot = el.getAttribute("data-worker-slot");
+    if (slot) existing.set(slot, el);
   }
-  body.innerHTML = html.join("");
+
+  const seen = new Set();
+  for (let i = 0; i < slots; i++) {
+    const slotKey = String(i + 1);
+    const w = ids[i] != null ? byId.get(ids[i]) : null;
+    let el = existing.get(slotKey);
+    if (!el) {
+      el = buildWorkerCardSkeleton(i + 1);
+      body.appendChild(el);
+    }
+    applyWorkerCardData(el, i + 1, w);
+    seen.add(slotKey);
+  }
+  // Drop cards for slots that no longer exist (pool shrunk).
+  for (const [slotKey, el] of existing) {
+    if (!seen.has(slotKey)) el.remove();
+  }
+}
+
+function buildWorkerCardSkeleton(slotNum) {
+  const el = document.createElement("div");
+  el.className = "worker-card";
+  el.setAttribute("data-worker-slot", String(slotNum));
+  // Phase-shift the GPU chase ring per slot so ::before animations
+  // don't all start at 0deg when first mounted. -0.30s per slot;
+  // wraps every 3 slots which is fine — eye reads them as desync'd.
+  el.style.setProperty("--worker-anim-offset", `${(-((slotNum - 1) % 3) * 0.30).toFixed(2)}s`);
+  el.innerHTML = `
+    <div class="worker-header">
+      <span class="worker-id"></span>
+      <span class="wstate"></span>
+    </div>
+    <div class="worker-drive"></div>
+    <div class="worker-phase muted" hidden></div>
+    <div class="worker-file"></div>
+    <div class="progress" hidden><div class="progress-fill"></div></div>
+    <div class="progress-text" hidden></div>
+    <div class="worker-err" hidden></div>`;
+  return el;
+}
+
+// Mutate an existing card in place. Adds/removes class names and updates
+// text/style without replacing the node, so CSS animations keep their
+// timeline.
+function applyWorkerCardData(el, slotNum, w) {
+  const cl = el.classList;
+  // Strip all state-related classes; we'll re-add the current set.
+  cl.remove("idle", "claiming", "listing", "building", "syncing",
+            "error", "done", "gpu-active");
+
+  const idEl    = el.querySelector(".worker-id");
+  const stEl    = el.querySelector(".wstate");
+  const drvEl   = el.querySelector(".worker-drive");
+  const phEl    = el.querySelector(".worker-phase");
+  const fileEl  = el.querySelector(".worker-file");
+  const progEl  = el.querySelector(".progress");
+  const fillEl  = el.querySelector(".progress-fill");
+  const ptxtEl  = el.querySelector(".progress-text");
+  const errEl   = el.querySelector(".worker-err");
+
+  if (!w) {
+    cl.add("idle");
+    idEl.textContent = `#${slotNum}`;
+    stEl.className = "wstate muted";
+    stEl.textContent = "(未起動)";
+    drvEl.className = "worker-drive muted";
+    drvEl.textContent = "—";
+    phEl.hidden = true;
+    fileEl.textContent = "";
+    progEl.hidden = true;
+    ptxtEl.hidden = true;
+    errEl.hidden = true;
+    return;
+  }
+
+  const state = (w.state || "idle").toLowerCase();
+  cl.add(state);
+  if (ACTIVE_WORKER_STATES.has(state) && isGpuActive()) cl.add("gpu-active");
+
+  idEl.textContent = `#${w.worker_id}`;
+  stEl.className = `wstate ${state}`;
+  stEl.textContent = state;
+
+  if (w.drive_name) {
+    drvEl.className = "worker-drive";
+    drvEl.textContent = `▶ ${w.drive_name}`;
+  } else {
+    drvEl.className = "worker-drive";
+    drvEl.innerHTML = '<span class="muted">(担当ドライブなし)</span>';
+  }
+
+  if (w.phase) {
+    phEl.hidden = false;
+    phEl.textContent = w.phase;
+  } else {
+    phEl.hidden = true;
+  }
+
+  fileEl.textContent = w.current_file || "";
+
+  const done = Number(w.files_done) || 0;
+  const total = Number(w.total_files) || 0;
+  if (total > 0) {
+    const pct = Math.round((done / total) * 100);
+    progEl.hidden = false;
+    fillEl.style.width = `${pct}%`;
+    ptxtEl.hidden = false;
+    ptxtEl.textContent = `${done}/${total} files (${pct}%)`;
+  } else {
+    progEl.hidden = true;
+    ptxtEl.hidden = true;
+  }
+
+  if (w.last_error) {
+    errEl.hidden = false;
+    errEl.textContent = String(w.last_error).slice(0, 200);
+  } else {
+    errEl.hidden = true;
+  }
 }
 
 function updateGlobalIndicator(workersPayload) {
@@ -259,41 +397,6 @@ function isGpuActive() {
   return _deviceSnapshot
       && _deviceSnapshot.kind === "cuda"
       && (Number(_deviceSnapshot.util_pct) || 0) >= GPU_ACTIVE_UTIL_THRESHOLD;
-}
-
-function renderWorkerCard(slotNum, w) {
-  if (!w) {
-    return `
-      <div class="worker-card idle">
-        <div class="worker-id">#${slotNum}</div>
-        <div class="worker-drive muted">—</div>
-        <div class="worker-state muted">(未起動)</div>
-      </div>`;
-  }
-  const state = (w.state || "idle").toLowerCase();
-  const done = Number(w.files_done) || 0;
-  const total = Number(w.total_files) || 0;
-  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
-  const progressBar = total > 0
-    ? `<div class="progress"><div class="progress-fill" style="width:${pct}%"></div></div>
-       <div class="progress-text">${done}/${total} files (${pct}%)</div>`
-    : "";
-  // Red chasing GPU indicator: only when the worker is doing active drive
-  // work AND the device reports non-trivial CUDA utilization. Without a
-  // real GPU spike the card keeps its normal blue/green border.
-  const gpuCls = ACTIVE_WORKER_STATES.has(state) && isGpuActive() ? " gpu-active" : "";
-  return `
-    <div class="worker-card ${state}${gpuCls}">
-      <div class="worker-header">
-        <span class="worker-id">#${w.worker_id}</span>
-        <span class="wstate ${state}">${state}</span>
-      </div>
-      <div class="worker-drive">${w.drive_name ? '▶ ' + escapeHtml(w.drive_name) : '<span class="muted">(担当ドライブなし)</span>'}</div>
-      ${w.phase ? `<div class="worker-phase muted">${escapeHtml(w.phase)}</div>` : ""}
-      <div class="worker-file">${w.current_file ? escapeHtml(w.current_file) : ""}</div>
-      ${progressBar}
-      ${w.last_error ? `<div class="worker-err">${escapeHtml(String(w.last_error).slice(0, 200))}</div>` : ""}
-    </div>`;
 }
 
 // ---------------- FD tables ----------------

@@ -236,6 +236,12 @@ td.empty { text-align: center; color: var(--muted); padding: 30px 0; }
     linear-gradient(#000 0 0);
           mask-composite: exclude;
   animation: gpu-chase 0.9s linear infinite;
+  /* v1.5: per-worker phase shift baked into a CSS variable set inline
+     by app.js. -0.30s per worker_id (mod 3) makes #1=0deg, #2=120deg,
+     #3=240deg at mount time. Combined with stable-DOM rendering the
+     ::before timer never resets across polls — each card runs its
+     own continuous rotation. */
+  animation-delay: var(--worker-anim-offset, 0s);
   pointer-events: none;
   z-index: 1;
 }
@@ -254,6 +260,7 @@ td.empty { text-align: center; color: var(--muted); padding: 30px 0; }
     background:
       linear-gradient(90deg, rgba(255,64,64,0) 0%, #ff4040 50%, rgba(255,64,64,0) 100%);
     animation: gpu-chase-fallback 0.9s linear infinite;
+    animation-delay: var(--worker-anim-offset, 0s);
   }
   @keyframes gpu-chase-fallback {
     0%   { transform: rotate(0deg); }
