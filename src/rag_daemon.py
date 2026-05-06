@@ -97,6 +97,13 @@ _next_worker_id = 1
 # 5s staleness is acceptable per spec.
 _paused_flag = threading.Event()
 
+# Disk-space auto-pause flag. Set by the main loop (every 30s) when the DB
+# drive drops below DAEMON_DISK_LOW_PCT; cleared when it recovers above
+# DAEMON_DISK_RESUME_PCT. Semantics identical to _paused_flag: blocks new
+# list enqueues and causes workers to drop queued list tasks. Independent of
+# manual pause — either flag alone is sufficient to halt new builds.
+_disk_low_flag = threading.Event()
+
 
 def _signal_handler(signum, frame):
     global _stop_flag
@@ -142,6 +149,21 @@ def _min_free_bytes_ok() -> bool:
         return usage.free >= config.DAEMON_MIN_FREE_BYTES
     except Exception:
         return False
+
+
+def _disk_free_pct() -> float:
+    """Return free disk % for the DB drive. Returns 100.0 on error (fail-open)."""
+    import shutil
+    try:
+        path = config.DAEMON_DISK_CHECK_PATH or (
+            os.path.splitdrive(str(config.PROJECT_ROOT))[0] + "\\"
+        )
+        usage = shutil.disk_usage(path)
+        if usage.total == 0:
+            return 100.0
+        return 100.0 * usage.free / usage.total
+    except Exception:
+        return 100.0
 
 
 # ---------------------------------------------------------------------
@@ -473,11 +495,12 @@ def _worker_loop(wid: int, personal_stop: threading.Event) -> None:
             kind = task[0]
 
             # Defense-in-depth: a list_full / list_delta task may have been
-            # enqueued by a previous manager iter just before pause was
-            # activated. Drop it instead of starting a new build/sync.
-            # file / file_delete / finalize tasks always run — they are
-            # in-flight work that the spec promises will complete.
-            if kind in ("list_full", "list_delta") and _paused_flag.is_set():
+            # enqueued by a previous manager iter just before pause or
+            # disk-low was activated. Drop it instead of starting a new
+            # build/sync. file / file_delete / finalize tasks always run —
+            # they are in-flight work that the spec promises will complete.
+            if kind in ("list_full", "list_delta") and (
+                    _paused_flag.is_set() or _disk_low_flag.is_set()):
                 log.info("worker %d: paused — dropping %s task for %s",
                          wid, kind, task[1])
                 continue
@@ -614,10 +637,10 @@ def _manager_iter(manager_conn) -> None:
     fds = db.list_fds(manager_conn)
 
     # Enqueue new work for enabled+idle drives.
-    # SKIPPED while paused — this is the primary pause mechanism. Workers
+    # SKIPPED while paused or disk-low — primary pause mechanism. Workers
     # provide defense-in-depth by dropping any list_* tasks already queued
-    # at the moment pause was set.
-    if not paused:
+    # at the moment either flag was set.
+    if not paused and not _disk_low_flag.is_set():
         for row in fds:
             if not row.get("enabled"):
                 continue
@@ -699,6 +722,7 @@ def main() -> int:
         last_cleanup = 0.0
         last_events_gc = 0.0
         last_liveness = 0.0
+        last_disk_check = 0.0
 
         while not _stop_flag:
             now = time.time()
@@ -731,6 +755,25 @@ def main() -> int:
                     try: manager_conn.rollback()
                     except Exception: pass
                     manager_conn = _replace_conn(manager_conn, label="manager")
+
+            # Disk-space auto-pause — every 30s
+            if now - last_disk_check >= 30:
+                pct = _disk_free_pct()
+                if pct < config.DAEMON_DISK_LOW_PCT and not _disk_low_flag.is_set():
+                    _disk_low_flag.set()
+                    log.warning(
+                        "disk low: %.1f%% free (pause threshold %.0f%%) — "
+                        "new builds suspended until %.0f%% free",
+                        pct, config.DAEMON_DISK_LOW_PCT, config.DAEMON_DISK_RESUME_PCT,
+                    )
+                elif pct >= config.DAEMON_DISK_RESUME_PCT and _disk_low_flag.is_set():
+                    _disk_low_flag.clear()
+                    log.info(
+                        "disk recovered: %.1f%% free (resume threshold %.0f%%) — "
+                        "builds resumed",
+                        pct, config.DAEMON_DISK_RESUME_PCT,
+                    )
+                last_disk_check = now
 
             # Zombie cleanup — every 30s
             if now - last_cleanup >= 30:

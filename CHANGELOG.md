@@ -4,6 +4,30 @@ All notable changes to GridWorldRAG (Windows canonical). Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v1.5.0] — 2026-05-06
+
+**Theme: ディスク残容量監視による自動 pause/resume**
+
+DB 保存先 SSD の残容量が設定閾値（デフォルト 10%）を切った場合、デーモンが新規
+ビルドを自動停止する。30 秒ごとに再チェックし、残容量が回復閾値（デフォルト 20%）
+以上になれば自動再開。ヒステリシス（停止 < 再開）によりバウンド防止。
+
+### Added
+- `DAEMON_DISK_LOW_PCT` (default 10.0) — 停止閾値 (%)
+- `DAEMON_DISK_RESUME_PCT` (default 20.0) — 再開閾値 (%) ※ヒステリシス確保のため LOW より大きく設定
+- `DAEMON_DISK_CHECK_PATH` — チェック対象パス（空 = PROJECT_ROOT のドライブ）
+- `_disk_low_flag` — 独立した disk-low auto-pause フラグ（手動 pause と干渉しない）
+- `_disk_free_pct()` — shutil.disk_usage で残容量 % を取得（エラー時 100.0 フェイルオープン）
+- `/api/stats` レスポンスに `disk_free_pct: float` + `disk_low: bool` を追加
+
+### Changed
+- デーモン main loop が 30 秒ごとにディスクをチェック; <10% で警告ログ + flag set、≥20% で復帰ログ + flag clear
+- `_manager_iter` の enqueue 条件に `_disk_low_flag` を追加（manual pause と OR）
+- Worker dispatch loop の list タスクドロップ条件に `_disk_low_flag` を追加
+- `_stats_pump` が `disk_free_pct` / `disk_low` を毎 5s 更新
+
+---
+
 ## [v1.4.0] — 2026-04-28
 
 **Theme: インストーラ→ウィザード→サービス起動の連鎖を完走可能に**

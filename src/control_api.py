@@ -566,6 +566,9 @@ _stats_cache: dict = {
     #   "partial" — exactly one service registered (broken install)
     #   "manual"  — neither registered (dev mode, venv-launched)
     "service_managed_by": "manual",
+    # Disk-space auto-pause state. Refreshed by _stats_pump every 5s.
+    "disk_free_pct": None,   # float 0-100, or None on check error
+    "disk_low": False,        # True when daemon has suspended new builds
     # Device info (GPU vs CPU). Static fields are probed once at startup;
     # dynamic VRAM / util are refreshed in _stats_pump via nvidia-smi.
     "device": {
@@ -664,6 +667,23 @@ def _probe_gpu_live() -> dict | None:
         return None
 
 
+def _check_disk_stats() -> dict:
+    """Return disk_free_pct and disk_low for the configured DB drive."""
+    import shutil, os
+    try:
+        path = config.DAEMON_DISK_CHECK_PATH or (
+            os.path.splitdrive(str(config.PROJECT_ROOT))[0] + "\\"
+        )
+        usage = shutil.disk_usage(path)
+        pct = 100.0 * usage.free / usage.total if usage.total else 100.0
+    except Exception:
+        return {"disk_free_pct": None, "disk_low": False}
+    return {
+        "disk_free_pct": round(pct, 1),
+        "disk_low": pct < config.DAEMON_DISK_LOW_PCT,
+    }
+
+
 async def _stats_pump():
     """Background task: refresh _stats_cache every 5s from DB + nvidia-smi."""
     import asyncio as _a
@@ -678,12 +698,14 @@ async def _stats_pump():
         try:
             # Run blocking DB work in a thread
             def _fetch():
+                import shutil as _shutil
                 conn = db.connect()
                 try:
                     stats = db.global_stats(conn)
                     paused, since = db.is_paused(conn)
                     stats["paused"] = paused
                     stats["paused_since"] = since.isoformat() if since else None
+                    stats.update(_check_disk_stats())
                     return stats
                 finally:
                     conn.close()

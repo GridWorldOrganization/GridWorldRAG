@@ -151,6 +151,12 @@ API_SHEET_MAX_RETRIES = _env_int("API_SHEET_MAX_RETRIES", 6)
 # --- Daemon ---
 DAEMON_ROTATE_INTERVAL_SEC = _env_int("DAEMON_ROTATE_INTERVAL_SEC", 300)
 DAEMON_MIN_FREE_BYTES = _env_int("DAEMON_MIN_FREE_BYTES", 1_073_741_824)
+# Disk-space auto-pause: stop new builds when free% < LOW, resume when free% >= RESUME.
+# Hysteresis (LOW < RESUME) prevents rapid oscillation near the boundary.
+DAEMON_DISK_LOW_PCT    = _env_float("DAEMON_DISK_LOW_PCT",    10.0)
+DAEMON_DISK_RESUME_PCT = _env_float("DAEMON_DISK_RESUME_PCT", 20.0)
+# Drive letter / path to check (default: drive where the project lives).
+DAEMON_DISK_CHECK_PATH = _env("DAEMON_DISK_CHECK_PATH", "")
 # Parallel worker threads (each builds/syncs one FD at a time).
 # 4 is a reasonable default on a laptop; increase to saturate CPU for CPU-bound
 # embedding, decrease if Google Drive / Sheets quota errors appear.
