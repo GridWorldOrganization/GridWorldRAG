@@ -6,6 +6,7 @@ venv/
 .pytest_cache/
 
 # Secrets and tokens
+shared_drives_whitelist.txt
 config.env
 config/config.env
 config/config.v2.env
@@ -44,7 +45,7 @@ desktop/node_modules/
 
 # Memory / context caches
 .gstack/
-.claude/local/
+.claude/
 
 # IDE
 .vscode/
