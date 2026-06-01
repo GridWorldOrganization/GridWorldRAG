@@ -1,6 +1,6 @@
 # Core
-psycopg[binary]>=3.2
-pgvector>=0.3.6
+psycopg[binary]>=3.3.4
+pgvector>=0.4.2
 numpy
 
 # Google APIs
@@ -10,7 +10,7 @@ google-auth-httplib2
 httplib2
 
 # Embedding
-sentence-transformers>=3.0
+sentence-transformers>=5.5.1
 # torch: pip resolves to the CPU wheel by default. For NVIDIA GPU
 # (reranker latency 3-13s -> ~200ms, 15x faster search; ~25% faster
 # build), uninstall the CPU wheel and install the CUDA variant via
@@ -32,8 +32,8 @@ jinja2
 python-multipart
 
 # MCP (Model Context Protocol) — remote server for Claude Cowork
-mcp>=1.0
+mcp>=1.27.2
 
 # Util
 python-dotenv
-pydantic>=2
+pydantic>=2.13.4
